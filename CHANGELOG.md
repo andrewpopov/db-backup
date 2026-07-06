@@ -1,7 +1,11 @@
 # Changelog
 
-All notable changes to `@andrewvpopov/db-backup`. Versions are git tags
+All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
+
+## 0.4.1
+
+- Renamed package scope `@andrewvpopov/*` -> `@andrewpopov/*` after consolidating the GitHub org into the `andrewpopov` user. No runtime or API change; update imports and the `github:` install path to `andrewpopov/db-backup`.
 
 ## 0.4.0
 
@@ -33,7 +37,7 @@ existing `backup`/`restore`/`list` behavior and defaults are unchanged.
 
 - Fix ESM named imports of the storage helpers: export them as shorthand
   identifiers so Node's cjs-module-lexer detects them. `key: storage.fn` was
-  invisible to `import { fn } from "@andrewvpopov/db-backup"` (hit by stoki/sano,
+  invisible to `import { fn } from "@andrewpopov/db-backup"` (hit by stoki/sano,
   which run ESM). No API change.
 - verify-pack now also runs an ESM `import { ... }` smoke to catch this class.
 
