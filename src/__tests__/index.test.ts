@@ -12,6 +12,7 @@ const {
   planRetention,
   restoreBackup,
   runBackupJob,
+  runCli,
 } = require('../index.js') as typeof import('../index');
 
 const fixedNow = new Date('2026-07-05T15:00:00.000Z');
@@ -120,6 +121,9 @@ describe('@bewks/db-backup-manager', () => {
       commandExists: (command) => command === 'sqlite3' || command === 'gzip',
       execFileSync: (command, args) => {
         calls.push({ command, args });
+        if (command === 'sqlite3' && args[1] === 'PRAGMA integrity_check;') {
+          return Buffer.from('ok\n');
+        }
         if (command === 'sqlite3') {
           const backupCommand = args[3];
           const match = backupCommand.match(/^\.backup '(.+)'$/);
@@ -129,9 +133,11 @@ describe('@bewks/db-backup-manager', () => {
         if (command === 'gzip') {
           fs.renameSync(args[1], `${args[1]}.gz`);
         }
+        return undefined;
       },
     });
 
+    const rawPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
     const result = runBackupJob({
       cwd,
       databaseUrl: 'file:./dev.db',
@@ -144,13 +150,69 @@ describe('@bewks/db-backup-manager', () => {
     expect(calls).toEqual([
       {
         command: 'sqlite3',
-        args: ['-cmd', '.timeout 5000', sourcePath, `.backup '${path.join(outputDir, 'sqlite-backup-20260705-150000Z.db')}'`],
+        args: ['-cmd', '.timeout 5000', sourcePath, `.backup '${rawPath}'`],
+      },
+      {
+        command: 'sqlite3',
+        args: [rawPath, 'PRAGMA integrity_check;'],
       },
       {
         command: 'gzip',
-        args: ['-f', path.join(outputDir, 'sqlite-backup-20260705-150000Z.db')],
+        args: ['-f', rawPath],
       },
     ]);
+  });
+
+  it('deletes the backup and throws when the SQLite integrity check fails', () => {
+    const cwd = makeTempDir();
+    const sourcePath = path.join(cwd, 'dev.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(sourcePath, 'source');
+
+    const runtime = makeRuntime({
+      commandExists: (command) => command === 'sqlite3',
+      execFileSync: (command, args) => {
+        if (command === 'sqlite3' && args[1] === 'PRAGMA integrity_check;') {
+          return Buffer.from('*** in database main ***\nrow 1 missing from index idx');
+        }
+        if (command === 'sqlite3') {
+          const match = String(args[3]).match(/^\.backup '(.+)'$/);
+          fs.writeFileSync(match![1].replace(/''/g, "'"), 'corrupt backup');
+        }
+        return undefined;
+      },
+    });
+
+    expect(() =>
+      runBackupJob({ cwd, databaseUrl: 'file:./dev.db', outputDir, compressSqlite: false, runtime }),
+    ).toThrow(/integrity check failed/i);
+    // The corrupt snapshot must not be left behind.
+    expect(fs.existsSync(outputDir) ? fs.readdirSync(outputDir) : []).toEqual([]);
+  });
+
+  it('skips the backup when the database is missing and --allow-missing is set', () => {
+    const outputDir = makeTempDir();
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (message?: unknown) => {
+      logs.push(String(message));
+    };
+    const originalUrl = process.env.DATABASE_URL;
+    const originalNodeEnv = process.env.NODE_ENV;
+    try {
+      process.env.DATABASE_URL = 'file:./does-not-exist-δ.db';
+      process.env.NODE_ENV = 'development';
+      expect(() => runCli(['backup', '--allow-missing', '--output-dir', outputDir])).not.toThrow();
+      expect(logs.some((line) => /skipping backup/.test(line))).toBe(true);
+      // Nothing should have been written.
+      expect(fs.readdirSync(outputDir)).toEqual([]);
+    } finally {
+      console.log = originalLog;
+      if (originalUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalUrl;
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+    }
   });
 
   it('uses pg_dump custom format for PostgreSQL backups', () => {

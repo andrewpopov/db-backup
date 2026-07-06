@@ -54,6 +54,7 @@ function parseArgs(argv) {
     backupFile: null,
     useLatest: false,
     createPreRestoreBackup: true,
+    allowMissing: false,
   };
 
   const commandArg = argv[0];
@@ -87,6 +88,11 @@ function parseArgs(argv) {
 
     if (arg === '--no-compress') {
       options.compressSqlite = false;
+      continue;
+    }
+
+    if (arg === '--allow-missing') {
+      options.allowMissing = true;
       continue;
     }
 
@@ -351,6 +357,17 @@ function resolveBackupOptions(options = {}) {
   };
 }
 
+function verifySqliteBackupIntegrity(backupPath, runtime) {
+  const output = runtime.execFileSync('sqlite3', [backupPath, 'PRAGMA integrity_check;'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const firstLine = (output ? output.toString() : '').trim().split(/\r?\n/, 1)[0] || '';
+  if (firstLine !== 'ok') {
+    fs.rmSync(backupPath, { force: true });
+    throw new Error(`SQLite backup integrity check failed: ${firstLine || 'no output'}`);
+  }
+}
+
 function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd = process.cwd(), runtime = normalizeRuntime() }) {
   now = now || runtime.now();
   const sourcePath = parseSqlitePath(databaseUrl, cwd);
@@ -383,6 +400,11 @@ function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd =
         runtime.sleep(attempt * 1000);
       }
     }
+
+    // Verify the snapshot before we keep it: a `.backup` can succeed yet leave a
+    // corrupt file. A bad backup is worse than a loud failure, so delete it and
+    // throw. Only possible when sqlite3 is present (the cp fallback can't verify).
+    verifySqliteBackupIntegrity(rawFilePath, runtime);
   } else {
     fs.copyFileSync(sourcePath, rawFilePath);
   }
@@ -878,6 +900,7 @@ Options:
   --dev                   Use development env files (.env + .env.local)
   --output-dir <path>     Backup directory (default: backups/database)
   --no-compress           Disable gzip for SQLite backups
+  --allow-missing         Skip (don't fail) when the SQLite database is absent
   --json                  Print JSON output
   --hour <0-23>           Hour for cron output (command: cron)
   --minute <0-59>         Minute for cron output (command: cron)
@@ -955,7 +978,27 @@ function runCli(argv = process.argv.slice(2)) {
     return;
   }
 
-  const result = runBackupJob(baseOptions);
+  let result;
+  try {
+    result = runBackupJob(baseOptions);
+  } catch (error) {
+    // On a fresh install the database file may not exist yet; --allow-missing
+    // lets a scheduled/deploy backup no-op instead of failing the whole run.
+    if (
+      options.allowMissing &&
+      error instanceof Error &&
+      /^SQLite database file not found:/.test(error.message)
+    ) {
+      const skipped = { skipped: true, reason: error.message, mode: baseOptions.mode };
+      if (options.json) {
+        console.log(JSON.stringify(skipped, null, 2));
+      } else {
+        console.log(`[db-backup] ${error.message}; skipping backup.`);
+      }
+      return;
+    }
+    throw error;
+  }
 
   if (options.json) {
     console.log(JSON.stringify(result, null, 2));
