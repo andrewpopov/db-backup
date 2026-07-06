@@ -392,4 +392,59 @@ describe('@bewks/db-backup-manager', () => {
       retentionReason: 'daily',
     });
   });
+
+  it('resolves backup directories from env + candidates, expanding ~ and de-duping', () => {
+    const {
+      resolveBackupDirectories,
+    } = require('../index.js') as typeof import('../index');
+    const home = '/home/tester';
+    const dirs = resolveBackupDirectories({
+      env: { BACKUP_DIRS: '~/backups, /srv/app/backups' },
+      candidates: ['/srv/app/backups', '~/backups', 'relative/dir'],
+      home,
+    });
+    expect(dirs).toEqual([
+      '/home/tester/backups',
+      '/srv/app/backups',
+      path.resolve('relative/dir'),
+    ]);
+  });
+
+  it('contains a user-supplied restore path within allowed directories', () => {
+    const {
+      resolveContainedBackupPath,
+    } = require('../index.js') as typeof import('../index');
+    const directories = ['/srv/app/backups', '/home/tester/backups'];
+    expect(
+      resolveContainedBackupPath('/srv/app/backups/daily/db.gz', { directories }),
+    ).toBe('/srv/app/backups/daily/db.gz');
+    // Traversal / arbitrary-file access is rejected.
+    expect(
+      resolveContainedBackupPath('/srv/app/backups/../../etc/passwd', { directories }),
+    ).toBeNull();
+    expect(resolveContainedBackupPath('/etc/passwd', { directories })).toBeNull();
+  });
+
+  it('reads and appends backup manifest entries', () => {
+    const {
+      readBackupManifest,
+      appendBackupManifestEntry,
+    } = require('../index.js') as typeof import('../index');
+    const dir = makeTempDir();
+    expect(readBackupManifest(dir)).toEqual({ version: 1, entries: [] });
+
+    const entry = {
+      name: 'sqlite-backup-x.db.gz',
+      path: path.join(dir, 'sqlite-backup-x.db.gz'),
+      createdAt: fixedNow.toISOString(),
+      sizeBytes: 128,
+      label: 'manual',
+      source: 'api',
+    };
+    appendBackupManifestEntry(dir, entry);
+    const manifest = readBackupManifest(dir);
+    expect(manifest.version).toBe(1);
+    expect(manifest.entries).toHaveLength(1);
+    expect(manifest.entries[0]).toMatchObject({ name: 'sqlite-backup-x.db.gz', label: 'manual', source: 'api' });
+  });
 });

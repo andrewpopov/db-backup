@@ -1,6 +1,6 @@
 {
   "name": "@andrewvpopov/db-backup",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Reusable database backup manager with age-tier retention (SQLite raw/gzip + Postgres pg_dump)",
   "main": "src/index.js",
   "types": "src/index.d.ts",

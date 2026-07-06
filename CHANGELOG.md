@@ -3,6 +3,26 @@
 All notable changes to `@andrewvpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.3.0
+
+Generalizes stoki/pantry's admin backup-storage subsystem into shared,
+policy-free helpers (BWK-85), so any consumer gets multi-directory backups,
+restore path-safety, and manifest tracking. Purely additive — existing
+`runBackupJob`/`restoreBackup`/`listBackupsWithPlan` behavior is unchanged.
+
+New exports (`src/storage.js`):
+- `resolveBackupDirectories({ env, envVar, candidates, home })` — merge a CSV
+  env var (default `BACKUP_DIRS`) with a caller-supplied candidate list, expand
+  `~/`, de-dup. The caller owns the directory policy.
+- `getBackupFallbackDirectory({ cwd })` — default write target.
+- `resolveContainedBackupPath(candidate, { directories, home })` — resolve a
+  user-supplied restore path and confirm it's contained within an allowed
+  directory; returns `null` on traversal/arbitrary-file access. Callers MUST
+  gate restore on this.
+- `readBackupManifest(dir)` / `appendBackupManifestEntry(dir, entry)` — a
+  per-directory `backup-manifest.json` tracking labels + source.
+- `isContainedWithin`, `expandHome`, `MANIFEST_FILENAME` helpers.
+
 ## 0.2.0
 
 Ports the genuinely-better features from sano-os `@sano/sqlite-backup` into the

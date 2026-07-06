@@ -102,3 +102,46 @@ export function planRetention(backups: BackupEntry[], policy?: RetentionPolicy, 
 export function restoreBackup(options?: RestoreOptions): RestoreResult;
 export function runBackupJob(options?: BackupOptions): BackupJobResult;
 export function runCli(argv?: string[]): void;
+
+// --- Backup-storage helpers (generalized from stoki/pantry) ---
+
+export interface BackupManifestEntry {
+  name: string;
+  path: string;
+  createdAt: string;
+  sizeBytes: number;
+  databaseSizeBytes?: number;
+  label?: string;
+  source?: string;
+  [key: string]: unknown;
+}
+
+export interface BackupManifest {
+  version: 1;
+  entries: BackupManifestEntry[];
+}
+
+export const MANIFEST_FILENAME: string;
+
+export function expandHome(dir: string, home?: string): string;
+export function isContainedWithin(parent: string, candidate: string): boolean;
+
+export function resolveBackupDirectories(options?: {
+  env?: NodeJS.ProcessEnv;
+  envVar?: string;
+  candidates?: string[] | (() => string[]);
+  home?: string;
+}): string[];
+
+export function getBackupFallbackDirectory(options?: { cwd?: string }): string;
+
+export function resolveContainedBackupPath(
+  candidate: string,
+  options?: { directories?: string[]; home?: string },
+): string | null;
+
+export function readBackupManifest(directory: string): BackupManifest;
+export function appendBackupManifestEntry(
+  directory: string,
+  entry: BackupManifestEntry,
+): BackupManifest;

@@ -3,6 +3,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const zlib = require('zlib');
 const { config: loadDotenv, parse: parseDotenv } = require('dotenv');
+const storage = require('./storage');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -1023,4 +1024,13 @@ module.exports = {
   restoreBackup,
   runBackupJob,
   runCli,
+  // Backup-storage helpers (BWK-85, generalized from stoki/pantry):
+  MANIFEST_FILENAME: storage.MANIFEST_FILENAME,
+  expandHome: storage.expandHome,
+  isContainedWithin: storage.isContainedWithin,
+  resolveBackupDirectories: storage.resolveBackupDirectories,
+  getBackupFallbackDirectory: storage.getBackupFallbackDirectory,
+  resolveContainedBackupPath: storage.resolveContainedBackupPath,
+  readBackupManifest: storage.readBackupManifest,
+  appendBackupManifestEntry: storage.appendBackupManifestEntry,
 };
