@@ -1,6 +1,6 @@
 # Shared Package Standards
 
-Reference for every `andrewvpopov/*` package consumed across bewks, stoki,
+Reference for every `andrewpopov/*` package consumed across bewks, stoki,
 smarthome, sano-os, and kira (Kira epic BWK-84 / BWK-92). The pilot is
 `prisma-tools`; this repo follows the same standard (its `.github/workflows/ci.yml`
 and `scripts/verify-pack.mjs` are copied from the pilot with the require-smoke
@@ -8,7 +8,7 @@ adjusted).
 
 ## Distribution
 
-- Install via git tag: `npm install github:andrewvpopov/<pkg>#vX.Y.Z`.
+- Install via git tag: `npm install github:andrewpopov/<pkg>#vX.Y.Z`.
   No npm org, no registry.
 - **One package per repo.** The `github:` protocol installs the repo root.
 - **Consumers pin a tag**, never a branch or a bare SHA. Upgrading a consumer =
@@ -46,7 +46,7 @@ Two shapes, both valid:
 each new package repo immediately after creating it:
 
 ```sh
-gh api -X PUT repos/andrewvpopov/<pkg>/branches/master/protection \
+gh api -X PUT repos/andrewpopov/<pkg>/branches/master/protection \
   -H "Accept: application/vnd.github+json" --input - <<'JSON'
 {
   "required_status_checks": { "strict": true, "contexts": ["test"] },

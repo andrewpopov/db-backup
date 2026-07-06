@@ -1,6 +1,6 @@
 {
-  "name": "@andrewvpopov/db-backup",
-  "version": "0.4.0",
+  "name": "@andrewpopov/db-backup",
+  "version": "0.4.1",
   "description": "Reusable database backup manager with age-tier retention (SQLite raw/gzip + Postgres pg_dump)",
   "main": "src/index.js",
   "types": "src/index.d.ts",
@@ -9,7 +9,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/andrewvpopov/db-backup.git"
+    "url": "https://github.com/andrewpopov/db-backup.git"
   },
   "bin": {
     "db-backup": "src/cli.js"
