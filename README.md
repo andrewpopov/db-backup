@@ -4,13 +4,18 @@
 - Status: Active package reference
 - Last reviewed: 2026-07-05
 
-Reusable database backup utilities with a fixed retention strategy:
+Reusable database backup utilities with an age-tiered retention strategy
+(defaults, tunable via `--max-backups` / `--daily-slots` or the
+`DB_BACKUP_MAX_BACKUPS` / `DB_BACKUP_DAILY_SLOTS` env vars):
 
-- Keep up to **6** backups total
-- Keep **3 recent daily** backups
+- Keep up to **6** backups total (`--max-backups`)
+- Keep **3 recent daily** backups (`--daily-slots`)
 - Always keep **1 backup from last week**
 - Always keep **1 backup from last month**
 - Always keep **1 backup from two months ago**
+
+The age-tier anchors (week/month/two-months) are policy-owned; only the total
+cap and daily-slot count are exposed on the CLI.
 
 ## Supported databases
 
@@ -23,11 +28,14 @@ Reusable database backup utilities with a fixed retention strategy:
 # Create backup + apply retention policy
 db-backup-manager backup --prod --output-dir /var/backups/myapp
 
-# List backups and retention decisions
-db-backup-manager list --prod --output-dir /var/backups/myapp
+# List backups and retention decisions (dry run — no DB needed)
+db-backup-manager list --output-dir /var/backups/myapp
 
-# Print cron entry for daily execution
-db-backup-manager cron --hour 3 --minute 0
+# Apply retention now without taking a new backup (no DB needed)
+db-backup-manager prune --output-dir /var/backups/myapp --max-backups 6
+
+# Print a copy-pasteable cron entry for daily execution
+db-backup-manager cron --hour 3 --minute 0 --prod --output-dir /var/backups/myapp
 
 # Restore from a specific backup file
 db-backup-manager restore --prod --output-dir /var/backups/myapp --file sqlite-backup-20260219-030000Z.db.gz
@@ -72,17 +80,21 @@ Same-second PostgreSQL backups use the same numeric suffix pattern, such as
 
 ### Daily cron
 
-Generate a starter cron entry:
+Generate a copy-pasteable cron entry. `cron` reflects the flags you pass
+(`--prod`, `--output-dir`, `--allow-missing`) into the emitted `backup` command
+and defaults the log path to `<output-dir>/backup.log`:
 
 ```bash
-db-backup-manager cron --hour 3 --minute 0
+db-backup-manager cron --hour 3 --minute 0 --prod --output-dir /var/backups/myapp --allow-missing
+# 0 3 * * * /usr/bin/env bash -lc 'cd "/srv/myapp" && npx db-backup backup --prod --output-dir "/var/backups/myapp" --allow-missing >> "/var/backups/myapp/backup.log" 2>&1'
 ```
 
-For an app-specific script, prefer a command that changes into the deployed app
-directory and writes logs next to the backup directory:
+The default command uses `npx db-backup` (resolves the locally-installed bin
+under npm and pnpm). Override it entirely with `--command` (e.g. to wrap a
+`pnpm exec` or an app npm script) and set the log file with `--log-path`:
 
-```cron
-0 3 * * * /usr/bin/env bash -lc 'cd "/srv/myapp" && npm run db:backup -- --prod --output-dir "/var/backups/myapp" >> "/var/backups/myapp/backup.log" 2>&1'
+```bash
+db-backup-manager cron --command 'pnpm exec db-backup backup --allow-missing' --log-path /srv/myapp/logs/backup.log
 ```
 
 ## Environment resolution

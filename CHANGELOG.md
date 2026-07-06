@@ -3,6 +3,32 @@
 All notable changes to `@andrewvpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.4.0
+
+Operational retention/cleanup surface (requested by sano-os). Additive — all
+existing `backup`/`restore`/`list` behavior and defaults are unchanged.
+
+- **Configurable retention** from the CLI/env instead of a hard-coded policy:
+  `--max-backups <n>` / `--daily-slots <n>`, or `DB_BACKUP_MAX_BACKUPS` /
+  `DB_BACKUP_DAILY_SLOTS`. Precedence: flag > env > default. The age-tier
+  anchors stay policy-owned. New export `resolveRetentionPolicy()`.
+- **`prune` command**: apply the retention policy to an existing backup
+  directory without creating a new snapshot — a standalone cleanup pass. New
+  export `pruneBackupsJob()`.
+- **Fix**: `list` (and the new `prune`) no longer require `DATABASE_URL`. They
+  operate purely on the backup directory and never open the database;
+  previously `list` failed with `DATABASE_URL is missing`. Programmatic callers
+  can pass `requireDatabaseUrl: false` on any `BackupOptions`.
+- **`cron` emits a usable entry**: it now reflects `--output-dir`, `--prod`, and
+  `--allow-missing` into a `npx db-backup backup ...` command (resolves the
+  local bin under npm and pnpm) and defaults the log path to
+  `<output-dir>/backup.log`. Override the whole command with `--command` and the
+  log with `--log-path`. Previously it hard-coded `npm run db:backup -- --prod`.
+- Hardening: retention counts are strictly validated (fractional/suffixed values
+  like `1.5`/`3x` are rejected, not silently truncated), and `buildDailyCronEntry`
+  single-quote-escapes its payload so a quote in a command/path can't malform the
+  emitted cron line.
+
 ## 0.3.1
 
 - Fix ESM named imports of the storage helpers: export them as shorthand

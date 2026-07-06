@@ -34,6 +34,8 @@ export interface BackupOptions {
   policy?: RetentionPolicy;
   runtime?: BackupRuntime;
   strictProductionEnv?: boolean;
+  /** list/prune set this false: they never open the DB, so DATABASE_URL is not required. */
+  requireDatabaseUrl?: boolean;
   envFiles?: {
     base?: string;
     dev?: string;
@@ -72,6 +74,14 @@ export interface BackupListResult {
   policy: RetentionPolicy;
 }
 
+export interface PruneJobResult {
+  removed: BackupEntry[];
+  kept: BackupEntry[];
+  mode: string;
+  outputDir: string;
+  policy: RetentionPolicy;
+}
+
 export interface RestoreOptions extends BackupOptions {
   backupFile?: string;
   useLatest?: boolean;
@@ -98,6 +108,12 @@ export function buildDailyCronEntry(options?: {
 }): string;
 
 export function listBackupsWithPlan(options?: BackupOptions): BackupListResult;
+export function pruneBackupsJob(options?: BackupOptions): PruneJobResult;
+export function resolveRetentionPolicy(options?: {
+  maxBackups?: number | string | null;
+  dailySlots?: number | string | null;
+  env?: NodeJS.ProcessEnv;
+}): RetentionPolicy;
 export function planRetention(backups: BackupEntry[], policy?: RetentionPolicy, now?: Date): BackupPlan;
 export function restoreBackup(options?: RestoreOptions): RestoreResult;
 export function runBackupJob(options?: BackupOptions): BackupJobResult;

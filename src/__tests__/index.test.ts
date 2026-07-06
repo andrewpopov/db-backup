@@ -9,6 +9,8 @@ const require = createRequire(import.meta.url);
 const {
   DEFAULT_RETENTION_POLICY,
   listBackupsWithPlan,
+  pruneBackupsJob,
+  resolveRetentionPolicy,
   planRetention,
   restoreBackup,
   runBackupJob,
@@ -391,6 +393,127 @@ describe('@bewks/db-backup-manager', () => {
       keep: true,
       retentionReason: 'daily',
     });
+  });
+
+  it('lists backups without a DATABASE_URL (list never opens the database)', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(outputDir, 'sqlite-backup-20260705-150000Z.db'), 'sqlite');
+
+    const originalUrl = process.env.DATABASE_URL;
+    try {
+      delete process.env.DATABASE_URL;
+      const result = listBackupsWithPlan({ cwd, outputDir, runtime: makeRuntime() });
+      expect(result.backups).toHaveLength(1);
+    } finally {
+      if (originalUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalUrl;
+    }
+  });
+
+  it('resolveRetentionPolicy prefers CLI args over env, and env over the default', () => {
+    expect(resolveRetentionPolicy()).toBe(DEFAULT_RETENTION_POLICY);
+
+    const fromEnv = resolveRetentionPolicy({
+      env: { DB_BACKUP_MAX_BACKUPS: '4', DB_BACKUP_DAILY_SLOTS: '1' },
+    });
+    expect(fromEnv.maxBackups).toBe(4);
+    expect(fromEnv.dailySlots).toBe(1);
+    expect(fromEnv.anchors).toEqual(DEFAULT_RETENTION_POLICY.anchors);
+
+    const argsWin = resolveRetentionPolicy({
+      maxBackups: 9,
+      env: { DB_BACKUP_MAX_BACKUPS: '4', DB_BACKUP_DAILY_SLOTS: '1' },
+    });
+    expect(argsWin.maxBackups).toBe(9);
+    expect(argsWin.dailySlots).toBe(1);
+
+    expect(() => resolveRetentionPolicy({ maxBackups: 0 })).toThrow(/maxBackups/);
+    expect(() => resolveRetentionPolicy({ env: { DB_BACKUP_MAX_BACKUPS: 'x' } })).toThrow(
+      /DB_BACKUP_MAX_BACKUPS/,
+    );
+    // Strict: fractional/suffixed strings are rejected, not silently truncated.
+    expect(() => resolveRetentionPolicy({ maxBackups: '1.5' })).toThrow(/maxBackups/);
+    expect(() => resolveRetentionPolicy({ env: { DB_BACKUP_DAILY_SLOTS: '3x' } })).toThrow(
+      /DB_BACKUP_DAILY_SLOTS/,
+    );
+  });
+
+  it('rejects fractional/suffixed --max-backups on the CLI instead of truncating', () => {
+    const outputDir = makeTempDir();
+    expect(() => runCli(['list', '--output-dir', outputDir, '--max-backups', '2x'])).toThrow(
+      /--max-backups/,
+    );
+  });
+
+  it('pruneBackupsJob deletes overflow backups to the policy without creating one', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    // Four consecutive daily snapshots, newest first.
+    const files = [
+      'sqlite-backup-20260705-150000Z.db',
+      'sqlite-backup-20260704-150000Z.db',
+      'sqlite-backup-20260703-150000Z.db',
+      'sqlite-backup-20260702-150000Z.db',
+    ];
+    for (const name of files) {
+      fs.writeFileSync(path.join(outputDir, name), 'sqlite');
+    }
+
+    const originalUrl = process.env.DATABASE_URL;
+    try {
+      delete process.env.DATABASE_URL; // prune must not require it
+      const result = pruneBackupsJob({
+        cwd,
+        outputDir,
+        runtime: makeRuntime(),
+        policy: resolveRetentionPolicy({ maxBackups: 2, dailySlots: 2 }),
+      });
+
+      expect(result.kept.map((entry) => entry.fileName)).toEqual([
+        'sqlite-backup-20260705-150000Z.db',
+        'sqlite-backup-20260704-150000Z.db',
+      ]);
+      expect(result.removed.map((entry) => entry.fileName)).toEqual([
+        'sqlite-backup-20260703-150000Z.db',
+        'sqlite-backup-20260702-150000Z.db',
+      ]);
+      // The overflow files are actually gone from disk; the kept ones remain.
+      expect(fs.readdirSync(outputDir).sort()).toEqual([
+        'sqlite-backup-20260704-150000Z.db',
+        'sqlite-backup-20260705-150000Z.db',
+      ]);
+    } finally {
+      if (originalUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalUrl;
+    }
+  });
+
+  it('cron output reflects --output-dir/--prod/--allow-missing and honors --command', () => {
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (message?: unknown) => {
+      logs.push(String(message));
+    };
+    try {
+      runCli(['cron', '--hour', '4', '--minute', '30', '--prod', '--output-dir', '/var/backups/app', '--allow-missing']);
+      expect(logs[0]).toMatch(/^30 4 \* \* \* /);
+      expect(logs[0]).toContain('npx db-backup backup --prod --output-dir "/var/backups/app" --allow-missing');
+      expect(logs[0]).toContain('/var/backups/app/backup.log');
+
+      logs.length = 0;
+      runCli(['cron', '--command', 'pnpm exec db-backup backup', '--log-path', '/tmp/b.log']);
+      expect(logs[0]).toContain("bash -lc 'pnpm exec db-backup backup >> \"/tmp/b.log\" 2>&1'");
+
+      // A single quote in the command must be escaped, not break the entry.
+      logs.length = 0;
+      runCli(['cron', '--command', "echo 'hi'", '--log-path', '/tmp/b.log']);
+      expect(logs[0]).toContain("bash -lc 'echo '\\''hi'\\'' >> \"/tmp/b.log\" 2>&1'");
+    } finally {
+      console.log = originalLog;
+    }
   });
 
   it('resolves backup directories from env + candidates, expanding ~ and de-duping', () => {

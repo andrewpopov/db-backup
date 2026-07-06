@@ -55,11 +55,26 @@ const DEFAULT_ENV_FILES = {
 
 const DEFAULT_OUTPUT_DIR = path.resolve(process.cwd(), 'backups', 'database');
 
+// Strict non-negative integer parse: rejects fractional/suffixed strings that
+// Number.parseInt would silently truncate ("1.5"->1, "3x"->3). Returns null for
+// absent/empty/invalid input so callers own the error message.
+function strictNonNegativeInt(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const text = String(value).trim();
+  if (!/^\d+$/.test(text)) {
+    return null;
+  }
+  return Number.parseInt(text, 10);
+}
+
 function parseArgs(argv) {
   const options = {
     command: 'backup',
     mode: process.env.NODE_ENV === 'production' ? 'prod' : 'dev',
     outputDir: DEFAULT_OUTPUT_DIR,
+    outputDirProvided: false,
     compressSqlite: true,
     json: false,
     hour: 3,
@@ -68,10 +83,20 @@ function parseArgs(argv) {
     useLatest: false,
     createPreRestoreBackup: true,
     allowMissing: false,
+    maxBackups: null,
+    dailySlots: null,
+    cronCommand: null,
+    logPath: null,
   };
 
   const commandArg = argv[0];
-  if (commandArg === 'backup' || commandArg === 'list' || commandArg === 'cron' || commandArg === 'restore') {
+  if (
+    commandArg === 'backup' ||
+    commandArg === 'list' ||
+    commandArg === 'prune' ||
+    commandArg === 'cron' ||
+    commandArg === 'restore'
+  ) {
     options.command = commandArg;
     argv = argv.slice(1);
   }
@@ -95,6 +120,7 @@ function parseArgs(argv) {
         throw new Error('Missing value for --output-dir');
       }
       options.outputDir = path.resolve(process.cwd(), value);
+      options.outputDirProvided = true;
       index += 1;
       continue;
     }
@@ -151,6 +177,46 @@ function parseArgs(argv) {
 
     if (arg === '--no-pre-backup') {
       options.createPreRestoreBackup = false;
+      continue;
+    }
+
+    if (arg === '--max-backups') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null || value < 1) {
+        throw new Error('--max-backups must be an integer >= 1');
+      }
+      options.maxBackups = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--daily-slots') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null) {
+        throw new Error('--daily-slots must be an integer >= 0');
+      }
+      options.dailySlots = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--command') {
+      const value = argv[index + 1];
+      if (!value) {
+        throw new Error('Missing value for --command');
+      }
+      options.cronCommand = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--log-path') {
+      const value = argv[index + 1];
+      if (!value) {
+        throw new Error('Missing value for --log-path');
+      }
+      options.logPath = value;
+      index += 1;
       continue;
     }
 
@@ -344,6 +410,40 @@ function loadEnvironment({
   };
 }
 
+// Build a retention policy from CLI/env overrides, falling back to
+// DEFAULT_RETENTION_POLICY. Only maxBackups/dailySlots are tunable from the
+// operational surface; the age-tier anchors stay policy-owned. Precedence:
+// explicit argument > env var > default.
+function resolveRetentionPolicy({ maxBackups, dailySlots, env = process.env } = {}) {
+  const readInt = (value, label, min) => {
+    if (value === undefined || value === null || value === '') {
+      return null;
+    }
+    const parsed = strictNonNegativeInt(value);
+    if (parsed === null || parsed < min) {
+      throw new Error(`${label} must be an integer >= ${min}`);
+    }
+    return parsed;
+  };
+
+  const resolvedMax =
+    readInt(maxBackups, 'maxBackups', 1) ??
+    readInt(env.DB_BACKUP_MAX_BACKUPS, 'DB_BACKUP_MAX_BACKUPS', 1);
+  const resolvedDaily =
+    readInt(dailySlots, 'dailySlots', 0) ??
+    readInt(env.DB_BACKUP_DAILY_SLOTS, 'DB_BACKUP_DAILY_SLOTS', 0);
+
+  if (resolvedMax === null && resolvedDaily === null) {
+    return DEFAULT_RETENTION_POLICY;
+  }
+
+  return {
+    ...DEFAULT_RETENTION_POLICY,
+    maxBackups: resolvedMax ?? DEFAULT_RETENTION_POLICY.maxBackups,
+    dailySlots: resolvedDaily ?? DEFAULT_RETENTION_POLICY.dailySlots,
+  };
+}
+
 function resolveBackupOptions(options = {}) {
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const mode = options.mode || (process.env.NODE_ENV === 'production' ? 'prod' : 'dev');
@@ -352,12 +452,19 @@ function resolveBackupOptions(options = {}) {
   const policy = options.policy || DEFAULT_RETENTION_POLICY;
   const runtime = normalizeRuntime(options.runtime || options._runtime);
 
-  const databaseUrl = options.databaseUrl || loadEnvironment({
-    mode,
-    cwd,
-    envFiles: options.envFiles || DEFAULT_ENV_FILES,
-    strictProductionEnv: options.strictProductionEnv !== false,
-  }).databaseUrl;
+  // list/prune operate purely on the backup directory and never open the
+  // database, so they opt out of DATABASE_URL resolution (requireDatabaseUrl:
+  // false). backup/restore keep the default of requiring it.
+  const requireDatabaseUrl = options.requireDatabaseUrl !== false;
+  let databaseUrl = options.databaseUrl || null;
+  if (!databaseUrl && requireDatabaseUrl) {
+    databaseUrl = loadEnvironment({
+      mode,
+      cwd,
+      envFiles: options.envFiles || DEFAULT_ENV_FILES,
+      strictProductionEnv: options.strictProductionEnv !== false,
+    }).databaseUrl;
+  }
 
   return {
     cwd,
@@ -827,7 +934,7 @@ function pruneBackups(backupsToRemove = []) {
 }
 
 function listBackupsWithPlan(options = {}) {
-  const resolved = resolveBackupOptions(options);
+  const resolved = resolveBackupOptions({ ...options, requireDatabaseUrl: false });
   const now = resolved.runtime.now();
   const backups = listBackups({ outputDir: resolved.outputDir, now });
   const plan = planRetention(backups, resolved.policy, now);
@@ -847,6 +954,25 @@ function listBackupsWithPlan(options = {}) {
   return {
     backups: backupRows,
     plan,
+    mode: resolved.mode,
+    outputDir: resolved.outputDir,
+    policy: resolved.policy,
+  };
+}
+
+// Apply the retention policy to an existing backup directory without creating a
+// new snapshot — a standalone cleanup pass. Like list, it never opens the
+// database, so DATABASE_URL is not required.
+function pruneBackupsJob(options = {}) {
+  const resolved = resolveBackupOptions({ ...options, requireDatabaseUrl: false });
+  const now = resolved.runtime.now();
+  const backups = listBackups({ outputDir: resolved.outputDir, now });
+  const plan = planRetention(backups, resolved.policy, now);
+  const removed = pruneBackups(plan.remove);
+
+  return {
+    removed,
+    kept: plan.keep,
     mode: resolved.mode,
     outputDir: resolved.outputDir,
     policy: resolved.policy,
@@ -877,7 +1003,12 @@ function buildDailyCronEntry({
   command = "cd /path/to/app && npm run db:backup:prod",
   logPath = "/var/log/db-backup.log",
 } = {}) {
-  return `${minute} ${hour} * * * /usr/bin/env bash -lc '${command} >> "${logPath}" 2>&1'`;
+  // The whole invocation is the argument to `bash -lc`, wrapped in single
+  // quotes. Escape any single quote inside it ('\'' is the standard trick) so a
+  // quote in a command or path can't break out of — or malform — the entry.
+  const inner = `${command} >> "${logPath}" 2>&1`;
+  const quoted = `'${inner.replace(/'/g, "'\\''")}'`;
+  return `${minute} ${hour} * * * /usr/bin/env bash -lc ${quoted}`;
 }
 
 function formatBytes(sizeBytes) {
@@ -900,11 +1031,12 @@ function formatBytes(sizeBytes) {
 function showHelp() {
   console.log(`
 Usage:
-  db-backup-manager [backup|list|cron|restore] [options]
+  db-backup-manager [backup|list|prune|cron|restore] [options]
 
 Commands:
   backup                  Create a backup and apply retention policy (default)
-  list                    List backups with keep/rotate decisions
+  list                    List backups with keep/rotate decisions (no DB needed)
+  prune                   Apply retention now without taking a backup (no DB needed)
   cron                    Print a daily cron entry
   restore                 Restore database from backup file
 
@@ -912,11 +1044,15 @@ Options:
   --prod                  Use production env files (.env + .env.production)
   --dev                   Use development env files (.env + .env.local)
   --output-dir <path>     Backup directory (default: backups/database)
+  --max-backups <n>       Max backups to retain (env: DB_BACKUP_MAX_BACKUPS)
+  --daily-slots <n>       Recent daily slots before age tiers (env: DB_BACKUP_DAILY_SLOTS)
   --no-compress           Disable gzip for SQLite backups
   --allow-missing         Skip (don't fail) when the SQLite database is absent
   --json                  Print JSON output
   --hour <0-23>           Hour for cron output (command: cron)
   --minute <0-59>         Minute for cron output (command: cron)
+  --command <str>         Override the command in cron output (command: cron)
+  --log-path <path>       Log path for cron output (command: cron)
   --file <name|path>      Backup file to restore (command: restore)
   --latest                Restore latest backup in output-dir (command: restore)
   --no-pre-backup         Skip safety backup before restore (command: restore)
@@ -933,11 +1069,32 @@ function runCli(argv = process.argv.slice(2)) {
   }
 
   if (options.command === 'cron') {
+    const outputDir = options.outputDirProvided ? options.outputDir : null;
+    let command = options.cronCommand;
+    if (!command) {
+      // A copy-pasteable default that resolves the locally-installed bin
+      // (npx checks node_modules/.bin first, so it works under npm and pnpm)
+      // and mirrors the flags passed to `cron` onto the emitted `backup` call.
+      const parts = [`cd "${process.cwd()}" &&`, 'npx db-backup backup'];
+      if (options.mode === 'prod') {
+        parts.push('--prod');
+      }
+      if (outputDir) {
+        parts.push(`--output-dir "${outputDir}"`);
+      }
+      if (options.allowMissing) {
+        parts.push('--allow-missing');
+      }
+      command = parts.join(' ');
+    }
+    const logPath = options.logPath
+      ? path.resolve(process.cwd(), options.logPath)
+      : path.resolve(outputDir || path.join(process.cwd(), 'backups', 'database'), 'backup.log');
     const cronLine = buildDailyCronEntry({
       hour: options.hour,
       minute: options.minute,
-      command: `cd "${process.cwd()}" && npm run db:backup -- --prod`,
-      logPath: path.resolve(process.cwd(), 'backups', 'database', 'backup.log'),
+      command,
+      logPath,
     });
     console.log(cronLine);
     return;
@@ -947,6 +1104,10 @@ function runCli(argv = process.argv.slice(2)) {
     mode: options.mode,
     outputDir: options.outputDir,
     compressSqlite: options.compressSqlite,
+    policy: resolveRetentionPolicy({
+      maxBackups: options.maxBackups,
+      dailySlots: options.dailySlots,
+    }),
   };
 
   if (options.command === 'list') {
@@ -964,6 +1125,24 @@ function runCli(argv = process.argv.slice(2)) {
       const marker = backup.keep ? 'KEEP' : 'DROP';
       console.log(`  ${marker} | ${backup.fileName} | ${backup.retentionLabel} | ${formatBytes(backup.sizeBytes)}`);
     });
+    return;
+  }
+
+  if (options.command === 'prune') {
+    const result = pruneBackupsJob(baseOptions);
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    console.log(`[db-backup] Mode: ${result.mode}`);
+    console.log(`[db-backup] Output directory: ${result.outputDir}`);
+    console.log(
+      `[db-backup] Removed ${result.removed.length} backup(s), keeping ${result.kept.length} backup(s).`,
+    );
+    if (result.removed.length > 0) {
+      console.log(`[db-backup] Removed: ${result.removed.map((entry) => entry.fileName).join(', ')}`);
+    }
     return;
   }
 
@@ -1032,6 +1211,8 @@ module.exports = {
   DEFAULT_RETENTION_POLICY,
   buildDailyCronEntry,
   listBackupsWithPlan,
+  pruneBackupsJob,
+  resolveRetentionPolicy,
   planRetention,
   restoreBackup,
   runBackupJob,
