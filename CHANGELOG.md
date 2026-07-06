@@ -3,6 +3,17 @@
 All notable changes to `@andrewvpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.2.0
+
+Ports the genuinely-better features from sano-os `@sano/sqlite-backup` into the
+consolidated package (BWK-85), so the whole estate shares them.
+
+- **SQLite integrity verification**: after `.backup`, run `PRAGMA
+  integrity_check` on the snapshot (when sqlite3 is available) and delete +
+  throw if it isn't `ok` — a corrupt backup is worse than a loud failure.
+- **`--allow-missing`**: a scheduled/deploy backup no-ops instead of failing
+  when the SQLite database file doesn't exist yet (fresh installs).
+
 ## 0.1.0
 
 Initial extraction from bewks `packages/db-backup-manager` (BWK-85), the base
