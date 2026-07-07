@@ -1,4 +1,5 @@
 import { createRequire } from 'module';
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -15,13 +16,15 @@ const {
   restoreBackup,
   runBackupJob,
   runCli,
+  readBackupManifest,
+  appendBackupManifestEntry,
 } = require('../index.js') as typeof import('../index');
 
 const fixedNow = new Date('2026-07-05T15:00:00.000Z');
 const tempDirs: string[] = [];
 
 function makeTempDir() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-manager-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-'));
   tempDirs.push(dir);
   return dir;
 }
@@ -62,7 +65,7 @@ afterEach(() => {
   }
 });
 
-describe('@bewks/db-backup-manager', () => {
+describe('@andrewpopov/db-backup', () => {
   it('creates a SQLite backup from a URL-encoded relative file path without external binaries', () => {
     const cwd = makeTempDir();
     const sourcePath = path.join(cwd, 'db with spaces.db');
@@ -569,5 +572,525 @@ describe('@bewks/db-backup-manager', () => {
     expect(manifest.version).toBe(1);
     expect(manifest.entries).toHaveLength(1);
     expect(manifest.entries[0]).toMatchObject({ name: 'sqlite-backup-x.db.gz', label: 'manual', source: 'api' });
+  });
+
+  // --- P0 #3: restore round-trip, --latest, engine mismatch, truncated .gz ---
+
+  it('restores a SQLite backup created via the cp-fallback path, round-tripping bytes exactly', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'data', 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    const originalBytes = Buffer.from('arbitrary sqlite bytes, not a real sqlite file, 12345');
+    fs.writeFileSync(dbPath, originalBytes);
+
+    const runtime = makeRuntime({ commandExists: () => false });
+    const created = runBackupJob({
+      cwd,
+      databaseUrl: 'file:./data/app.db',
+      outputDir,
+      compressSqlite: false,
+      runtime,
+    });
+
+    // Mutate the live DB so the assertion actually proves restore rewrote it.
+    fs.writeFileSync(dbPath, 'mutated after backup');
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl: 'file:./data/app.db',
+      outputDir,
+      backupFile: created.created.fileName,
+      createPreRestoreBackup: false,
+      runtime,
+    });
+
+    expect(result.target).toBe(dbPath);
+    expect(fs.readFileSync(dbPath).equals(originalBytes)).toBe(true);
+  });
+
+  it('restore --latest picks the newest backup by timestamp', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(dbPath, 'version 1');
+
+    const olderRuntime = makeRuntime({ now: () => new Date('2026-07-01T00:00:00.000Z') });
+    runBackupJob({ cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: olderRuntime });
+
+    fs.writeFileSync(dbPath, 'version 2');
+    const newerRuntime = makeRuntime({ now: () => new Date('2026-07-05T00:00:00.000Z') });
+    const second = runBackupJob({ cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: newerRuntime });
+
+    fs.writeFileSync(dbPath, 'mutated after both backups');
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      useLatest: true,
+      createPreRestoreBackup: false,
+      runtime: newerRuntime,
+    });
+
+    expect(result.restored.fileName).toBe(second.created.fileName);
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('version 2');
+  });
+
+  it('throws an engine-mismatch error when the selected backup engine does not match DATABASE_URL', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(outputDir, 'sqlite-backup-20260705-150000Z.db'), 'sqlite bytes');
+
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl: 'postgres://user:pass@host/db',
+        outputDir,
+        backupFile: 'sqlite-backup-20260705-150000Z.db',
+        createPreRestoreBackup: false,
+        runtime: makeRuntime(),
+      }),
+    ).toThrow(/engine mismatch/i);
+  });
+
+  it('leaves the live DB untouched and cleans up the temp file when a truncated .gz backup fails to decompress', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'data', 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    const originalBytes = Buffer.from('the live database, unchanged');
+    fs.writeFileSync(dbPath, originalBytes);
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db.gz');
+    fs.writeFileSync(backupPath, 'not actually gzip data');
+
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl: 'file:./data/app.db',
+        outputDir,
+        backupFile: path.basename(backupPath),
+        createPreRestoreBackup: false,
+        runtime: makeRuntime(),
+      }),
+    ).toThrow();
+
+    expect(fs.readFileSync(dbPath).equals(originalBytes)).toBe(true);
+    const remaining = fs.readdirSync(path.dirname(dbPath)).filter((name) => name.startsWith('.restore-'));
+    expect(remaining).toEqual([]);
+  });
+
+  // --- P0 #3: retention edges on planRetention ---
+
+  it('planRetention: dailySlots > maxBackups keeps only maxBackups worth of dailies', () => {
+    const backups = [
+      backupEntry('day-0.db.gz', 0),
+      backupEntry('day-1.db.gz', 1),
+      backupEntry('day-2.db.gz', 2),
+      backupEntry('day-3.db.gz', 3),
+    ];
+    const policy = { ...DEFAULT_RETENTION_POLICY, maxBackups: 2, dailySlots: 10 };
+
+    const plan = planRetention(backups, policy, fixedNow);
+
+    expect(plan.keep.map((entry) => entry.fileName)).toEqual(['day-0.db.gz', 'day-1.db.gz']);
+    expect(plan.remove.map((entry) => entry.fileName)).toEqual(['day-2.db.gz', 'day-3.db.gz']);
+  });
+
+  it('planRetention: an empty backup list keeps and removes nothing', () => {
+    const plan = planRetention([], DEFAULT_RETENTION_POLICY, fixedNow);
+    expect(plan.keep).toEqual([]);
+    expect(plan.remove).toEqual([]);
+  });
+
+  it('planRetention: a future-dated (clock-skewed) backup cannot starve the newest real daily slot', () => {
+    // Both effective (clamped) times tie at `fixedNow`: the future entry's raw
+    // createdAt is capped down to `fixedNow`, and the just-created real entry's
+    // createdAt IS `fixedNow`. Array.prototype.sort is stable (ES2019+), so with
+    // the real entry listed first, the tie resolves in its favor — daily slot 1
+    // goes to the real backup, not the clock-skewed one.
+    const realSlot1 = backupEntry('day-0.db.gz', 0);
+    const future = backupEntry('future.db.gz', -30); // createdAt ~30 days ahead of "now"
+    const day1 = backupEntry('day-1.db.gz', 1);
+    const day8 = backupEntry('day-8.db.gz', 8);
+
+    const plan = planRetention([realSlot1, future, day1, day8], DEFAULT_RETENTION_POLICY, fixedNow);
+
+    expect(plan.keep[0].fileName).toBe('day-0.db.gz');
+    expect(plan.keep[0].retentionReason).toBe('daily');
+    expect(plan.keep.some((entry) => entry.retentionReason === 'last_week' && entry.fileName === 'day-8.db.gz')).toBe(
+      true,
+    );
+  });
+
+  // --- P0 #3: locked-DB retry ---
+
+  it('retries sqlite3 .backup on "database is locked" and succeeds on the third attempt', () => {
+    const cwd = makeTempDir();
+    const sourcePath = path.join(cwd, 'dev.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(sourcePath, 'source');
+
+    const backupCalls: string[] = [];
+    const sleepCalls: number[] = [];
+    let attempt = 0;
+
+    const runtime = makeRuntime({
+      commandExists: (command) => command === 'sqlite3',
+      sleep: (ms) => sleepCalls.push(ms),
+      execFileSync: (command: string, args: string[]) => {
+        if (command === 'sqlite3' && args[1] === 'PRAGMA integrity_check;') {
+          return Buffer.from('ok\n') as unknown as void;
+        }
+        if (command === 'sqlite3' && String(args[3]).startsWith('.backup')) {
+          attempt += 1;
+          backupCalls.push(args[3]);
+          if (attempt < 3) {
+            const error = new Error('sqlite3 failed') as Error & { stderr?: Buffer };
+            error.stderr = Buffer.from('Error: database is locked');
+            throw error;
+          }
+          const match = String(args[3]).match(/^\.backup '(.+)'$/);
+          fs.writeFileSync(match![1].replace(/''/g, "'"), 'backup bytes');
+        }
+        return undefined;
+      },
+    });
+
+    const result = runBackupJob({
+      cwd,
+      databaseUrl: 'file:./dev.db',
+      outputDir,
+      compressSqlite: false,
+      runtime,
+    });
+
+    expect(backupCalls).toHaveLength(3);
+    expect(sleepCalls).toHaveLength(2);
+    expect(result.created.fileName).toBe('sqlite-backup-20260705-150000Z.db');
+  });
+
+  // --- P0 #3: loadEnvironment (exercised via resolveBackupOptions) ---
+
+  it('loadEnvironment: prod mode prefers .env.production over the base .env', () => {
+    const cwd = makeTempDir();
+    fs.writeFileSync(path.join(cwd, '.env'), 'DATABASE_URL=file:./dev.db\n');
+    fs.writeFileSync(path.join(cwd, '.env.production'), 'DATABASE_URL=file:./prod.db\n');
+    fs.writeFileSync(path.join(cwd, 'prod.db'), 'prod bytes');
+    const outputDir = path.join(cwd, 'backups');
+
+    const originalUrl = process.env.DATABASE_URL;
+    try {
+      delete process.env.DATABASE_URL;
+      const result = runBackupJob({ cwd, mode: 'prod', outputDir, compressSqlite: false, runtime: makeRuntime() });
+      expect(fs.readFileSync(result.created.fullPath, 'utf8')).toBe('prod bytes');
+    } finally {
+      if (originalUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalUrl;
+    }
+  });
+
+  it('loadEnvironment: prod mode throws when neither shell env nor .env.production has DATABASE_URL', () => {
+    const cwd = makeTempDir();
+    fs.writeFileSync(path.join(cwd, '.env'), 'DATABASE_URL=file:./dev.db\n');
+    const outputDir = path.join(cwd, 'backups');
+
+    const originalUrl = process.env.DATABASE_URL;
+    try {
+      delete process.env.DATABASE_URL;
+      expect(() =>
+        runBackupJob({ cwd, mode: 'prod', outputDir, compressSqlite: false, runtime: makeRuntime() }),
+      ).toThrow(/production backups/i);
+    } finally {
+      if (originalUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalUrl;
+    }
+  });
+
+  // --- P1 #4: Postgres dump verification ---
+
+  it('deletes the dump and throws when pg_restore --list fails to verify a Postgres backup', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+
+    const runtime = makeRuntime({
+      commandExists: (command) => command === 'pg_dump' || command === 'pg_restore',
+      execFileSync: (command: string, args: string[]) => {
+        if (command === 'pg_dump') {
+          const outputArg = args.find((arg) => arg.startsWith('--file='));
+          if (!outputArg) throw new Error('pg_dump call missing --file argument');
+          fs.writeFileSync(outputArg.slice('--file='.length), 'not a real dump');
+          return undefined;
+        }
+        if (command === 'pg_restore' && args[0] === '--list') {
+          const error = new Error('pg_restore failed') as Error & { stderr?: Buffer };
+          error.stderr = Buffer.from('pg_restore: error: input file does not appear to be a valid archive');
+          throw error;
+        }
+        return undefined;
+      },
+    });
+
+    expect(() => runBackupJob({ cwd, databaseUrl, outputDir, runtime })).toThrow(
+      /PostgreSQL backup verification failed/i,
+    );
+    const dumpFiles = fs.existsSync(outputDir)
+      ? fs.readdirSync(outputDir).filter((name) => name.endsWith('.dump'))
+      : [];
+    expect(dumpFiles).toEqual([]);
+  });
+
+  it('skips Postgres verification (and keeps the dump) when pg_restore is absent', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+
+    const runtime = makeRuntime({
+      commandExists: (command) => command === 'pg_dump',
+      execFileSync: (command: string, args: string[]) => {
+        const outputArg = args.find((arg) => arg.startsWith('--file='));
+        if (!outputArg) throw new Error('pg_dump call missing --file argument');
+        fs.writeFileSync(outputArg.slice('--file='.length), 'dump bytes');
+        return undefined;
+      },
+    });
+
+    const result = runBackupJob({ cwd, databaseUrl, outputDir, runtime });
+    expect(fs.existsSync(result.created.fullPath)).toBe(true);
+  });
+
+  // --- P1 #5: advisory backup lock ---
+
+  it('runBackupJob throws when a fresh (non-stale) lock is already held, and leaves it in place', () => {
+    const cwd = makeTempDir();
+    const sourcePath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(sourcePath, 'bytes');
+    fs.mkdirSync(outputDir, { recursive: true });
+    const lockPath = path.join(outputDir, '.db-backup.lock');
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, at: fixedNow.toISOString(), token: 'someone-else' }));
+
+    expect(() =>
+      runBackupJob({ cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: makeRuntime() }),
+    ).toThrow(/holds the lock/i);
+
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
+  it('runBackupJob steals a stale lock and succeeds, removing the lock file afterward', () => {
+    const cwd = makeTempDir();
+    const sourcePath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(sourcePath, 'bytes');
+    fs.mkdirSync(outputDir, { recursive: true });
+    const lockPath = path.join(outputDir, '.db-backup.lock');
+    const staleAt = new Date(fixedNow.getTime() - 60 * 60 * 1000).toISOString(); // 1h old, > default 30m staleMs
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, at: staleAt, token: 'stale-token' }));
+
+    const result = runBackupJob({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      compressSqlite: false,
+      runtime: makeRuntime(),
+    });
+
+    expect(result.created.fileName).toBe('sqlite-backup-20260705-150000Z.db');
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('steals a corrupt/zero-byte leftover lock (crash between create and write)', () => {
+    const cwd = makeTempDir();
+    const sourcePath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(sourcePath, 'bytes');
+    fs.mkdirSync(outputDir, { recursive: true });
+    const lockPath = path.join(outputDir, '.db-backup.lock');
+    fs.writeFileSync(lockPath, ''); // zero-byte, unparsable — a crashed run's leftover
+
+    const result = runBackupJob({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      compressSqlite: false,
+      runtime: makeRuntime(),
+    });
+
+    expect(result.created.fileName).toBe('sqlite-backup-20260705-150000Z.db');
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('removes the lock file even when the wrapped job throws', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const lockPath = path.join(outputDir, '.db-backup.lock');
+
+    expect(() =>
+      runBackupJob({
+        cwd,
+        databaseUrl: 'file:./missing.db',
+        outputDir,
+        compressSqlite: false,
+        runtime: makeRuntime(),
+      }),
+    ).toThrow(/not found/i);
+
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  // --- P1 #6: sha256 + manifest wiring ---
+
+  it('runBackupJob appends a manifest entry with a 64-hex sha256', () => {
+    const cwd = makeTempDir();
+    const sourcePath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(sourcePath, 'sqlite bytes');
+
+    const result = runBackupJob({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      compressSqlite: false,
+      runtime: makeRuntime(),
+    });
+
+    expect(result.created.sha256).toMatch(/^[0-9a-f]{64}$/);
+
+    const manifest = readBackupManifest(outputDir);
+    expect(manifest.entries).toHaveLength(1);
+    expect(manifest.entries[0]).toMatchObject({
+      name: result.created.fileName,
+      path: result.created.fullPath,
+      sha256: result.created.sha256,
+    });
+  });
+
+  it('restoreBackup throws a checksum-mismatch error when the manifested backup bytes were tampered with', () => {
+    const cwd = makeTempDir();
+    const sourcePath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(sourcePath, 'sqlite bytes');
+
+    const created = runBackupJob({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      compressSqlite: false,
+      runtime: makeRuntime(),
+    });
+    // Corrupt the backup bytes on disk without touching the manifest.
+    fs.writeFileSync(created.created.fullPath, 'tampered bytes');
+
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl: 'file:./app.db',
+        outputDir,
+        backupFile: created.created.fileName,
+        createPreRestoreBackup: false,
+        runtime: makeRuntime(),
+      }),
+    ).toThrow(/checksum mismatch/i);
+  });
+
+  it('restoreBackup restores fine when the backup has no manifest at all (older backups)', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(dbPath, 'old bytes');
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath, 'restored bytes');
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      runtime: makeRuntime(),
+    });
+
+    expect(result.target).toBe(dbPath);
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('restored bytes');
+  });
+
+  it('checks the checksum for an absolute --file path outside outputDir against a manifest colocated with the file', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    const externalDir = path.join(cwd, 'external-backups');
+    fs.mkdirSync(externalDir, { recursive: true });
+    fs.writeFileSync(dbPath, 'old bytes');
+
+    const backupPath = path.join(externalDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath, 'restored bytes');
+    const sha256 = crypto.createHash('sha256').update(fs.readFileSync(backupPath)).digest('hex');
+
+    appendBackupManifestEntry(externalDir, {
+      name: path.basename(backupPath),
+      path: backupPath,
+      createdAt: fixedNow.toISOString(),
+      sizeBytes: fs.statSync(backupPath).size,
+      sha256,
+    });
+
+    // Corrupt the file after manifesting: the colocated manifest should catch it
+    // even though `outputDir` (passed below) is a different directory entirely.
+    fs.writeFileSync(backupPath, 'tampered');
+
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl: 'file:./app.db',
+        outputDir,
+        backupFile: backupPath, // absolute path, outside outputDir
+        createPreRestoreBackup: false,
+        runtime: makeRuntime(),
+      }),
+    ).toThrow(/checksum mismatch/i);
+  });
+
+  // --- P1 #7: SQLite restore validation (temp-first, non-deleting) ---
+
+  it('fails restore when the temp file fails SQLite integrity check, leaving the live DB untouched', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'data', 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    const originalBytes = Buffer.from('the live database, unchanged');
+    fs.writeFileSync(dbPath, originalBytes);
+
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath, 'a backup file (cp-fallback path, no compression)');
+
+    const runtime = makeRuntime({
+      commandExists: (command) => command === 'sqlite3',
+      execFileSync: (command: string, args: string[]) => {
+        if (command === 'sqlite3' && args[1] === 'PRAGMA integrity_check;') {
+          return Buffer.from('*** in database main ***\nrow 1 missing from index idx') as unknown as void;
+        }
+        return undefined;
+      },
+    });
+
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl: 'file:./data/app.db',
+        outputDir,
+        backupFile: path.basename(backupPath),
+        createPreRestoreBackup: false,
+        runtime,
+      }),
+    ).toThrow(/integrity check failed/i);
+
+    expect(fs.readFileSync(dbPath).equals(originalBytes)).toBe(true);
+    const remaining = fs.readdirSync(path.dirname(dbPath)).filter((name) => name.startsWith('.restore-'));
+    expect(remaining).toEqual([]);
   });
 });

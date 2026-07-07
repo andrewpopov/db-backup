@@ -15,11 +15,11 @@ on:
 
 jobs:
   # Single job named `test` so it stays the stable required status check for
-  # branch protection. Runs the engines floor (Node 20); this package has no
-  # version-specific behavior, so passing on the floor covers newer consumers. If
-  # a package ever needs a real version matrix, add a `ci-success` aggregation job
-  # (needs: [test]) and require THAT — a matrix renames `test` to `test (20)` and
-  # silently breaks a required context of `test`.
+  # branch protection. Runs the engines floor (Node 20). The Node 22/24 compat
+  # matrix lives in a SEPARATE `compat` job (below) so this required context name
+  # never changes — a matrix would rename `test` to `test (20)` and silently
+  # break a required context of `test`. Promote `ci-success` to the required
+  # check (and drop `test`) if/when you want the matrix gating merges.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -30,8 +30,43 @@ jobs:
       - run: npm ci
       - name: Unit tests
         run: npm test
+      - name: Type contract (src/index.d.ts vs a consumer snippet)
+        run: npm run verify:types
       - name: Consumer-side pack + install smoke
         run: npm run verify:pack
+
+  # Non-required forward-compat matrix. The estate will cross Node versions
+  # eventually; catch a break here, not in production. Kept out of the `test`
+  # context name on purpose (see above).
+  compat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci
+      - run: npm test
+      - run: npm run verify:types
+
+  # Aggregation gate: green only if `test` and every `compat` leg passed. Make
+  # THIS the required status check to gate merges on the full matrix.
+  ci-success:
+    if: always()
+    needs: [test, compat]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert all upstream jobs succeeded
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.compat.result }}" != "success" ]; then
+            echo "::error::a required CI job failed (test=${{ needs.test.result }} compat=${{ needs.compat.result }})"
+            exit 1
+          fi
+          echo "all CI jobs green"
 
   # Tags are the shipped artifact (consumers install github:...#vX.Y.Z), so gate
   # them: the tag must match package.json version and have a CHANGELOG entry.

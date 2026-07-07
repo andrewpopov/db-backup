@@ -23,6 +23,10 @@ export interface BackupEntry {
   keep?: boolean;
   retentionReason?: string;
   retentionLabel?: string;
+  /** sha256 hex digest of the backup file. Populated by createSqliteBackup /
+   * createPostgresBackup; absent on entries derived from disk scans alone
+   * (e.g. via getBackupEntryFromPath/listBackups) until re-hashed. */
+  sha256?: string;
 }
 
 export interface BackupOptions {
@@ -129,6 +133,9 @@ export interface BackupManifestEntry {
   databaseSizeBytes?: number;
   label?: string;
   source?: string;
+  /** sha256 hex digest of the backup file at manifest-write time. Verified by
+   * restoreBackup before touching the live database, when present. */
+  sha256?: string;
   [key: string]: unknown;
 }
 

@@ -1,0 +1,15 @@
+{
+  "//": "Contract test for the hand-written src/index.d.ts. `npm run verify:types`",
+  "//2": "type-checks a consumer snippet against the declarations so the .d.ts",
+  "//3": "can't silently drift from the JS. No emit — this only checks types.",
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": false,
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "es2020",
+    "types": ["node"]
+  },
+  "include": ["src/index.d.ts", "scripts/types-consumer.ts"]
+}

@@ -3,6 +3,64 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.5.0
+
+Maturation pass: hardens integrity/consistency around backup and restore, and
+fixes lingering `@bewks`/`db-backup-manager` references left over from the
+BWK-85 extraction. Additive — all existing `backup`/`restore`/`list`/`prune`
+behavior and defaults are unchanged.
+
+- **Fix**: README title, Usage/recipes/cron examples, the programmatic
+  `require(...)` snippet, and the CLI's own `--help` usage line all still said
+  `@bewks/db-backup-manager` / `db-backup-manager`. Replaced everywhere with
+  `@andrewpopov/db-backup` / `db-backup`. Added an `## Install` section
+  (`npm install github:andrewpopov/db-backup#v0.5.0`).
+- **Fix — clock-skew retention safety**: a future-dated backup filename (clock
+  skew) could sort as "newest" and starve a real daily slot. `listBackups` /
+  `getBackupEntryFromPath` now clamp the derived `ageDays` to a minimum of 0
+  (display-only; `createdAt` stays truthful), and `planRetention` now sorts by
+  an *effective* time (`Math.min(createdAt, now)`) so a future-dated backup
+  can no longer out-rank the actual newest backup for daily slot 1.
+  `chooseAnchorCandidate`'s recomputed `ageDays` is clamped the same way.
+- **Postgres backup verification**: after `pg_dump`, `pg_restore --list` reads
+  the archive's table of contents (no database touched) as a structural sanity
+  check, mirroring the existing SQLite `PRAGMA integrity_check`. On failure the
+  dump is deleted and the backup throws. Skipped (dump kept) when `pg_restore`
+  isn't installed, matching the SQLite cp-fallback's skip behavior.
+- **Advisory lock around `backup` and `prune`**: a `.db-backup.lock` file
+  (atomic `O_EXCL` create) in `outputDir` prevents two concurrent db-backup
+  runs from racing each other. A live lock throws `Another db-backup run holds
+  the lock`; a stale lock (default: older than 30 minutes) is safely stolen.
+  `prune` still no-ops without locking when `outputDir` doesn't exist yet.
+- **sha256 + manifest wiring**: `runBackupJob`'s created backup now carries a
+  `sha256` (new optional field on `BackupEntry`/`BackupManifestEntry`), and a
+  manifest entry is appended best-effort (a manifest write failure is logged
+  via `console.warn` and never fails the backup itself). Pre-restore safety
+  backups are intentionally NOT manifested — they're transient.
+  `restoreBackup` now verifies the selected backup's bytes against its
+  manifest checksum (read from the backup file's own directory, so an
+  absolute `--file` outside `outputDir` is still checked) before touching the
+  live database, throwing `Backup checksum mismatch` on a mismatch. Backups
+  with no manifest entry, or an entry with no `sha256` (older backups), skip
+  the check.
+- **SQLite restore validation**: before a restore overwrites the live
+  database, the restored bytes are integrity-checked (`PRAGMA
+  integrity_check`) on the TEMP file — never on the live destination — using a
+  new, non-deleting `assertSqliteIntegrity`. A failure cleans up only the temp
+  file and throws; the live database is never touched, even with
+  `--no-pre-backup`. Skipped when `sqlite3` isn't installed. (Postgres restores
+  get no equivalent check in this release — it would require a live database
+  connection.)
+- CI: added a non-required `compat` matrix job (Node 22/24) and a `ci-success`
+  aggregation job, plus a `verify:types` step/script backed by a new
+  `tsconfig.types.json` + `scripts/types-consumer.ts` type contract test
+  against `src/index.d.ts` (new `typescript` devDependency).
+- Expanded test coverage: restore round-trip via the cp-fallback path,
+  `--latest` restore selection, engine-mismatch restore, a truncated `.gz`
+  backup leaving the live DB untouched, `planRetention` edge cases (dailySlots
+  exceeding maxBackups, an empty backup list, the future-dated starvation
+  case), the sqlite3 locked-database retry path, and `loadEnvironment`'s
+  prod-mode env-file precedence and strict-production-env guard.
 ## 0.4.1
 
 - Renamed package scope `@andrewvpopov/*` -> `@andrewpopov/*` after consolidating the GitHub org into the `andrewpopov` user. No runtime or API change; update imports and the `github:` install path to `andrewpopov/db-backup`.

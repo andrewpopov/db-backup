@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const zlib = require('zlib');
 const { config: loadDotenv, parse: parseDotenv } = require('dotenv');
@@ -488,6 +489,38 @@ function verifySqliteBackupIntegrity(backupPath, runtime) {
   }
 }
 
+// Analog of verifySqliteBackupIntegrity for Postgres custom-format dumps:
+// `pg_restore --list` reads the archive's TOC without touching any database, so
+// it's a cheap structural sanity check that the dump isn't truncated/corrupt.
+// Deletes the dump and throws on failure, mirroring the SQLite behavior.
+function verifyPostgresBackupIntegrity(backupPath, runtime) {
+  try {
+    runtime.execFileSync('pg_restore', ['--list', backupPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    const stdErr = error.stderr ? error.stderr.toString() : '';
+    const firstLine = stdErr.trim().split(/\r?\n/, 1)[0] || 'no output';
+    fs.rmSync(backupPath, { force: true });
+    throw new Error(`PostgreSQL backup verification failed: ${firstLine}`);
+  }
+}
+
+// Chunked (not whole-file) hashing so a large backup can't OOM the process right
+// after it was written — a checksum step must never make a good backup unusable.
+function sha256File(filePath) {
+  const hash = crypto.createHash('sha256');
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(1 << 16); // 64 KiB
+    let bytesRead;
+    while ((bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest('hex');
+}
+
 function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd = process.cwd(), runtime = normalizeRuntime() }) {
   now = now || runtime.now();
   const sourcePath = parseSqlitePath(databaseUrl, cwd);
@@ -545,6 +578,7 @@ function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd =
     compressed,
     createdAt: now.toISOString(),
     sizeBytes: stats.size,
+    sha256: sha256File(finalPath),
   };
 }
 
@@ -561,6 +595,13 @@ function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalize
     outputDir,
   });
   runtime.execFileSync('pg_dump', ['--format=custom', `--file=${fullPath}`, databaseUrl], { stdio: 'inherit' });
+
+  // Verify the dump before we keep it, mirroring the SQLite integrity check.
+  // Only possible when pg_restore is present; skip like the SQLite cp-fallback.
+  if (runtime.commandExists('pg_restore')) {
+    verifyPostgresBackupIntegrity(fullPath, runtime);
+  }
+
   const stats = fs.statSync(fullPath);
 
   return {
@@ -570,6 +611,7 @@ function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalize
     compressed: false,
     createdAt: now.toISOString(),
     sizeBytes: stats.size,
+    sha256: sha256File(fullPath),
   };
 }
 
@@ -616,7 +658,9 @@ function getBackupEntryFromPath(backupPath, now = new Date()) {
   const stats = fs.statSync(backupPath);
   const timestampDate = parseTimestampKey(parsed.timestampKey);
   const createdAt = timestampDate || stats.mtime;
-  const ageDays = (now.getTime() - createdAt.getTime()) / DAY_MS;
+  // Clamp to zero: a future-dated backup (clock skew) must never read as
+  // "negative age" for display/consumers. createdAt itself stays truthful.
+  const ageDays = Math.max(0, (now.getTime() - createdAt.getTime()) / DAY_MS);
 
   return {
     fileName,
@@ -655,6 +699,21 @@ function resolveRestoreBackup({
   throw new Error('Restore requires --file <backup-file> or --latest.');
 }
 
+// Distinct from verifySqliteBackupIntegrity: that helper deletes the file it
+// checks on failure, which is correct for a freshly-created backup snapshot but
+// would DESTROY the live database if reused here. This one only checks and
+// throws — the caller (restoreSqliteBackup) is responsible for cleaning up its
+// own temp file, and the live destination is never touched by this function.
+function assertSqliteIntegrity(filePath, runtime) {
+  const output = runtime.execFileSync('sqlite3', [filePath, 'PRAGMA integrity_check;'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const firstLine = (output ? output.toString() : '').trim().split(/\r?\n/, 1)[0] || '';
+  if (firstLine !== 'ok') {
+    throw new Error(`SQLite restore integrity check failed: ${firstLine || 'no output'}`);
+  }
+}
+
 function redactDatabaseUrl(databaseUrl) {
   try {
     const parsed = new URL(databaseUrl);
@@ -688,6 +747,13 @@ function restoreSqliteBackup({
       fs.writeFileSync(tempPath, decompressed);
     } else {
       fs.copyFileSync(backupEntry.fullPath, tempPath);
+    }
+
+    // Validate the restored file on the TEMP path, BEFORE it ever replaces the
+    // live database: if this throws, the catch below cleans up tempPath only —
+    // destinationPath is never touched, so a bad backup can't destroy a good DB.
+    if (runtime.commandExists('sqlite3')) {
+      assertSqliteIntegrity(tempPath, runtime);
     }
 
     if (fs.existsSync(destinationPath)) {
@@ -740,6 +806,29 @@ function restorePostgresBackup({
   };
 }
 
+// Checksum guard, run BEFORE anything touches the live DB (pre-restore backup
+// creation or the restore itself). Reads the manifest from the backup file's
+// OWN directory (path.dirname(backupEntry.fullPath)) rather than
+// resolved.outputDir: a `--file` argument may be an absolute path outside
+// outputDir, and the manifest that recorded it lives alongside it. Matches the
+// LAST manifest entry whose `name` equals the backup's filename, to tolerate a
+// recreated same-timestamp file. Older backups (no manifest, or a manifest
+// entry with no sha256) skip the check entirely.
+function verifyBackupChecksum(backupEntry) {
+  const manifest = readBackupManifest(path.dirname(backupEntry.fullPath));
+  const matches = manifest.entries.filter((entry) => entry.name === backupEntry.fileName);
+  const matched = matches[matches.length - 1];
+
+  if (!matched || !matched.sha256) {
+    return;
+  }
+
+  const actual = sha256File(backupEntry.fullPath);
+  if (actual !== matched.sha256) {
+    throw new Error(`Backup checksum mismatch for ${backupEntry.fileName}`);
+  }
+}
+
 function restoreBackup(options = {}) {
   const resolved = resolveBackupOptions(options);
   const now = resolved.runtime.now();
@@ -760,6 +849,11 @@ function restoreBackup(options = {}) {
       `Backup engine mismatch. Selected backup is "${backupEntry.engine}" but DATABASE_URL uses "${databaseEngine}".`
     );
   }
+
+  // Before touching the live DB at all (not even the pre-restore safety
+  // backup): verify the selected backup's bytes against its manifest checksum,
+  // if one was recorded.
+  verifyBackupChecksum(backupEntry);
 
   let preRestoreBackup = null;
   if (options.createPreRestoreBackup !== false) {
@@ -818,7 +912,9 @@ function listBackups({ outputDir = DEFAULT_OUTPUT_DIR, now = new Date() } = {}) 
       const fullPath = path.join(absoluteOutputDir, fileName);
       const fileStats = fs.statSync(fullPath);
       const createdAt = timestampDate || fileStats.mtime;
-      const ageDays = (now.getTime() - createdAt.getTime()) / DAY_MS;
+      // Clamp to zero: a future-dated backup (clock skew) must never read as
+      // "negative age" for display/consumers. createdAt itself stays truthful.
+      const ageDays = Math.max(0, (now.getTime() - createdAt.getTime()) / DAY_MS);
 
       return {
         fileName,
@@ -846,7 +942,9 @@ function chooseAnchorCandidate(backups, anchor, now, excludedNames) {
     .filter((backup) => !excludedNames.has(backup.fileName))
     .map((backup) => ({
       ...backup,
-      ageDays: (now.getTime() - new Date(backup.createdAt).getTime()) / DAY_MS,
+      // Clamp to zero: a future-dated (clock-skewed) backup must not read as
+      // younger-than-zero when matched against an anchor's age window.
+      ageDays: Math.max(0, (now.getTime() - new Date(backup.createdAt).getTime()) / DAY_MS),
     }))
     .filter((backup) => backup.ageDays >= anchor.minAgeDays && backup.ageDays <= anchor.maxAgeDays);
 
@@ -871,8 +969,14 @@ function planRetention(backups, policy = DEFAULT_RETENTION_POLICY, now = new Dat
   const selected = [];
   const selectedNames = new Set();
 
+  // Sort by an EFFECTIVE time (clamped to "now") rather than raw createdAt: a
+  // future-dated backup (clock skew) would otherwise sort first and starve a
+  // daily slot from a legitimately-recent backup.
+  const nowMs = now.getTime();
   const sorted = [...backups].sort(
-    (left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()
+    (left, right) =>
+      Math.min(new Date(right.createdAt).getTime(), nowMs) -
+      Math.min(new Date(left.createdAt).getTime(), nowMs)
   );
 
   const dailyCount = Math.min(policy.dailySlots, policy.maxBackups);
@@ -960,41 +1064,159 @@ function listBackupsWithPlan(options = {}) {
   };
 }
 
+const LOCK_FILENAME = '.db-backup.lock';
+
+// Advisory, cooperative lock so a scheduled backup/prune run doesn't clobber a
+// concurrent one in the same outputDir. Not a substitute for filesystem-level
+// locking — it only protects db-backup runs against each other.
+//
+// - Acquire atomically via O_EXCL (`wx`): only one process can create the file.
+// - On EEXIST, read the existing lock's `at` (an ISO string — age is computed
+//   with Date.parse + getTime(), never by subtracting the string itself). If
+//   it's unreadable/invalid (NaN) or older than `staleMs`, re-read the file once
+//   and only steal (delete) it if the token we just re-read still matches the
+//   token we originally saw — this avoids racing a newer run that stole the
+//   lock a moment earlier. Then retry the atomic open exactly once.
+// - Otherwise (a live, non-stale lock), throw.
+// - In `finally`, only remove the lock file if its token still matches ours —
+//   a run that stole our (stale) lock after us owns it now, and must not have
+//   its lock deleted out from under it.
+function withBackupLock(outputDir, runtime, fn, { staleMs = 30 * 60 * 1000 } = {}) {
+  const lockPath = path.join(outputDir, LOCK_FILENAME);
+  const token = runtime.randomId();
+
+  const lockedError = () =>
+    new Error(`Another db-backup run holds the lock (${lockPath}, pid ${process.pid}).`);
+
+  function readLockFile() {
+    try {
+      return JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    } catch {
+      return null;
+    }
+  }
+
+  let fd;
+  try {
+    fd = fs.openSync(lockPath, 'wx');
+  } catch (error) {
+    if (error.code !== 'EEXIST') {
+      throw error;
+    }
+
+    const existing = readLockFile();
+    const age = existing ? runtime.now().getTime() - Date.parse(existing.at) : NaN;
+
+    if (!(Number.isFinite(age) && age <= staleMs)) {
+      // Steal a lock that is either (a) stale and still owned by the same token,
+      // or (b) a corrupt/zero-byte leftover from a crash between openSync('wx')
+      // and writeFileSync — otherwise an unparsable lock would deadlock every
+      // future run forever. (Best-effort advisory lock on a single host: a rare
+      // concurrent run is tolerated by unique filenames + idempotent prune.)
+      const reread = readLockFile();
+      const sameStaleOwner = existing && reread && reread.token === existing.token;
+      const corruptLeftover = !existing && !reread;
+      if (sameStaleOwner || corruptLeftover) {
+        fs.rmSync(lockPath, { force: true });
+      }
+
+      try {
+        fd = fs.openSync(lockPath, 'wx');
+      } catch (retryError) {
+        if (retryError.code === 'EEXIST') {
+          throw lockedError();
+        }
+        throw retryError;
+      }
+    } else {
+      throw lockedError();
+    }
+  }
+
+  fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: runtime.now().toISOString(), token }));
+  fs.closeSync(fd);
+
+  try {
+    return fn();
+  } finally {
+    const current = readLockFile();
+    if (current && current.token === token) {
+      fs.rmSync(lockPath, { force: true });
+    }
+  }
+}
+
 // Apply the retention policy to an existing backup directory without creating a
 // new snapshot — a standalone cleanup pass. Like list, it never opens the
 // database, so DATABASE_URL is not required.
 function pruneBackupsJob(options = {}) {
   const resolved = resolveBackupOptions({ ...options, requireDatabaseUrl: false });
   const now = resolved.runtime.now();
-  const backups = listBackups({ outputDir: resolved.outputDir, now });
-  const plan = planRetention(backups, resolved.policy, now);
-  const removed = pruneBackups(plan.remove);
 
-  return {
-    removed,
-    kept: plan.keep,
-    mode: resolved.mode,
-    outputDir: resolved.outputDir,
-    policy: resolved.policy,
-  };
+  // Preserve today's no-op-on-missing-dir behavior, and don't attempt to
+  // create a lock file inside a directory that doesn't exist.
+  if (!fs.existsSync(resolved.outputDir)) {
+    return {
+      removed: [],
+      kept: [],
+      mode: resolved.mode,
+      outputDir: resolved.outputDir,
+      policy: resolved.policy,
+    };
+  }
+
+  return withBackupLock(resolved.outputDir, resolved.runtime, () => {
+    const backups = listBackups({ outputDir: resolved.outputDir, now });
+    const plan = planRetention(backups, resolved.policy, now);
+    const removed = pruneBackups(plan.remove);
+
+    return {
+      removed,
+      kept: plan.keep,
+      mode: resolved.mode,
+      outputDir: resolved.outputDir,
+      policy: resolved.policy,
+    };
+  });
 }
 
 function runBackupJob(options = {}) {
   const resolved = resolveBackupOptions(options);
-  const created = createBackup(resolved);
-  const now = resolved.runtime.now();
-  const backups = listBackups({ outputDir: resolved.outputDir, now });
-  const plan = planRetention(backups, resolved.policy, now);
-  const removed = pruneBackups(plan.remove);
+  fs.mkdirSync(resolved.outputDir, { recursive: true });
 
-  return {
-    created,
-    removed,
-    kept: plan.keep,
-    mode: resolved.mode,
-    outputDir: resolved.outputDir,
-    policy: resolved.policy,
-  };
+  return withBackupLock(resolved.outputDir, resolved.runtime, () => {
+    const created = createBackup(resolved);
+    const now = resolved.runtime.now();
+    const backups = listBackups({ outputDir: resolved.outputDir, now });
+    const plan = planRetention(backups, resolved.policy, now);
+    const removed = pruneBackups(plan.remove);
+
+    // Best-effort: a manifest write failure must never fail the backup itself.
+    // Safety/pre-restore backups (created via createBackup outside this job)
+    // are intentionally NOT manifested — they're transient.
+    try {
+      appendBackupManifestEntry(resolved.outputDir, {
+        name: created.fileName,
+        path: created.fullPath,
+        createdAt: created.createdAt,
+        sizeBytes: created.sizeBytes,
+        engine: created.engine,
+        compressed: created.compressed,
+        sha256: created.sha256,
+      });
+    } catch (error) {
+      console.warn(`[db-backup] Failed to append manifest entry: ${error.message}`);
+    }
+
+    return {
+      created,
+      removed,
+      kept: plan.keep,
+      mode: resolved.mode,
+      outputDir: resolved.outputDir,
+      policy: resolved.policy,
+    };
+  });
 }
 
 function buildDailyCronEntry({
@@ -1031,7 +1253,7 @@ function formatBytes(sizeBytes) {
 function showHelp() {
   console.log(`
 Usage:
-  db-backup-manager [backup|list|prune|cron|restore] [options]
+  db-backup [backup|list|prune|cron|restore] [options]
 
 Commands:
   backup                  Create a backup and apply retention policy (default)

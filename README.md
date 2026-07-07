@@ -1,8 +1,14 @@
-# @bewks/db-backup-manager
+# @andrewpopov/db-backup
 
 ## Document Status
 - Status: Active package reference
 - Last reviewed: 2026-07-05
+
+## Install
+
+```bash
+npm install github:andrewpopov/db-backup#v0.5.0
+```
 
 Reusable database backup utilities with an age-tiered retention strategy
 (defaults, tunable via `--max-backups` / `--daily-slots` or the
@@ -26,22 +32,22 @@ cap and daily-slot count are exposed on the CLI.
 
 ```bash
 # Create backup + apply retention policy
-db-backup-manager backup --prod --output-dir /var/backups/myapp
+db-backup backup --prod --output-dir /var/backups/myapp
 
 # List backups and retention decisions (dry run — no DB needed)
-db-backup-manager list --output-dir /var/backups/myapp
+db-backup list --output-dir /var/backups/myapp
 
 # Apply retention now without taking a new backup (no DB needed)
-db-backup-manager prune --output-dir /var/backups/myapp --max-backups 6
+db-backup prune --output-dir /var/backups/myapp --max-backups 6
 
 # Print a copy-pasteable cron entry for daily execution
-db-backup-manager cron --hour 3 --minute 0 --prod --output-dir /var/backups/myapp
+db-backup cron --hour 3 --minute 0 --prod --output-dir /var/backups/myapp
 
 # Restore from a specific backup file
-db-backup-manager restore --prod --output-dir /var/backups/myapp --file sqlite-backup-20260219-030000Z.db.gz
+db-backup restore --prod --output-dir /var/backups/myapp --file sqlite-backup-20260219-030000Z.db.gz
 
 # Restore from the latest backup in output-dir
-db-backup-manager restore --prod --output-dir /var/backups/myapp --latest
+db-backup restore --prod --output-dir /var/backups/myapp --latest
 ```
 
 ## Adoption recipes
@@ -53,7 +59,7 @@ outside your source checkout when possible:
 
 ```bash
 DATABASE_URL=file:./data/app.db
-db-backup-manager backup --prod --output-dir /var/backups/myapp
+db-backup backup --prod --output-dir /var/backups/myapp
 ```
 
 When `sqlite3` is available, backups are created with SQLite's online `.backup`
@@ -71,7 +77,7 @@ Set `DATABASE_URL` to a Postgres connection string:
 
 ```bash
 DATABASE_URL=postgresql://user:password@db.example.com:5432/myapp
-db-backup-manager backup --prod --output-dir /var/backups/myapp
+db-backup backup --prod --output-dir /var/backups/myapp
 ```
 
 PostgreSQL backups require `pg_dump`. Restores require `pg_restore`.
@@ -85,7 +91,7 @@ Generate a copy-pasteable cron entry. `cron` reflects the flags you pass
 and defaults the log path to `<output-dir>/backup.log`:
 
 ```bash
-db-backup-manager cron --hour 3 --minute 0 --prod --output-dir /var/backups/myapp --allow-missing
+db-backup cron --hour 3 --minute 0 --prod --output-dir /var/backups/myapp --allow-missing
 # 0 3 * * * /usr/bin/env bash -lc 'cd "/srv/myapp" && npx db-backup backup --prod --output-dir "/var/backups/myapp" --allow-missing >> "/var/backups/myapp/backup.log" 2>&1'
 ```
 
@@ -94,7 +100,7 @@ under npm and pnpm). Override it entirely with `--command` (e.g. to wrap a
 `pnpm exec` or an app npm script) and set the log file with `--log-path`:
 
 ```bash
-db-backup-manager cron --command 'pnpm exec db-backup backup --allow-missing' --log-path /srv/myapp/logs/backup.log
+db-backup cron --command 'pnpm exec db-backup backup --allow-missing' --log-path /srv/myapp/logs/backup.log
 ```
 
 ## Environment resolution
@@ -119,7 +125,7 @@ const {
   listBackupsWithPlan,
   restoreBackup,
   DEFAULT_RETENTION_POLICY,
-} = require('@bewks/db-backup-manager');
+} = require('@andrewpopov/db-backup');
 
 const result = runBackupJob({
   mode: 'prod',
