@@ -1,8 +1,10 @@
 # @andrewpopov/db-backup
 
-## Document Status
-- Status: Active package reference
-- Last reviewed: 2026-07-05
+Backs up SQLite and PostgreSQL databases from a CLI or a Node API: timestamped
+compressed dumps, retention policies, optional GPG encryption at rest, verified
+off-host replication via rclone, and a freshness check that catches a cron job
+which has silently stopped producing backups. Built for self-hosted apps where
+the backup job has to be trustworthy without a human watching it.
 
 ## Install
 
@@ -10,9 +12,10 @@
 npm install github:andrewpopov/db-backup#v0.11.1
 ```
 
-Reusable database backup utilities with three retention strategies. **Age-tier**
-is the default; **keep-last** and **keep-days** are flat alternatives. The modes
-are mutually exclusive — pick one.
+## Retention
+
+Three retention strategies. **Age-tier** is the default; **keep-last** and
+**keep-days** are flat alternatives. The modes are mutually exclusive — pick one.
 
 ### Age-tier (default)
 
@@ -69,7 +72,7 @@ and refuses without the passphrase.
 ## Filename prefix
 
 ```bash
-db-backup backup --prod --name-prefix smarthome     # smarthome-<ts>.db.gz.gpg
+db-backup backup --prod --name-prefix myapp     # myapp-<ts>.db.gz.gpg
 ```
 
 Defaults to `sqlite-backup` / `postgres-backup`. Set it to adopt an existing
@@ -101,6 +104,34 @@ skipping the off-site copy.
 Remote retention never deletes the object it just uploaded (a host whose clock
 rolled backward would otherwise delete the only verified copy). Use
 `--skip-remote` for a fast local-only run, e.g. a pre-migration deploy hook.
+
+### Cloudflare R2 (and other S3-compatible targets)
+
+The `--remote` target is just an [rclone](https://rclone.org) remote, so any
+backend rclone supports works — Cloudflare R2, AWS S3, Backblaze B2, or a second
+local disk. To replicate to R2, define an rclone remote once:
+
+```bash
+rclone config create r2 s3 \
+  provider=Cloudflare \
+  access_key_id=<R2_ACCESS_KEY_ID> \
+  secret_access_key=<R2_SECRET_ACCESS_KEY> \
+  endpoint=https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
+  region=auto acl=private no_check_bucket=true
+```
+
+The access key ID and secret come from the R2 dashboard (**Manage R2 API Tokens**
+→ an *S3 credential* pair — not a general Cloudflare API token, which cannot sign
+S3 requests). Then point `--remote` at a bucket and prefix:
+
+```bash
+db-backup backup --prod \
+  --remote r2:my-bucket/my-app --remote-keep 30 \
+  --rclone-config ~/.config/rclone/rclone.conf
+```
+
+The upload, byte-verification, and remote retention described above apply
+unchanged — the remote is opaque to `db-backup`.
 
 ## Backup liveness
 
@@ -326,5 +357,6 @@ After restore, restart the application before serving traffic.
 ## What stays app-specific
 
 The package does not decide where backups should live, who can trigger them, or
-how a web UI should present them. In Bewks, those concerns live in the admin
-controller and settings layer; other apps should keep the same adapter boundary.
+how a web UI should present them. Those concerns belong in the host application —
+an admin controller, a settings layer — as a thin adapter over the programmatic
+API, not inside the package.
