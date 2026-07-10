@@ -330,6 +330,32 @@ export function checkBackupFreshness(options: {
   now?: Date;
 }): BackupFreshness;
 
+/** Remote sibling of {@link checkBackupFreshness}: the newest object under the
+ * rclone remote stands in for the stamp, so a host that is NOT the backup host
+ * can verify the off-site copy (the dead-man's switch a local stamp can't be).
+ * Returns the same shape; throws when `rclone` is unavailable or its listing is
+ * unparseable — "couldn't tell" is never "fresh". */
+export function checkRemoteFreshness(options: {
+  remote: BackupRemote;
+  maxAgeHours?: number;
+  now?: Date;
+  runtime?: BackupRuntime;
+}): BackupFreshness;
+
+/** Best-effort alert delivery for the `freshness` command. NEVER throws and
+ * NEVER changes the exit code. Synchronous (POSTs via curl / runs a command),
+ * so it adds no dependency and does not make callers async. `notifyCommand`
+ * receives the message in `$DB_BACKUP_ALERT`. */
+export function notifyAlert(
+  message: string,
+  options?: {
+    notifyDiscord?: string | null;
+    notifyWebhook?: string | null;
+    notifyCommand?: string | null;
+    runtime?: BackupRuntime;
+  },
+): void;
+
 /** Build a bounded runtime. Pass `commandTimeoutMs` (or set
  * `DB_BACKUP_COMMAND_TIMEOUT_MS`) to override the default bound. */
 export function normalizeRuntime(runtime?: BackupRuntime): ResolvedBackupRuntime;
@@ -390,7 +416,7 @@ export function restoreSqliteBackup(options?: {
  * whenever that file is replaced wholesale. No-op when absent. */
 export function removeSqliteSidecars(databasePath: string): void;
 
-// --- Backup-storage helpers (generalized from stoki/pantry) ---
+// --- Backup-storage helpers ---
 
 export interface BackupManifestEntry {
   name: string;

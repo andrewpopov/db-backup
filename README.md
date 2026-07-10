@@ -147,6 +147,36 @@ db-backup freshness --stamp-file /var/lib/app/backups/.last-success --max-age-ho
 ever recorded**. Pair it with `--min-bytes` so a truncated database — which passes
 `PRAGMA integrity_check` — fails loudly instead of rotating out a good backup.
 
+### Off-host dead-man's switch (remote freshness + alerts)
+
+A local `--stamp-file` check runs *on the backup host* — so it dies with the host, and
+it only exits non-zero; someone still has to watch it. To actually get told when the
+backup silently stops, run `freshness --remote` **from a different host** and give it a
+notification channel:
+
+```bash
+# On a persistent host that is NOT the backup host (a timer, every few hours):
+db-backup freshness --remote r2:backups/app --max-age-hours 30 \
+  --rclone-config /path/to/rclone.conf \
+  --notify-discord https://discord.com/api/webhooks/…
+```
+
+`--remote` checks the newest object's age under the rclone remote instead of a local
+stamp — verifying the *off-site copy* independently, which catches host death, a broken
+timer, a failed upload, and a deleted script alike. On staleness, a missing backup, a
+future timestamp (clock skew), or a check that can't run (rclone missing), it alerts:
+
+| flag | delivery |
+|---|---|
+| `--notify-discord <url>` | POST `{"content": message}` to a Discord webhook |
+| `--notify-webhook <url>` | POST `{"text": message}` to any webhook (Slack-style) |
+| `--notify-command <cmd>` | run `cmd` with the message in `$DB_BACKUP_ALERT` (generic escape hatch) |
+
+Notifications are **best-effort and synchronous** (POST via `curl`, or run the command) —
+a failing webhook never masks or manufactures a verdict, and `freshness` still exits
+non-zero on staleness. No new dependency; no `fetch` (so `runCli` stays synchronous and
+consumers' `try/catch` is unaffected).
+
 ## Supported databases
 
 - SQLite (`DATABASE_URL=file:...`)

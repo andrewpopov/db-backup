@@ -102,6 +102,9 @@ function parseArgs(argv) {
     skipRemote: false,
     cronCommand: null,
     logPath: null,
+    notifyCommand: null,
+    notifyDiscord: null,
+    notifyWebhook: null,
   };
 
   const commandArg = argv[0];
@@ -356,6 +359,30 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--notify-discord') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --notify-discord');
+      options.notifyDiscord = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--notify-webhook') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --notify-webhook');
+      options.notifyWebhook = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--notify-command') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --notify-command');
+      options.notifyCommand = value;
+      index += 1;
+      continue;
+    }
+
     throw new Error(`Unknown argument: ${arg}`);
   }
 
@@ -472,7 +499,7 @@ function detectDatabaseEngine(databaseUrl) {
 }
 
 // The canonical prefixes. A consumer with an existing backup history under a
-// different name (smarthome's `smarthome-<ts>.db.gpg`) sets `namePrefix` so the
+// different name (e.g. `myapp-<ts>.db.gpg`) sets `namePrefix` so the
 // package adopts that history instead of orphaning it. The ENGINE is then read
 // from the extension — `.db` is sqlite, `.dump` is postgres — which is
 // unambiguous and independent of the prefix.
@@ -787,9 +814,8 @@ function quoteDotCommandArg(value) {
 }
 
 
-// Encryption at rest. Absorbed from smarthome's backup-db.sh (BWK-131), which
-// was strictly better than this package on this axis: db-backup wrote plaintext
-// snapshots to disk and left off-siting and secrecy entirely to the operator.
+// Encryption at rest. Without it, a backup writes plaintext snapshots to disk
+// and leaves off-siting and secrecy entirely to the operator.
 //
 // gpg symmetric AES256 with a passphrase FILE — never a passphrase argument,
 // which would be visible in the process table. The plaintext artifact is removed
@@ -801,7 +827,6 @@ function quoteDotCommandArg(value) {
 // by other local users. Node's fs mode argument is masked by the process umask,
 // and gzip/gpg/pg_dump write through child processes that ignore it entirely —
 // so restrict explicitly after each artifact lands, rather than trusting umask.
-// Absorbed from smarthome's `umask 077` (BWK-132).
 const ARTIFACT_MODE = 0o600;
 const BACKUP_DIR_MODE = 0o700;
 
@@ -903,8 +928,8 @@ function decryptBackupToPath(sourcePath, destPath, encryption, runtime) {
 }
 
 // A snapshot far smaller than expected is a failure, not a backup: an empty or
-// truncated database sails through `integrity_check`. Absorbed from smarthome's
-// MIN_BACKUP_BYTES floor. Disabled (0) unless the consumer sets it.
+// truncated database sails through `integrity_check`. A minimum-size floor
+// catches this. Disabled (0) unless the consumer sets it.
 function assertMinimumBackupSize(entry, minBytes) {
   if (!minBytes || minBytes <= 0) {
     return;
@@ -1724,11 +1749,10 @@ function pruneBackupsJob(options = {}) {
 
 
 // ---------------------------------------------------------------------------
-// Off-host replication (BWK-131, absorbed from smarthome's backup-db.sh).
+// Off-host replication.
 //
-// A local-only backup dies with the disk it sits on. sano-os's docs flag exactly
-// this ("same-SSD durability gap"), and rouge pulls its backups to a Mac by hand.
-// smarthome solved it properly and this package had nothing.
+// A local-only backup dies with the disk it sits on — the same-disk durability
+// gap. A verified off-host copy closes it.
 //
 // The invariant that makes it safe: NOTHING is pruned and NO success is stamped
 // until the remote object has been re-read and its size matched. A failed or
@@ -1841,12 +1865,11 @@ function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null)
 
 // `.last-success` is the liveness signal a cron-driven backup otherwise lacks:
 // a job that silently stops producing backups is invisible without one.
-// Absorbed from smarthome's .last-success stamp + check-backup-freshness.sh.
 function writeSuccessStamp(stampFile, now = new Date()) {
   const dir = path.dirname(stampFile);
   fs.mkdirSync(dir, { recursive: true });
   // Write-then-rename: a crash mid-write must never leave a truncated stamp that
-  // a freshness monitor would misread. Absorbed from smarthome's mktemp + mv.
+  // a freshness monitor would misread.
   const tempPath = path.join(dir, `.last-success.tmp-${process.pid}`);
   fs.writeFileSync(tempPath, `${now.toISOString()}\n`, { mode: ARTIFACT_MODE });
   restrictArtifact(tempPath);
@@ -1873,7 +1896,6 @@ function readSuccessStamp(stampFile) {
 // stopped. That is not hypothetical: it is the same clock-rollback failure mode
 // this package already guards against in retention. A host whose clock jumps
 // forward once stamps a future date and blinds the monitor permanently.
-// Absorbed from smarthome's check-backup-freshness.sh (BWK-135).
 function checkBackupFreshness({ stampFile, maxAgeHours = 36, now = new Date() } = {}) {
   if (!stampFile) {
     throw new Error('stampFile is required to check backup freshness');
@@ -1887,6 +1909,95 @@ function checkBackupFreshness({ stampFile, maxAgeHours = 36, now = new Date() } 
     return { fresh: false, clockSkew: true, stampedAt, ageHours, maxAgeHours };
   }
   return { fresh: ageHours <= maxAgeHours, clockSkew: false, stampedAt, ageHours, maxAgeHours };
+}
+
+// Newest ModTime under an rclone remote, or null if the remote is empty. Reuses
+// the rclone env + object-path helpers the upload path uses. `rclone lsjson`
+// returns an array of { Path, ModTime, ... }; an unparseable response is a
+// FAILURE (throws), mirroring verifyRemoteObject — "couldn't tell" is never
+// "fresh".
+function remoteNewestModTime(remote, runtime) {
+  if (!runtime.commandExists('rclone')) {
+    throw new Error('rclone is unavailable — cannot check remote backup freshness');
+  }
+  const output = runtime.execFileSync('rclone', ['lsjson', remote.target.replace(/\/+$/, '')], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: rcloneEnv(remote),
+  });
+  let entries;
+  try {
+    entries = JSON.parse((output || '').toString());
+  } catch {
+    throw new Error(`Could not parse rclone lsjson for ${remote.target}; refusing to report freshness`);
+  }
+  if (!Array.isArray(entries)) {
+    throw new Error(`Unexpected rclone lsjson shape for ${remote.target}`);
+  }
+  let newest = null;
+  for (const entry of entries) {
+    if (entry && entry.IsDir) continue;
+    const t = entry && entry.ModTime ? new Date(entry.ModTime) : null;
+    if (t && !Number.isNaN(t.getTime()) && (!newest || t.getTime() > newest.getTime())) {
+      newest = t;
+    }
+  }
+  return newest;
+}
+
+// Remote sibling of checkBackupFreshness: the newest object under the rclone
+// remote stands in for the stamp. Returns the SAME { fresh, clockSkew,
+// stampedAt, ageHours, maxAgeHours } shape so the CLI print/exit/notify path is
+// uniform. Lets a host that is NOT the backup host verify the off-site copy —
+// the dead-man's switch the local stamp check can't be (it dies with the host).
+function checkRemoteFreshness({ remote, runtime = normalizeRuntime(), maxAgeHours = 36, now = new Date() } = {}) {
+  if (!remote || !remote.target) {
+    throw new Error('remote.target is required to check remote backup freshness');
+  }
+  const stampedAt = remoteNewestModTime(remote, runtime);
+  if (!stampedAt) {
+    return { fresh: false, clockSkew: false, stampedAt: null, ageHours: null, maxAgeHours };
+  }
+  const ageHours = (now.getTime() - stampedAt.getTime()) / (60 * 60 * 1000);
+  if (ageHours < 0) {
+    return { fresh: false, clockSkew: true, stampedAt, ageHours, maxAgeHours };
+  }
+  return { fresh: ageHours <= maxAgeHours, clockSkew: false, stampedAt, ageHours, maxAgeHours };
+}
+
+// Best-effort alert delivery. NEVER throws and NEVER changes the exit code — a
+// failing webhook must not mask (or manufacture) a stale-backup verdict. Stays
+// synchronous (no fetch) so runCli's contract and every consumer's
+// `try { runCli() } catch` are unaffected. Zero new deps: POSTs via curl (the
+// discord/webhook helpers), or runs an arbitrary command with the message in
+// $DB_BACKUP_ALERT (the fully generic escape hatch).
+function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, runtime = normalizeRuntime() } = {}) {
+  const postJson = (url, body) => {
+    if (!runtime.commandExists('curl')) {
+      console.warn('[db-backup] notify skipped: curl is unavailable');
+      return;
+    }
+    // Body over stdin (`-d @-`) so the message never lands in argv/ps output.
+    runtime.execFileSync('curl', ['-fsS', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', '@-', url], {
+      input: JSON.stringify(body),
+      stdio: ['pipe', 'ignore', 'pipe'],
+    });
+  };
+  if (notifyDiscord) {
+    try { postJson(notifyDiscord, { content: message }); }
+    catch (err) { console.warn(`[db-backup] Discord notify failed: ${err && err.message ? err.message : err}`); }
+  }
+  if (notifyWebhook) {
+    try { postJson(notifyWebhook, { text: message }); }
+    catch (err) { console.warn(`[db-backup] webhook notify failed: ${err && err.message ? err.message : err}`); }
+  }
+  if (notifyCommand) {
+    try {
+      runtime.execFileSync('/bin/sh', ['-c', notifyCommand], {
+        env: { ...process.env, DB_BACKUP_ALERT: message },
+        stdio: ['ignore', 'inherit', 'inherit'],
+      });
+    } catch (err) { console.warn(`[db-backup] notify-command failed: ${err && err.message ? err.message : err}`); }
+  }
 }
 
 function runBackupJob(options = {}) {
@@ -1912,8 +2023,7 @@ function runBackupJob(options = {}) {
     // NEVER prune the backup we just created and verified, whatever the plan
     // says. A host whose clock jumped backward at boot gives the new file an
     // older timestamp than existing ones, and a retention policy that trusts the
-    // ordering would then delete the only known-good backup. Absorbed from
-    // smarthome's prune_local (BWK-131).
+    // ordering would then delete the only known-good backup.
     const doomed = plan.remove.filter((entry) => entry.fileName !== created.fileName);
     const removed = pruneBackups(doomed);
 
@@ -2005,6 +2115,7 @@ Commands:
   cron                    Print a daily cron entry
   restore                 Restore database from backup file
   freshness               Exit non-zero if the last success is older than the threshold
+                          (checks --stamp-file, or --remote for an off-host monitor)
 
 Options:
   --prod                  Use production env files (.env + .env.production)
@@ -2024,8 +2135,11 @@ Options:
   --max-age-hours <n>     Freshness threshold (command: freshness, default 36)
   --remote <dest>         Upload off-host via rclone and verify (e.g. remote:path)
   --remote-keep <n>       Remote backups to retain (default 30)
-  --rclone-config <path>  RCLONE_CONFIG for the upload
+  --rclone-config <path>  RCLONE_CONFIG for the upload (and remote freshness check)
   --skip-remote           Local-only run: no upload, no remote prune
+  --notify-discord <url>  freshness: POST an alert to a Discord webhook on failure
+  --notify-webhook <url>  freshness: POST {"text":...} to a webhook on failure
+  --notify-command <cmd>  freshness: run cmd on failure ($DB_BACKUP_ALERT = message)
   --no-compress           Disable gzip for SQLite backups
   --allow-missing         Skip (don't fail) when the SQLite database is absent
   --json                  Print JSON output
@@ -2049,30 +2163,67 @@ function runCli(argv = process.argv.slice(2)) {
   }
 
   if (options.command === 'freshness') {
-    if (!options.stampFile) {
-      throw new Error('freshness requires --stamp-file <path>');
+    if (!options.stampFile && !options.remoteTarget) {
+      throw new Error('freshness requires --stamp-file <path> or --remote <dest>');
     }
-    const status = checkBackupFreshness({
-      stampFile: options.stampFile,
-      maxAgeHours: options.maxAgeHours,
-    });
+    const notifyOpts = {
+      notifyDiscord: options.notifyDiscord,
+      notifyWebhook: options.notifyWebhook,
+      notifyCommand: options.notifyCommand,
+      runtime: normalizeRuntime({ commandTimeoutMs: options.commandTimeoutMs }),
+    };
+    // Remote check wins when --remote is given: an off-host monitor verifies the
+    // off-site copy directly (the dead-man's switch the local stamp can't be).
+    const source = options.remoteTarget
+      ? `remote ${options.remoteTarget}`
+      : `stamp ${options.stampFile}`;
+
+    let status;
+    try {
+      status = options.remoteTarget
+        ? checkRemoteFreshness({
+            remote: {
+              target: options.remoteTarget,
+              ...(options.rcloneConfig ? { configFile: options.rcloneConfig } : {}),
+            },
+            runtime: notifyOpts.runtime,
+            maxAgeHours: options.maxAgeHours,
+          })
+        : checkBackupFreshness({ stampFile: options.stampFile, maxAgeHours: options.maxAgeHours });
+    } catch (err) {
+      // A check that cannot run (rclone missing, unparseable listing) is itself an
+      // alert condition — the backup's health is UNKNOWN, which we treat as bad.
+      const msg = `🔴 ${source}: backup freshness check FAILED (${err && err.message ? err.message : err})`;
+      console.error(`[db-backup] ${msg}`);
+      notifyAlert(msg, notifyOpts);
+      process.exitCode = 1;
+      return;
+    }
+
+    let alertMessage = null;
     if (options.json) {
       console.log(JSON.stringify(status, null, 2));
+      if (!status.fresh) alertMessage = `🔴 ${source}: backup not fresh — ${JSON.stringify(status)}`;
     } else if (!status.stampedAt) {
-      console.error(`[db-backup] no successful backup recorded at ${options.stampFile}`);
+      alertMessage = `🔴 ${source}: no successful backup found — the backup may have stopped`;
+      console.error(`[db-backup] ${alertMessage}`);
     } else if (status.clockSkew) {
-      console.error(
-        `[db-backup] CLOCK PROBLEM: .last-success is dated in the future (${status.stampedAt.toISOString()}); ` +
-          'refusing to report the backup as fresh'
-      );
+      alertMessage = `🔴 ${source}: CLOCK PROBLEM — newest backup is dated in the future (${status.stampedAt.toISOString()}); refusing to report fresh`;
+      console.error(`[db-backup] ${alertMessage}`);
     } else {
       const age = status.ageHours.toFixed(1);
-      const line = `last successful backup is ${age}h old (threshold ${status.maxAgeHours}h), stamped ${status.stampedAt.toISOString()}`;
-      if (status.fresh) console.log(`[db-backup] ${line}`);
-      else console.error(`[db-backup] STALE: ${line}`);
+      const line = `newest backup is ${age}h old (threshold ${status.maxAgeHours}h), stamped ${status.stampedAt.toISOString()}`;
+      if (status.fresh) {
+        console.log(`[db-backup] ${source}: ${line}`);
+      } else {
+        alertMessage = `🔴 ${source}: STALE — ${line}`;
+        console.error(`[db-backup] ${alertMessage}`);
+      }
     }
-    // Non-zero so a cron wrapper or monitor treats staleness as a failure.
+
     if (!status.fresh) {
+      if (alertMessage) notifyAlert(alertMessage, notifyOpts);
+      // Non-zero so a cron wrapper or monitor treats staleness as a failure.
       process.exitCode = 1;
     }
     return;
@@ -2245,7 +2396,7 @@ module.exports = {
   restoreBackup,
   runBackupJob,
   runCli,
-  // SQLite engine primitives (BWK-120). The job API above owns env resolution,
+  // SQLite engine primitives. The job API above owns env resolution,
   // filenames, the manifest and retention; a consumer that needs its own naming,
   // manifest, or no pruning side-effect uses these instead of reimplementing
   // `sqlite3 .backup` — they carry the lock retries, quote escaping, WAL guard,
@@ -2257,16 +2408,18 @@ module.exports = {
   removeSqliteSidecars,
   normalizeRuntime,
   DEFAULT_COMMAND_TIMEOUT_MS,
-  // Encryption at rest + backup liveness (BWK-131, absorbed from smarthome).
+  // Encryption at rest + backup liveness.
   encryptBackupEntry,
   decryptBackupToPath,
   writeSuccessStamp,
   readSuccessStamp,
   checkBackupFreshness,
+  checkRemoteFreshness,
+  notifyAlert,
   uploadBackupToRemote,
   pruneRemoteBackups,
   DEFAULT_CIPHER_ALGO,
-  // Backup-storage helpers (BWK-85, generalized from stoki/pantry):
+  // Backup-storage helpers:
   MANIFEST_FILENAME,
   expandHome,
   isContainedWithin,
