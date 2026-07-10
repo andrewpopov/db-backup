@@ -7,7 +7,7 @@
 ## Install
 
 ```bash
-npm install github:andrewpopov/db-backup#v0.6.1
+npm install github:andrewpopov/db-backup#v0.7.0
 ```
 
 Reusable database backup utilities with three retention strategies. **Age-tier**
@@ -147,6 +147,54 @@ Base env is loaded first; mode-specific env is loaded second and overrides base
 values. In production mode, `DATABASE_URL` must either be exported in the shell
 before the process starts or be present in `.env.production`, unless
 `strictProductionEnv: false` is passed programmatically.
+
+## Command timeouts
+
+Every external command (`sqlite3`, `gzip`, `pg_dump`, `pg_restore`) runs with a
+process timeout, so a hung binary cannot block a cron run indefinitely. The
+default is 10 minutes.
+
+```bash
+db-backup backup --prod --command-timeout 120     # seconds
+DB_BACKUP_COMMAND_TIMEOUT_MS=120000 db-backup backup --prod
+```
+
+Programmatically, pass `runtime: { commandTimeoutMs }`.
+
+## SQLite engine primitives
+
+`runBackupJob` / `restoreBackup` are the opinionated job API: they resolve env,
+choose filenames, write the manifest, and apply retention. When you need your own
+destination filename or manifest — an admin "back up now" route, a pre-deploy
+hook — use the engine directly instead of shelling out to `sqlite3` yourself:
+
+```js
+const {
+  createSqliteSnapshot,
+  verifySqliteBackupIntegrity,
+  restoreSqliteBackup,
+  removeSqliteSidecars,
+  normalizeRuntime,
+} = require('@andrewpopov/db-backup');
+
+const runtime = normalizeRuntime({ commandTimeoutMs: 30_000 });
+
+// WAL-safe, self-contained snapshot at a path you choose. Retries on
+// "database is locked", escapes the path, and integrity-checks the result.
+createSqliteSnapshot({ sourcePath: '/srv/app/data/app.db', destPath, runtime });
+
+// Atomic restore: temp -> verify -> discard destination sidecars -> rename.
+restoreSqliteBackup({ databaseUrl, backupEntry: { fullPath: destPath, compressed: false }, runtime });
+```
+
+`createSqliteSnapshot` **throws** when `sqlite3` is unavailable, rather than fall
+back to a plain byte copy. A copy of a live SQLite database is never guaranteed
+consistent: in WAL mode it omits committed transactions still held in the `-wal`,
+and in any mode it can tear under a concurrent writer. Checking for a `-wal`
+first would not help — a writer can create one between the check and the copy.
+
+Install `sqlite3`, or pass `allowUnsafeCopy` (CLI: `--allow-unsafe-copy`) to
+accept an explicitly-inconsistent copy.
 
 ## Programmatic API
 

@@ -47,7 +47,8 @@ try {
   // 3. Require it as a consumer would and assert the public surface resolves.
   const smoke = `
     const t = require('${pkg.name}');
-    const expected = ['runCli', 'runBackupJob', 'listBackupsWithPlan', 'restoreBackup', 'planRetention', 'resolveBackupDirectories', 'resolveContainedBackupPath', 'readBackupManifest', 'appendBackupManifestEntry'];
+    const expected = ['runCli', 'runBackupJob', 'listBackupsWithPlan', 'restoreBackup', 'planRetention', 'resolveBackupDirectories', 'resolveContainedBackupPath', 'readBackupManifest', 'appendBackupManifestEntry', // SQLite engine primitives (BWK-120): the seam consumers build on.
+      'createSqliteSnapshot', 'verifySqliteBackupIntegrity', 'restoreSqliteBackup', 'removeSqliteSidecars', 'normalizeRuntime'];
     const missing = expected.filter((k) => typeof t[k] !== 'function');
     if (missing.length) { throw new Error('missing exports: ' + missing.join(', ')); }
     console.log('[verify-pack] exports OK: ' + expected.join(', '));

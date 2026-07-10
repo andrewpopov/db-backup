@@ -1,5 +1,8 @@
 # Shared Package Standards
 
+> **Canonical source:** `agent_tools/knowledge/shared-package-standards.md`.
+> This file is a synced copy; change the canonical doc first.
+
 Reference for every `andrewpopov/*` package consumed across bewks, stoki,
 smarthome, sano-os, and kira (Kira epic BWK-84 / BWK-92). The pilot is
 `prisma-tools`; this repo follows the same standard (its `.github/workflows/ci.yml`
@@ -100,3 +103,36 @@ change PR — not a separate post-merge commit.
 deploy time. `deploy-kit` (BWK-86) must prefer lockfile/offline-cache installs
 and degrade gracefully when GitHub is unreachable, so a GitHub outage cannot
 break a deploy that changes no dependencies.
+
+## Engineering standards
+
+Reliability properties a package must hold before any consumer is migrated onto
+it. Each was learned from a real defect; `db-backup` is the reference
+implementation.
+
+1. **Be a superset of every consumer's copy.** Audit what a hand-rolled
+   implementation does *better* before deleting it, and fold it in. Pin it with a
+   regression test you have verified *fails* against the unpatched package.
+2. **Expose the seam consumers need.** Ship engine primitives, not only an
+   opinionated job wrapper. A consumer that needs different naming, its own
+   manifest, or no pruning side-effect will otherwise reimplement the engine
+   beside your import.
+3. **Bound every external command with a timeout.** No `execFileSync` /
+   `execSync` / `spawnSync` without one. Expose it as config with a sane default.
+4. **Destructive operations are atomic.** Write to a temp path, verify it there,
+   then rename into place. Verify the thing you will actually end up with.
+5. **Verify before you keep, and fail loud.** Never produce a silently-incomplete
+   artifact. A success message and a green integrity check are not proof.
+6. **SQLite is not one file.** Never copy, move, replace, or delete a `.db`
+   without deciding what happens to `-wal`, `-shm`, and `-journal`. Snapshot with
+   the online backup API, never `cp`. Escape quotes in dot-command paths. Retry
+   on `database is locked`.
+7. **Removing a config key is a breaking change.** Strict validation fails closed,
+   so a deleted key hard-throws in every consumer that still sets it. Requires a
+   major bump and a sweep of every consumer's config in the same change.
+8. **Types are a contract, and the contract is tested.** Exercise `index.d.ts`
+   from a consumer-shaped file in CI. Model exclusive shapes as discriminated
+   unions. Never let an overload promise a narrow return the runtime cannot
+   guarantee. Pin unsoundness with a load-bearing `@ts-expect-error`.
+9. **Uniform script names:** `test`, `verify:pack`, `verify:types` (+ `build` for
+   TS packages).

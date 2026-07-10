@@ -18,6 +18,9 @@ const {
   runCli,
   readBackupManifest,
   appendBackupManifestEntry,
+  createSqliteSnapshot,
+  normalizeRuntime,
+  DEFAULT_COMMAND_TIMEOUT_MS,
 } = require('../index.js') as typeof import('../index');
 
 const fixedNow = new Date('2026-07-05T15:00:00.000Z');
@@ -77,6 +80,7 @@ describe('@andrewpopov/db-backup', () => {
       databaseUrl: 'file:./db%20with%20spaces.db?connection_limit=1',
       outputDir,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
 
     expect(result.created).toMatchObject({
@@ -100,6 +104,7 @@ describe('@andrewpopov/db-backup', () => {
       databaseUrl: 'file:./app.db',
       outputDir,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
     fs.writeFileSync(sourcePath, 'new sqlite bytes');
     const second = runBackupJob({
@@ -107,6 +112,7 @@ describe('@andrewpopov/db-backup', () => {
       databaseUrl: 'file:./app.db',
       outputDir,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
 
     expect(first.created.fileName).toBe('sqlite-backup-20260705-150000Z.db');
@@ -144,6 +150,7 @@ describe('@andrewpopov/db-backup', () => {
 
     const rawPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
     const result = runBackupJob({
+      allowUnsafeCopy: true,
       cwd,
       databaseUrl: 'file:./dev.db',
       outputDir,
@@ -237,6 +244,7 @@ describe('@andrewpopov/db-backup', () => {
     });
 
     const result = runBackupJob({
+      allowUnsafeCopy: true,
       cwd,
       databaseUrl,
       outputDir,
@@ -339,6 +347,7 @@ describe('@andrewpopov/db-backup', () => {
       backupFile: path.basename(backupPath),
       createPreRestoreBackup: false,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
 
     expect(result.target).toBe(dbPath);
@@ -371,6 +380,7 @@ describe('@andrewpopov/db-backup', () => {
       backupFile: path.basename(backupPath),
       createPreRestoreBackup: false,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
 
     expect(fs.readFileSync(dbPath, 'utf8')).toBe('restored database');
@@ -397,6 +407,7 @@ describe('@andrewpopov/db-backup', () => {
       createPreRestoreBackup: false,
       allowMissing: true,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
 
     expect(result.target).toBe(dbPath);
@@ -606,6 +617,127 @@ describe('@andrewpopov/db-backup', () => {
     );
   });
 
+
+  it('bounds every external command with a timeout (standard 3)', () => {
+    // An unbounded execFileSync lets a hung sqlite3/pg_dump block a nightly cron
+    // forever. The bound is injected once at the runtime choke point.
+    const calls: Array<{ command: string; options: Record<string, unknown> }> = [];
+    const runtime = normalizeRuntime({
+      execFileSync: ((command: string, _args: string[], options: Record<string, unknown>) => {
+        calls.push({ command, options });
+        return Buffer.from('ok');
+      }) as never,
+      commandExists: () => true,
+    });
+
+    runtime.execFileSync('sqlite3', ['x', 'PRAGMA integrity_check;'], { stdio: 'pipe' });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].options.timeout).toBe(DEFAULT_COMMAND_TIMEOUT_MS);
+    expect(calls[0].options.killSignal).toBe('SIGKILL');
+    // The per-call option survives alongside the injected bound.
+    expect(calls[0].options.stdio).toBe('pipe');
+  });
+
+  it('command timeout is configurable via runtime and env, explicit wins', () => {
+    const seen: number[] = [];
+    const capture = ((_c: string, _a: string[], o: Record<string, unknown>) =>
+      void seen.push(o.timeout as number)) as never;
+
+    normalizeRuntime({ execFileSync: capture, commandTimeoutMs: 1234 }).execFileSync('x', []);
+    expect(seen.at(-1)).toBe(1234);
+
+    const originalEnv = process.env.DB_BACKUP_COMMAND_TIMEOUT_MS;
+    try {
+      process.env.DB_BACKUP_COMMAND_TIMEOUT_MS = '5555';
+      normalizeRuntime({ execFileSync: capture }).execFileSync('x', []);
+      expect(seen.at(-1)).toBe(5555);
+
+      // Explicit runtime value beats the env var.
+      normalizeRuntime({ execFileSync: capture, commandTimeoutMs: 77 }).execFileSync('x', []);
+      expect(seen.at(-1)).toBe(77);
+    } finally {
+      if (originalEnv === undefined) delete process.env.DB_BACKUP_COMMAND_TIMEOUT_MS;
+      else process.env.DB_BACKUP_COMMAND_TIMEOUT_MS = originalEnv;
+    }
+
+    expect(() => normalizeRuntime({ commandTimeoutMs: 0 })).toThrow(/commandTimeoutMs/);
+  });
+
+  it('createSqliteSnapshot refuses to copy when sqlite3 is absent (standards 5 + 6)', () => {
+    // Without sqlite3 there is no consistent snapshot: a byte copy omits
+    // committed transactions held in the -wal and can tear under a concurrent
+    // writer. There is no "safe cp" to detect — checking for a -wal first would
+    // race a writer creating one. Refuse; a bad backup is worse than a failure.
+    const dir = makeTempDir();
+    const sourcePath = path.join(dir, 'app.db');
+    fs.writeFileSync(sourcePath, 'database');
+
+    expect(() =>
+      createSqliteSnapshot({
+        sourcePath,
+        destPath: path.join(dir, 'snap.db'),
+        runtime: makeRuntime({ commandExists: () => false }),
+      }),
+    ).toThrow(/sqlite3.*unavailable|allowUnsafeCopy/s);
+
+    expect(fs.existsSync(path.join(dir, 'snap.db'))).toBe(false);
+  });
+
+  it('createSqliteSnapshot copies only when the caller opts in to an inconsistent copy', () => {
+    const dir = makeTempDir();
+    const sourcePath = path.join(dir, 'app.db');
+    const destPath = path.join(dir, 'snap.db');
+    fs.writeFileSync(sourcePath, 'self-contained database');
+
+    createSqliteSnapshot({
+      sourcePath,
+      destPath,
+      runtime: makeRuntime({ commandExists: () => false }),
+      allowUnsafeCopy: true,
+    });
+
+    expect(fs.readFileSync(destPath, 'utf8')).toBe('self-contained database');
+  });
+
+  it('runBackupJob refuses the cp path unless allowUnsafeCopy is set', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    fs.writeFileSync(dbPath, 'database');
+
+    expect(() =>
+      runBackupJob({
+        cwd,
+        databaseUrl: 'file:./app.db',
+        outputDir: path.join(cwd, 'backups'),
+        compressSqlite: false,
+        runtime: makeRuntime({ commandExists: () => false }),
+      }),
+    ).toThrow(/sqlite3.*unavailable|allowUnsafeCopy/s);
+  });
+
+  it('createSqliteSnapshot escapes single quotes in the destination path', () => {
+    const dir = makeTempDir();
+    const sourcePath = path.join(dir, 'app.db');
+    fs.writeFileSync(sourcePath, 'db');
+    const captured: string[][] = [];
+
+    createSqliteSnapshot({
+      sourcePath,
+      destPath: "/tmp/o'brien/snap.db",
+      runtime: makeRuntime({
+        commandExists: () => true,
+        execFileSync: ((_c: string, args: string[]) => {
+          captured.push(args);
+          return Buffer.from('ok');
+        }) as never,
+      }),
+    });
+
+    const backupArg = captured[0].find((a) => a.startsWith('.backup'));
+    expect(backupArg).toContain("o''brien");
+  });
+
   it('lists only supported backup filenames and annotates retention decisions', () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');
@@ -619,6 +751,7 @@ describe('@andrewpopov/db-backup', () => {
       databaseUrl: 'file:./app.db',
       outputDir,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
 
     expect(result.backups).toHaveLength(2);
@@ -708,6 +841,7 @@ describe('@andrewpopov/db-backup', () => {
         cwd,
         outputDir,
         runtime: makeRuntime(),
+      allowUnsafeCopy: true,
         policy: resolveRetentionPolicy({ maxBackups: 2, dailySlots: 2 }),
       });
 
@@ -822,6 +956,7 @@ describe('@andrewpopov/db-backup', () => {
 
     const runtime = makeRuntime({ commandExists: () => false });
     const created = runBackupJob({
+      allowUnsafeCopy: true,
       cwd,
       databaseUrl: 'file:./data/app.db',
       outputDir,
@@ -852,11 +987,11 @@ describe('@andrewpopov/db-backup', () => {
     fs.writeFileSync(dbPath, 'version 1');
 
     const olderRuntime = makeRuntime({ now: () => new Date('2026-07-01T00:00:00.000Z') });
-    runBackupJob({ cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: olderRuntime });
+    runBackupJob({ cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: olderRuntime, allowUnsafeCopy: true });
 
     fs.writeFileSync(dbPath, 'version 2');
     const newerRuntime = makeRuntime({ now: () => new Date('2026-07-05T00:00:00.000Z') });
-    const second = runBackupJob({ cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: newerRuntime });
+    const second = runBackupJob({ cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false, runtime: newerRuntime, allowUnsafeCopy: true });
 
     fs.writeFileSync(dbPath, 'mutated after both backups');
 
@@ -887,6 +1022,7 @@ describe('@andrewpopov/db-backup', () => {
         backupFile: 'sqlite-backup-20260705-150000Z.db',
         createPreRestoreBackup: false,
         runtime: makeRuntime(),
+      allowUnsafeCopy: true,
       }),
     ).toThrow(/engine mismatch/i);
   });
@@ -910,6 +1046,7 @@ describe('@andrewpopov/db-backup', () => {
         backupFile: path.basename(backupPath),
         createPreRestoreBackup: false,
         runtime: makeRuntime(),
+      allowUnsafeCopy: true,
       }),
     ).toThrow();
 
@@ -996,6 +1133,7 @@ describe('@andrewpopov/db-backup', () => {
     });
 
     const result = runBackupJob({
+      allowUnsafeCopy: true,
       cwd,
       databaseUrl: 'file:./dev.db',
       outputDir,
@@ -1020,7 +1158,7 @@ describe('@andrewpopov/db-backup', () => {
     const originalUrl = process.env.DATABASE_URL;
     try {
       delete process.env.DATABASE_URL;
-      const result = runBackupJob({ cwd, mode: 'prod', outputDir, compressSqlite: false, runtime: makeRuntime() });
+      const result = runBackupJob({ cwd, mode: 'prod', outputDir, compressSqlite: false, runtime: makeRuntime(), allowUnsafeCopy: true });
       expect(fs.readFileSync(result.created.fullPath, 'utf8')).toBe('prod bytes');
     } finally {
       if (originalUrl === undefined) delete process.env.DATABASE_URL;
@@ -1037,7 +1175,7 @@ describe('@andrewpopov/db-backup', () => {
     try {
       delete process.env.DATABASE_URL;
       expect(() =>
-        runBackupJob({ cwd, mode: 'prod', outputDir, compressSqlite: false, runtime: makeRuntime() }),
+        runBackupJob({ cwd, mode: 'prod', outputDir, compressSqlite: false, runtime: makeRuntime(), allowUnsafeCopy: true }),
       ).toThrow(/production backups/i);
     } finally {
       if (originalUrl === undefined) delete process.env.DATABASE_URL;
@@ -1132,6 +1270,7 @@ describe('@andrewpopov/db-backup', () => {
       outputDir,
       compressSqlite: false,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
 
     expect(result.created.fileName).toBe('sqlite-backup-20260705-150000Z.db');
@@ -1153,6 +1292,7 @@ describe('@andrewpopov/db-backup', () => {
       outputDir,
       compressSqlite: false,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
 
     expect(result.created.fileName).toBe('sqlite-backup-20260705-150000Z.db');
@@ -1171,6 +1311,7 @@ describe('@andrewpopov/db-backup', () => {
         outputDir,
         compressSqlite: false,
         runtime: makeRuntime(),
+      allowUnsafeCopy: true,
       }),
     ).toThrow(/not found/i);
 
@@ -1191,6 +1332,7 @@ describe('@andrewpopov/db-backup', () => {
       outputDir,
       compressSqlite: false,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
 
     expect(result.created.sha256).toMatch(/^[0-9a-f]{64}$/);
@@ -1211,11 +1353,13 @@ describe('@andrewpopov/db-backup', () => {
     fs.writeFileSync(sourcePath, 'sqlite bytes');
 
     const created = runBackupJob({
+      allowUnsafeCopy: true,
       cwd,
       databaseUrl: 'file:./app.db',
       outputDir,
       compressSqlite: false,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
     // Corrupt the backup bytes on disk without touching the manifest.
     fs.writeFileSync(created.created.fullPath, 'tampered bytes');
@@ -1228,6 +1372,7 @@ describe('@andrewpopov/db-backup', () => {
         backupFile: created.created.fileName,
         createPreRestoreBackup: false,
         runtime: makeRuntime(),
+      allowUnsafeCopy: true,
       }),
     ).toThrow(/checksum mismatch/i);
   });
@@ -1248,6 +1393,7 @@ describe('@andrewpopov/db-backup', () => {
       backupFile: path.basename(backupPath),
       createPreRestoreBackup: false,
       runtime: makeRuntime(),
+      allowUnsafeCopy: true,
     });
 
     expect(result.target).toBe(dbPath);
@@ -1286,6 +1432,7 @@ describe('@andrewpopov/db-backup', () => {
         backupFile: backupPath, // absolute path, outside outputDir
         createPreRestoreBackup: false,
         runtime: makeRuntime(),
+      allowUnsafeCopy: true,
       }),
     ).toThrow(/checksum mismatch/i);
   });

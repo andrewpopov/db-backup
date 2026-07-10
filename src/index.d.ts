@@ -58,6 +58,8 @@ export interface BackupOptions {
   databaseUrl?: string;
   compressSqlite?: boolean;
   policy?: RetentionPolicy;
+  /** Permit a plain byte copy when `sqlite3` is unavailable (default false). */
+  allowUnsafeCopy?: boolean;
   runtime?: BackupRuntime;
   strictProductionEnv?: boolean;
   /** list/prune set this false: they never open the DB, so DATABASE_URL is not required. */
@@ -69,12 +71,27 @@ export interface BackupOptions {
   };
 }
 
+/** The injectable runtime. Every field is optional; `normalizeRuntime` fills the
+ * gaps and returns a `ResolvedBackupRuntime`. */
 export interface BackupRuntime {
   commandExists?: (command: string) => boolean;
   execFileSync?: (command: string, args: string[], options?: unknown) => unknown;
   sleep?: (ms: number) => void;
   now?: () => Date;
   randomId?: () => string;
+  /** Process timeout applied to every external command. Overrides
+   * `DB_BACKUP_COMMAND_TIMEOUT_MS`; defaults to `DEFAULT_COMMAND_TIMEOUT_MS`. */
+  commandTimeoutMs?: number | string | null;
+}
+
+/** A fully-resolved runtime: every command it runs is bounded by a timeout. */
+export interface ResolvedBackupRuntime {
+  commandExists: (command: string) => boolean;
+  execFileSync: (command: string, args: string[], options?: Record<string, unknown>) => unknown;
+  sleep: (ms: number) => void;
+  now: () => Date;
+  randomId: () => string;
+  commandTimeoutMs: number;
 }
 
 export interface BackupPlan {
@@ -184,6 +201,59 @@ export function planRetention(backups: BackupEntry[], policy?: RetentionPolicy, 
 export function restoreBackup(options?: RestoreOptions): RestoreResult;
 export function runBackupJob(options?: BackupOptions): BackupJobResult;
 export function runCli(argv?: string[]): void;
+
+/** Default process timeout applied to every external command (10 minutes). */
+export const DEFAULT_COMMAND_TIMEOUT_MS: number;
+
+/** Build a bounded runtime. Pass `commandTimeoutMs` (or set
+ * `DB_BACKUP_COMMAND_TIMEOUT_MS`) to override the default bound. */
+export function normalizeRuntime(runtime?: BackupRuntime): ResolvedBackupRuntime;
+
+// ---------------------------------------------------------------------------
+// SQLite engine primitives.
+//
+// The job API (runBackupJob / restoreBackup) owns env resolution, filenames, the
+// manifest and retention. A consumer that needs its own naming or manifest, or
+// that must not prune as a side effect, uses these directly rather than
+// reimplementing `sqlite3 .backup`.
+// ---------------------------------------------------------------------------
+
+/** Take a WAL-safe, self-contained snapshot of a SQLite database at `destPath`
+ * using SQLite's online backup API. Retries on `database is locked`, escapes the
+ * destination path, and integrity-checks the result before keeping it.
+ *
+ * Throws rather than produce a silently-incomplete backup: if `sqlite3` is
+ * unavailable and the database has a `-wal` sidecar, committed transactions
+ * would be omitted from a plain copy. Returns `destPath`. */
+export function createSqliteSnapshot(options: {
+  sourcePath: string;
+  destPath: string;
+  runtime?: ResolvedBackupRuntime;
+  /** Permit a plain byte copy when `sqlite3` is unavailable. A copy of a live
+   * database is never guaranteed consistent, so this defaults to `false` and the
+   * snapshot throws instead. */
+  allowUnsafeCopy?: boolean;
+}): string;
+
+/** Run `PRAGMA integrity_check` on a SQLite file. Deletes the file and throws if
+ * it is not `ok` — a bad backup is worse than a loud failure. */
+export function verifySqliteBackupIntegrity(backupPath: string, runtime?: ResolvedBackupRuntime): void;
+
+/** Atomically replace the database named by `databaseUrl` with `backupEntry`:
+ * decompress/copy to a temp path, verify it there, discard the destination's
+ * `-wal`/`-shm`/`-journal` sidecars, then rename into place. A corrupt backup
+ * can never destroy a good database. */
+export function restoreSqliteBackup(options?: {
+  databaseUrl: string;
+  backupEntry: Pick<BackupEntry, 'fullPath' | 'compressed'>;
+  cwd?: string;
+  runtime?: ResolvedBackupRuntime;
+}): { target: string };
+
+/** Remove a SQLite database's `-wal`, `-shm` and `-journal` sidecars. They
+ * describe the database they were created for, so they must be discarded
+ * whenever that file is replaced wholesale. No-op when absent. */
+export function removeSqliteSidecars(databasePath: string): void;
 
 // --- Backup-storage helpers (generalized from stoki/pantry) ---
 

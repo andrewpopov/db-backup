@@ -3,6 +3,45 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.7.0
+
+Reference implementation of the shared package standards. Additive: no existing
+behavior changes except the `cp` fallback, which now refuses a case that
+previously produced a silently-incomplete backup.
+
+- **Feature — SQLite engine primitives are now exported.** The job API
+  (`runBackupJob` / `restoreBackup`) owns env resolution, filenames, the manifest
+  and retention. A consumer that needs its own naming or manifest, or that must
+  not prune as a side effect, previously had no seam to attach to and
+  reimplemented `sqlite3 .backup` itself. Now exported: `createSqliteSnapshot`,
+  `verifySqliteBackupIntegrity`, `restoreSqliteBackup`, `removeSqliteSidecars`,
+  `normalizeRuntime`. They carry the lock retries, quote escaping, WAL guard,
+  integrity verification, atomic replace, and sidecar cleanup.
+- **Fix — every external command is now bounded by a timeout.** No `execFileSync`
+  call passed a process timeout; the only `timeout` in the package was sqlite's
+  `.timeout 5000` *lock* pragma. A hung `sqlite3`, `gzip`, `pg_dump` or
+  `pg_restore` could block a nightly cron indefinitely. The bound is injected once
+  at the `normalizeRuntime` choke point (default 10 minutes, `killSignal:
+  'SIGKILL'`), configurable via `runtime.commandTimeoutMs`, the
+  `DB_BACKUP_COMMAND_TIMEOUT_MS` env var, or `--command-timeout <seconds>`. An
+  explicit per-call option still wins.
+- **BREAKING — the silent `cp` fallback is gone.** When `sqlite3` was
+  unavailable the package fell back to `fs.copyFileSync`, which in WAL mode omits
+  committed transactions held in the `-wal` (demonstrated: a database whose live
+  read returns `{x, in-wal}` yields `{x}` through a plain copy), and which can
+  tear under a concurrent writer in any mode. There is no "safe copy" to detect —
+  inspecting the sidecars first would race a writer creating one. Taking a backup
+  without `sqlite3` now **throws**. Pass `allowUnsafeCopy` (CLI:
+  `--allow-unsafe-copy`) to accept an explicitly-inconsistent copy.
+
+  Impact: none for consumers on a host with `sqlite3` installed, which is every
+  current one. Closes BWK-119.
+- **Types**: `BackupRuntime` (injectable, all-optional) is now distinct from
+  `ResolvedBackupRuntime` (returned by `normalizeRuntime`, every command bounded).
+  The engine primitives and the timeout config are exercised by the
+  `verify:types` consumer contract, and `verify:pack` asserts the packaged
+  tarball exports them through both CJS and ESM.
+
 ## 0.6.1
 
 **Fix — SQLite restore silently resurrected pre-restore data.** `restoreSqliteBackup`

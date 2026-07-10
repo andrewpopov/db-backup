@@ -88,6 +88,8 @@ function parseArgs(argv) {
     dailySlots: null,
     keepLast: null,
     keepDays: null,
+    commandTimeoutMs: null,
+    allowUnsafeCopy: false,
     cronCommand: null,
     logPath: null,
   };
@@ -203,6 +205,21 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--allow-unsafe-copy') {
+      options.allowUnsafeCopy = true;
+      continue;
+    }
+
+    if (arg === '--command-timeout') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null || value < 1) {
+        throw new Error('--command-timeout must be an integer >= 1 (seconds)');
+      }
+      options.commandTimeoutMs = value * 1000;
+      index += 1;
+      continue;
+    }
+
     if (arg === '--keep-last') {
       const value = strictNonNegativeInt(argv[index + 1]);
       if (value === null || value < 1) {
@@ -289,8 +306,42 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// Every external command this package runs (sqlite3, gzip, pg_dump, pg_restore)
+// must be bounded: an unbounded execFileSync lets a hung binary block a nightly
+// cron forever. The bound is injected once, here, rather than at each call site
+// — a call site that forgets it is the failure mode we are eliminating.
+// Generous by default because a large pg_dump is legitimately slow; tune with
+// `runtime.commandTimeoutMs`, `DB_BACKUP_COMMAND_TIMEOUT_MS`, or
+// `--command-timeout <seconds>`.
+const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+
+function resolveCommandTimeoutMs(value, env = process.env) {
+  const read = (raw, label) => {
+    if (raw === undefined || raw === null || raw === '') {
+      return null;
+    }
+    const parsed = strictNonNegativeInt(raw);
+    if (parsed === null || parsed < 1) {
+      throw new Error(`${label} must be an integer >= 1 (milliseconds)`);
+    }
+    return parsed;
+  };
+
+  return (
+    read(value, 'commandTimeoutMs') ??
+    read(env.DB_BACKUP_COMMAND_TIMEOUT_MS, 'DB_BACKUP_COMMAND_TIMEOUT_MS') ??
+    DEFAULT_COMMAND_TIMEOUT_MS
+  );
+}
+
 function normalizeRuntime(runtime = {}) {
-  const runCommand = runtime.execFileSync || execFileSync;
+  const baseCommand = runtime.execFileSync || execFileSync;
+  const commandTimeoutMs = resolveCommandTimeoutMs(runtime.commandTimeoutMs);
+
+  // Defaults first, so an explicit per-call option still wins. `killSignal`
+  // escalates past a SIGTERM the child may be ignoring.
+  const runCommand = (command, args, options = {}) =>
+    baseCommand(command, args, { timeout: commandTimeoutMs, killSignal: 'SIGKILL', ...options });
 
   return {
     execFileSync: runCommand,
@@ -298,6 +349,7 @@ function normalizeRuntime(runtime = {}) {
     sleep: runtime.sleep || sleep,
     now: runtime.now || (() => new Date()),
     randomId: runtime.randomId || (() => `${Date.now()}-${Math.random().toString(16).slice(2)}`),
+    commandTimeoutMs,
   };
 }
 
@@ -513,6 +565,7 @@ function resolveBackupOptions(options = {}) {
   const mode = options.mode || (process.env.NODE_ENV === 'production' ? 'prod' : 'dev');
   const outputDir = path.resolve(cwd, options.outputDir || path.relative(cwd, DEFAULT_OUTPUT_DIR));
   const compressSqlite = options.compressSqlite !== false;
+  const allowUnsafeCopy = options.allowUnsafeCopy === true;
   const policy = options.policy || DEFAULT_RETENTION_POLICY;
   const runtime = normalizeRuntime(options.runtime || options._runtime);
 
@@ -535,13 +588,14 @@ function resolveBackupOptions(options = {}) {
     mode,
     outputDir,
     compressSqlite,
+    allowUnsafeCopy,
     policy,
     databaseUrl,
     runtime,
   };
 }
 
-function verifySqliteBackupIntegrity(backupPath, runtime) {
+function verifySqliteBackupIntegrity(backupPath, runtime = normalizeRuntime()) {
   const output = runtime.execFileSync('sqlite3', [backupPath, 'PRAGMA integrity_check;'], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -584,7 +638,82 @@ function sha256File(filePath) {
   return hash.digest('hex');
 }
 
-function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd = process.cwd(), runtime = normalizeRuntime() }) {
+// The SQLite snapshot ENGINE, decoupled from filename/manifest/retention policy.
+// Consumers that need to choose their own destination path (an admin "back up
+// now" route, a pre-deploy hook) should call this directly rather than
+// reimplementing `sqlite3 .backup` — it carries the lock retries, the quote
+// escaping, the WAL guard, and the post-write integrity check.
+//
+// Writes a single self-contained database at `destPath`: SQLite's online backup
+// API checkpoints WAL frames into it, so the snapshot needs no sidecars.
+function createSqliteSnapshot({
+  sourcePath,
+  destPath,
+  runtime = normalizeRuntime(),
+  allowUnsafeCopy = false,
+}) {
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`SQLite database file not found: ${sourcePath}`);
+  }
+
+  if (!runtime.commandExists('sqlite3')) {
+    // Without sqlite3 the only option is a byte copy of the main database file,
+    // and a byte copy of a LIVE database is never guaranteed consistent: in WAL
+    // mode it omits committed transactions still in the -wal, and in any mode it
+    // can tear under a concurrent writer. Inspecting the sidecars first would
+    // not fix this — a writer can create one between the check and the copy.
+    //
+    // So there is no "safe cp" to detect. Refuse, and make the caller opt in to
+    // an explicitly-inconsistent copy. A bad backup is worse than a loud failure.
+    if (!allowUnsafeCopy) {
+      throw new Error(
+        `Refusing to back up ${sourcePath}: the 'sqlite3' binary is unavailable, so no ` +
+          `consistent snapshot can be taken. A plain file copy may omit committed ` +
+          `transactions held in the -wal and can tear under a concurrent writer. ` +
+          `Install sqlite3, or pass allowUnsafeCopy / --allow-unsafe-copy to accept an ` +
+          `inconsistent copy.`
+      );
+    }
+
+    // Opted in: an inconsistent copy is better than nothing for the caller's
+    // purposes. It cannot be integrity-checked either, since that needs sqlite3.
+    fs.copyFileSync(sourcePath, destPath);
+    return destPath;
+  }
+
+  // `.backup` is the online backup API: WAL-safe, consistent, and it will not
+  // tear under a concurrent writer. Single quotes are doubled because the path
+  // is interpolated into a sqlite3 dot-command, not passed as an argv element.
+  const escapedDestPath = destPath.replace(/'/g, "''");
+  const sqliteArgs = ['-cmd', '.timeout 5000', sourcePath, `.backup '${escapedDestPath}'`];
+  const maxAttempts = 5;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      runtime.execFileSync('sqlite3', sqliteArgs, { stdio: 'pipe' });
+      break;
+    } catch (error) {
+      const stdOut = error.stdout ? error.stdout.toString() : '';
+      const stdErr = error.stderr ? error.stderr.toString() : '';
+      const combined = `${stdOut}\n${stdErr}\n${error.message}`;
+      const isLockError = /database is locked/i.test(combined);
+
+      if (!isLockError || attempt === maxAttempts) {
+        throw error;
+      }
+
+      runtime.sleep(attempt * 1000);
+    }
+  }
+
+  // Verify the snapshot before we keep it: a `.backup` can succeed yet leave a
+  // corrupt file. A bad backup is worse than a loud failure, so delete it and
+  // throw.
+  verifySqliteBackupIntegrity(destPath, runtime);
+  return destPath;
+}
+
+function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd = process.cwd(), runtime = normalizeRuntime(), allowUnsafeCopy = false }) {
   now = now || runtime.now();
   const sourcePath = parseSqlitePath(databaseUrl, cwd);
   if (!fs.existsSync(sourcePath)) {
@@ -594,36 +723,7 @@ function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd =
   const timestamp = formatTimestamp(now);
   const { rawFilePath } = buildUniqueSqliteRawBackupPath({ timestamp, outputDir, compressSqlite });
 
-  if (runtime.commandExists('sqlite3')) {
-    const escapedBackupPath = rawFilePath.replace(/'/g, "''");
-    const sqliteArgs = ['-cmd', '.timeout 5000', sourcePath, `.backup '${escapedBackupPath}'`];
-    const maxAttempts = 5;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      try {
-        runtime.execFileSync('sqlite3', sqliteArgs, { stdio: 'pipe' });
-        break;
-      } catch (error) {
-        const stdOut = error.stdout ? error.stdout.toString() : '';
-        const stdErr = error.stderr ? error.stderr.toString() : '';
-        const combined = `${stdOut}\n${stdErr}\n${error.message}`;
-        const isLockError = /database is locked/i.test(combined);
-
-        if (!isLockError || attempt === maxAttempts) {
-          throw error;
-        }
-
-        runtime.sleep(attempt * 1000);
-      }
-    }
-
-    // Verify the snapshot before we keep it: a `.backup` can succeed yet leave a
-    // corrupt file. A bad backup is worse than a loud failure, so delete it and
-    // throw. Only possible when sqlite3 is present (the cp fallback can't verify).
-    verifySqliteBackupIntegrity(rawFilePath, runtime);
-  } else {
-    fs.copyFileSync(sourcePath, rawFilePath);
-  }
+  createSqliteSnapshot({ sourcePath, destPath: rawFilePath, runtime, allowUnsafeCopy });
 
   let finalPath = rawFilePath;
   let compressed = false;
@@ -692,6 +792,7 @@ function createBackup(options = {}) {
       cwd: resolved.cwd,
       now,
       runtime: resolved.runtime,
+      allowUnsafeCopy: resolved.allowUnsafeCopy,
     });
   }
 
@@ -1411,6 +1512,8 @@ Options:
   --daily-slots <n>       Age-tier: recent daily slots before age tiers (env: DB_BACKUP_DAILY_SLOTS)
   --keep-last <n>         Flat retention: keep the N most-recent backups (env: DB_BACKUP_KEEP_LAST)
   --keep-days <n>         Flat retention: keep backups younger than N days (env: DB_BACKUP_KEEP_DAYS)
+  --command-timeout <s>   Bound every external command (env: DB_BACKUP_COMMAND_TIMEOUT_MS)
+  --allow-unsafe-copy     Permit a byte copy when sqlite3 is absent (inconsistent)
   --no-compress           Disable gzip for SQLite backups
   --allow-missing         Skip (don't fail) when the SQLite database is absent
   --json                  Print JSON output
@@ -1469,6 +1572,8 @@ function runCli(argv = process.argv.slice(2)) {
     mode: options.mode,
     outputDir: options.outputDir,
     compressSqlite: options.compressSqlite,
+    allowUnsafeCopy: options.allowUnsafeCopy,
+    runtime: { commandTimeoutMs: options.commandTimeoutMs },
     policy: resolveRetentionPolicy({
       maxBackups: options.maxBackups,
       dailySlots: options.dailySlots,
@@ -1584,6 +1689,17 @@ module.exports = {
   restoreBackup,
   runBackupJob,
   runCli,
+  // SQLite engine primitives (BWK-120). The job API above owns env resolution,
+  // filenames, the manifest and retention; a consumer that needs its own naming,
+  // manifest, or no pruning side-effect uses these instead of reimplementing
+  // `sqlite3 .backup` — they carry the lock retries, quote escaping, WAL guard,
+  // integrity verification, atomic replace, and sidecar cleanup.
+  createSqliteSnapshot,
+  verifySqliteBackupIntegrity,
+  restoreSqliteBackup,
+  removeSqliteSidecars,
+  normalizeRuntime,
+  DEFAULT_COMMAND_TIMEOUT_MS,
   // Backup-storage helpers (BWK-85, generalized from stoki/pantry):
   MANIFEST_FILENAME,
   expandHome,

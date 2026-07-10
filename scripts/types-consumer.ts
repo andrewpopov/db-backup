@@ -11,6 +11,12 @@ import {
   pruneBackupsJob,
   resolveRetentionPolicy,
   planRetention,
+  createSqliteSnapshot,
+  verifySqliteBackupIntegrity,
+  restoreSqliteBackup,
+  removeSqliteSidecars,
+  normalizeRuntime,
+  DEFAULT_COMMAND_TIMEOUT_MS,
   buildDailyCronEntry,
   runCli,
   DEFAULT_RETENTION_POLICY,
@@ -29,6 +35,7 @@ import {
   type KeepDaysRetentionPolicy,
   type BackupPlan,
   type BackupManifest,
+  type ResolvedBackupRuntime,
 } from '../src/index';
 
 // Retention policy + the three job entry points.
@@ -69,6 +76,28 @@ const _described: string =
 planRetention([], keepLastPolicy);
 planRetention([], keepDaysPolicy);
 planRetention([], ageTier);
+
+// The SQLite engine seam, as savoro's admin "back up now" route consumes it:
+// its own destination filename, its own manifest, no pruning side-effect.
+const boundedRuntime: ResolvedBackupRuntime = normalizeRuntime({ commandTimeoutMs: 30_000 });
+const _timeout: number = boundedRuntime.commandTimeoutMs;
+const _bound: number = DEFAULT_COMMAND_TIMEOUT_MS;
+
+const snapshotPath: string = createSqliteSnapshot({
+  sourcePath: '/srv/app/data/app.db',
+  destPath: '/srv/app/backups/pantry_backup_2026-07-09.db',
+  runtime: boundedRuntime,
+});
+
+verifySqliteBackupIntegrity(snapshotPath, boundedRuntime);
+removeSqliteSidecars('/srv/app/data/app.db');
+
+const restored: { target: string } = restoreSqliteBackup({
+  databaseUrl: 'file:./data/app.db',
+  backupEntry: { fullPath: snapshotPath, compressed: false },
+  runtime: boundedRuntime,
+});
+const _restoredTarget: string = restored.target;
 
 const jobResult: BackupJobResult = runBackupJob({
   mode: 'prod',
