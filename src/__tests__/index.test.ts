@@ -1129,6 +1129,50 @@ describe('@andrewpopov/db-backup', () => {
     expect(deleted.length).toBeGreaterThan(0);
   });
 
+
+  it('writes backups, manifest and stamp with restrictive permissions (BWK-132)', () => {
+    // A backup is a full copy of the database. The package must not rely on the
+    // caller's umask: gzip/gpg/pg_dump write through child processes that ignore
+    // Node's mode argument entirely. smarthome got this right with `umask 077`.
+    if (process.platform === 'win32') return;
+    const previousUmask = process.umask(0o022); // deliberately permissive
+    try {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      const stampFile = path.join(outputDir, '.last-success');
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'database bytes');
+
+      const result = runBackupJob({
+        allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
+        compressSqlite: false, stampFile, runtime: makeRuntime(),
+      });
+
+      const mode = (p: string) => fs.statSync(p).mode & 0o777;
+      expect(mode(result.created.fullPath), 'backup artifact').toBe(0o600);
+      expect(mode(path.join(outputDir, 'backup-manifest.json')), 'manifest').toBe(0o600);
+      expect(mode(stampFile), 'success stamp').toBe(0o600);
+      expect(mode(outputDir), 'backup directory').toBe(0o700);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
+  it('does not re-mode a backup directory the operator already created', () => {
+    if (process.platform === 'win32') return;
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.chmodSync(outputDir, 0o750); // operator's choice, e.g. group-readable
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+
+    runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
+      compressSqlite: false, runtime: makeRuntime(),
+    });
+
+    expect(fs.statSync(outputDir).mode & 0o777, 'existing dir mode preserved').toBe(0o750);
+  });
+
   it('lists only supported backup filenames and annotates retention decisions', () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');

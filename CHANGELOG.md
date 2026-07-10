@@ -3,6 +3,26 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.10.1
+
+**Fix — backups were written world-readable (0644).** A backup is a full copy of
+the database; an unencrypted one is the database. The package relied on the
+caller's umask, and `gzip` / `gpg` / `pg_dump` write through child processes that
+ignore Node's `mode` argument entirely.
+
+Every artifact is now `0600` and a backup directory the package creates is
+`0700`: the snapshot, the gzip output, the `.gpg` ciphertext, the Postgres dump,
+the decrypted scratch file, the **restore temp file** (a plaintext copy of the
+database sitting beside the live one), `backup-manifest.json`, and the
+`.last-success` stamp. A backup directory the operator already created is left
+alone — the package tightens what it makes, not what it finds.
+
+Absorbed from smarthome's `umask 077` (BWK-132), the one backup-mechanics
+property it still had over this package after v0.10.0.
+
+Pinned by a test that sets a deliberately permissive `umask 022` first, so the
+package cannot pass by accident.
+
 ## 0.10.0
 
 Off-host replication with verification — the last of the four axes on which

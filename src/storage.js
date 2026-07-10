@@ -93,11 +93,12 @@ function readBackupManifest(directory) {
 function appendBackupManifestEntry(directory, entry) {
   const manifest = readBackupManifest(directory);
   manifest.entries.push(entry);
-  fs.writeFileSync(
-    path.join(directory, MANIFEST_FILENAME),
-    `${JSON.stringify(manifest, null, 2)}\n`,
-    'utf8',
-  );
+  const manifestPath = path.join(directory, MANIFEST_FILENAME);
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  // The manifest lists every backup path and checksum; keep it as private as the
+  // backups themselves (BWK-132). Not swallowed: a chmod that fails on a file we
+  // just wrote is a real problem, not a cosmetic one.
+  fs.chmodSync(manifestPath, 0o600);
   return manifest;
 }
 

@@ -765,6 +765,41 @@ function quoteDotCommandArg(value) {
 // which would be visible in the process table. The plaintext artifact is removed
 // once the ciphertext is written and hashed, so it never lingers in the backup
 // directory.
+
+// A backup is a full copy of the database, and a restore scratch file is a
+// plaintext copy of it sitting next to the live one. Neither should be readable
+// by other local users. Node's fs mode argument is masked by the process umask,
+// and gzip/gpg/pg_dump write through child processes that ignore it entirely —
+// so restrict explicitly after each artifact lands, rather than trusting umask.
+// Absorbed from smarthome's `umask 077` (BWK-132).
+const ARTIFACT_MODE = 0o600;
+const BACKUP_DIR_MODE = 0o700;
+
+function restrictArtifact(filePath) {
+  try {
+    fs.chmodSync(filePath, ARTIFACT_MODE);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+  return filePath;
+}
+
+// Only tighten a directory we just created; never re-mode one the operator set.
+function ensureBackupDir(dirPath) {
+  const existed = fs.existsSync(dirPath);
+  fs.mkdirSync(dirPath, { recursive: true });
+  if (!existed) {
+    try {
+      fs.chmodSync(dirPath, BACKUP_DIR_MODE);
+    } catch {
+      // Best effort: a restrictive umask may already have done it.
+    }
+  }
+  return dirPath;
+}
+
 const DEFAULT_CIPHER_ALGO = 'AES256';
 
 function encryptBackupEntry(entry, encryption, runtime) {
@@ -803,6 +838,7 @@ function encryptBackupEntry(entry, encryption, runtime) {
   if (!fs.existsSync(destPath)) {
     throw new Error(`gpg reported success but produced no output at ${destPath}`);
   }
+  restrictArtifact(destPath);
 
   // The plaintext snapshot must not survive alongside the ciphertext.
   fs.rmSync(entry.fullPath, { force: true });
@@ -833,6 +869,7 @@ function decryptBackupToPath(sourcePath, destPath, encryption, runtime) {
     ['--batch', '--yes', '--decrypt', '--passphrase-file', passphraseFile, '-o', destPath, sourcePath],
     { stdio: 'pipe' }
   );
+  restrictArtifact(destPath);
 }
 
 // A snapshot far smaller than expected is a failure, not a backup: an empty or
@@ -890,7 +927,7 @@ function createSqliteSnapshot({
     // Opted in: an inconsistent copy is better than nothing for the caller's
     // purposes. It cannot be integrity-checked either, since that needs sqlite3.
     fs.copyFileSync(sourcePath, destPath);
-    return destPath;
+    return restrictArtifact(destPath);
   }
 
   // `.backup` is the online backup API: WAL-safe, consistent, and it will not
@@ -921,7 +958,7 @@ function createSqliteSnapshot({
   // corrupt file. A bad backup is worse than a loud failure, so delete it and
   // throw. We own destPath — we just wrote it — hence deleteOnFailure.
   verifySqliteBackupIntegrity(destPath, runtime, { deleteOnFailure: true });
-  return destPath;
+  return restrictArtifact(destPath);
 }
 
 function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd = process.cwd(), runtime = normalizeRuntime(), allowUnsafeCopy = false }) {
@@ -942,6 +979,7 @@ function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd =
     runtime.execFileSync('gzip', ['-f', rawFilePath], { stdio: 'inherit' });
     finalPath = `${rawFilePath}.gz`;
     compressed = true;
+    restrictArtifact(finalPath);
   }
 
   const stats = fs.statSync(finalPath);
@@ -969,6 +1007,7 @@ function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalize
     outputDir,
   });
   runtime.execFileSync('pg_dump', ['--format=custom', `--file=${fullPath}`, databaseUrl], { stdio: 'inherit' });
+  restrictArtifact(fullPath);
 
   // Verify the dump before we keep it, mirroring the SQLite integrity check.
   // Only possible when pg_restore is present; skip like the SQLite cp-fallback.
@@ -992,7 +1031,7 @@ function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalize
 function createBackup(options = {}) {
   const resolved = resolveBackupOptions(options);
   const now = resolved.runtime.now();
-  fs.mkdirSync(resolved.outputDir, { recursive: true });
+  ensureBackupDir(resolved.outputDir);
 
   const finalize = (entry) => {
     assertMinimumBackupSize(entry, resolved.minBytes);
@@ -1144,6 +1183,7 @@ function restoreSqliteBackup({
     } else {
       fs.copyFileSync(sourcePath, tempPath);
     }
+    restrictArtifact(tempPath);
 
     // The decrypted plaintext has served its purpose; don't leave it beside the
     // live database.
@@ -1773,7 +1813,8 @@ function writeSuccessStamp(stampFile, now = new Date()) {
   // Write-then-rename: a crash mid-write must never leave a truncated stamp that
   // a freshness monitor would misread. Absorbed from smarthome's mktemp + mv.
   const tempPath = path.join(dir, `.last-success.tmp-${process.pid}`);
-  fs.writeFileSync(tempPath, `${now.toISOString()}\n`);
+  fs.writeFileSync(tempPath, `${now.toISOString()}\n`, { mode: ARTIFACT_MODE });
+  restrictArtifact(tempPath);
   fs.renameSync(tempPath, stampFile);
   return stampFile;
 }
@@ -1802,7 +1843,7 @@ function checkBackupFreshness({ stampFile, maxAgeHours = 36, now = new Date() } 
 
 function runBackupJob(options = {}) {
   const resolved = resolveBackupOptions(options);
-  fs.mkdirSync(resolved.outputDir, { recursive: true });
+  ensureBackupDir(resolved.outputDir);
 
   return withBackupLock(resolved.outputDir, resolved.runtime, () => {
     const created = createBackup(resolved);
