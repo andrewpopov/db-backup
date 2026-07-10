@@ -3,6 +3,40 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.8.0
+
+**BREAKING (behavioral) — `verifySqliteBackupIntegrity` no longer deletes the file
+it rejects, unless you ask it to.**
+
+The exported helper ran `fs.rmSync(backupPath)` whenever `PRAGMA integrity_check`
+did not return `ok`. That is correct for its one internal caller —
+`createSqliteSnapshot` discards a snapshot it just wrote, because a bad backup is
+worse than a loud failure — but it was exported (v0.7.0) with nothing to signal
+that it mutates the filesystem. A consumer reaching for the obvious-sounding
+"verify this backup file" helper on a **user-supplied path** would silently
+destroy that user's backup. This was caught one review away from shipping in
+savoro's admin restore route (PTRY-227).
+
+It is deviously hard to notice: on a file `sqlite3` cannot open, `execFileSync`
+throws *before* the deletion, so the file survives. Only a **parseable but
+corrupt** database (`sqlite3` opens it; `integrity_check` prints e.g.
+`Rowid 0 out of order`) reaches the deletion branch. A test using random bytes
+cannot tell the two behaviors apart.
+
+- `verifySqliteBackupIntegrity(path, runtime)` is now **non-destructive**.
+- `verifySqliteBackupIntegrity(path, runtime, { deleteOnFailure: true })` restores
+  the old behavior. `createSqliteSnapshot` passes it, because it owns `destPath`.
+- Collapsed the internal `assertSqliteIntegrity` duplicate — a byte-similar,
+  non-destructive copy of the same check used by the restore path — into this one
+  function. The restore path's error message changes from "SQLite restore
+  integrity check failed" to "SQLite backup integrity check failed".
+
+Impact: a caller relying on the old delete-on-failure behavior of the *exported*
+function must now pass `{ deleteOnFailure: true }`. No current consumer did.
+
+`verifyPostgresBackupIntegrity` is unchanged: it is internal-only and is called
+solely on a dump it just created, so its deletion is correct by ownership.
+
 ## 0.7.0
 
 Reference implementation of the shared package standards. Additive: no existing

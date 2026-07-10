@@ -595,13 +595,26 @@ function resolveBackupOptions(options = {}) {
   };
 }
 
-function verifySqliteBackupIntegrity(backupPath, runtime = normalizeRuntime()) {
+// Run `PRAGMA integrity_check` on a SQLite file and throw if it is not `ok`.
+//
+// NON-DESTRUCTIVE by default. `deleteOnFailure` exists for the one caller that
+// owns the file it is checking: createSqliteSnapshot discards a snapshot it just
+// wrote, because a bad backup is worse than a loud failure. A consumer verifying
+// a file it did not create — an admin route vetting a user-supplied path — must
+// never have that file deleted underneath it, so the exported default is safe.
+//
+// Subtlety: on a file sqlite3 cannot even open, execFileSync throws and nothing
+// is deleted regardless. Only a *parseable but corrupt* database reaches the
+// deletion branch, which makes an unsafe default very hard to notice in testing.
+function verifySqliteBackupIntegrity(backupPath, runtime = normalizeRuntime(), { deleteOnFailure = false } = {}) {
   const output = runtime.execFileSync('sqlite3', [backupPath, 'PRAGMA integrity_check;'], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const firstLine = (output ? output.toString() : '').trim().split(/\r?\n/, 1)[0] || '';
   if (firstLine !== 'ok') {
-    fs.rmSync(backupPath, { force: true });
+    if (deleteOnFailure) {
+      fs.rmSync(backupPath, { force: true });
+    }
     throw new Error(`SQLite backup integrity check failed: ${firstLine || 'no output'}`);
   }
 }
@@ -708,8 +721,8 @@ function createSqliteSnapshot({
 
   // Verify the snapshot before we keep it: a `.backup` can succeed yet leave a
   // corrupt file. A bad backup is worse than a loud failure, so delete it and
-  // throw.
-  verifySqliteBackupIntegrity(destPath, runtime);
+  // throw. We own destPath — we just wrote it — hence deleteOnFailure.
+  verifySqliteBackupIntegrity(destPath, runtime, { deleteOnFailure: true });
   return destPath;
 }
 
@@ -868,16 +881,6 @@ function resolveRestoreBackup({
 // would DESTROY the live database if reused here. This one only checks and
 // throws — the caller (restoreSqliteBackup) is responsible for cleaning up its
 // own temp file, and the live destination is never touched by this function.
-function assertSqliteIntegrity(filePath, runtime) {
-  const output = runtime.execFileSync('sqlite3', [filePath, 'PRAGMA integrity_check;'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  const firstLine = (output ? output.toString() : '').trim().split(/\r?\n/, 1)[0] || '';
-  if (firstLine !== 'ok') {
-    throw new Error(`SQLite restore integrity check failed: ${firstLine || 'no output'}`);
-  }
-}
-
 function redactDatabaseUrl(databaseUrl) {
   try {
     const parsed = new URL(databaseUrl);
@@ -929,7 +932,7 @@ function restoreSqliteBackup({
     // live database: if this throws, the catch below cleans up tempPath only —
     // destinationPath is never touched, so a bad backup can't destroy a good DB.
     if (runtime.commandExists('sqlite3')) {
-      assertSqliteIntegrity(tempPath, runtime);
+      verifySqliteBackupIntegrity(tempPath, runtime);
     }
 
     if (fs.existsSync(destinationPath)) {
