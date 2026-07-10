@@ -19,6 +19,7 @@ const {
   readBackupManifest,
   appendBackupManifestEntry,
   createSqliteSnapshot,
+  verifySqliteBackupIntegrity,
   normalizeRuntime,
   DEFAULT_COMMAND_TIMEOUT_MS,
 } = require('../index.js') as typeof import('../index');
@@ -736,6 +737,69 @@ describe('@andrewpopov/db-backup', () => {
 
     const backupArg = captured[0].find((a) => a.startsWith('.backup'));
     expect(backupArg).toContain("o''brien");
+  });
+
+
+  it('verifySqliteBackupIntegrity does NOT delete the file it rejects (BWK-129)', () => {
+    // The exported default must be non-destructive: a consumer vetting a
+    // user-supplied backup path must never have that file deleted underneath it.
+    const dir = makeTempDir();
+    const filePath = path.join(dir, 'corrupt.db');
+    fs.writeFileSync(filePath, 'db bytes');
+
+    // A *parseable but corrupt* database: sqlite3 opens it and integrity_check
+    // prints a failure. (On garbage, execFileSync throws first and nothing is
+    // deleted regardless — which is what makes an unsafe default hard to notice.)
+    const runtime = makeRuntime({
+      commandExists: () => true,
+      execFileSync: (() => Buffer.from('*** in database main ***\nRowid 0 out of order')) as never,
+    });
+
+    expect(() => verifySqliteBackupIntegrity(filePath, runtime)).toThrow(/integrity check failed/i);
+    expect(fs.existsSync(filePath), 'the caller\u2019s file must survive').toBe(true);
+  });
+
+  it('verifySqliteBackupIntegrity deletes only when the caller opts in', () => {
+    const dir = makeTempDir();
+    const filePath = path.join(dir, 'own-snapshot.db');
+    fs.writeFileSync(filePath, 'db bytes');
+
+    const runtime = makeRuntime({
+      commandExists: () => true,
+      execFileSync: (() => Buffer.from('Rowid 0 out of order')) as never,
+    });
+
+    expect(() =>
+      verifySqliteBackupIntegrity(filePath, runtime, { deleteOnFailure: true }),
+    ).toThrow(/integrity check failed/i);
+    expect(fs.existsSync(filePath)).toBe(false);
+  });
+
+  it('createSqliteSnapshot discards its own corrupt snapshot', () => {
+    // The one legitimate destructive case: the snapshot is a file the package
+    // just wrote, so a bad backup is worse than a loud failure.
+    const dir = makeTempDir();
+    const sourcePath = path.join(dir, 'app.db');
+    const destPath = path.join(dir, 'snap.db');
+    fs.writeFileSync(sourcePath, 'db');
+
+    const runtime = makeRuntime({
+      commandExists: () => true,
+      execFileSync: ((_c: string, args: string[]) => {
+        const isBackup = args.some((a) => String(a).startsWith('.backup'));
+        if (isBackup) {
+          fs.writeFileSync(destPath, 'corrupt snapshot');
+          return Buffer.from('');
+        }
+        return Buffer.from('Rowid 0 out of order'); // integrity_check
+      }) as never,
+    });
+
+    expect(() => createSqliteSnapshot({ sourcePath, destPath, runtime })).toThrow(
+      /integrity check failed/i,
+    );
+    expect(fs.existsSync(destPath), 'a corrupt snapshot must not be kept').toBe(false);
+    expect(fs.existsSync(sourcePath), 'the source database is never touched').toBe(true);
   });
 
   it('lists only supported backup filenames and annotates retention decisions', () => {

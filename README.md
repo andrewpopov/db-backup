@@ -7,7 +7,7 @@
 ## Install
 
 ```bash
-npm install github:andrewpopov/db-backup#v0.7.0
+npm install github:andrewpopov/db-backup#v0.8.0
 ```
 
 Reusable database backup utilities with three retention strategies. **Age-tier**
@@ -186,6 +186,10 @@ createSqliteSnapshot({ sourcePath: '/srv/app/data/app.db', destPath, runtime });
 // Atomic restore: temp -> verify -> discard destination sidecars -> rename.
 restoreSqliteBackup({ databaseUrl, backupEntry: { fullPath: destPath, compressed: false }, runtime });
 ```
+
+`verifySqliteBackupIntegrity` is **non-destructive**: it throws on a corrupt file
+but never deletes it. Pass `{ deleteOnFailure: true }` only for a file you own —
+`createSqliteSnapshot` does this to discard a snapshot it just wrote.
 
 `createSqliteSnapshot` **throws** when `sqlite3` is unavailable, rather than fall
 back to a plain byte copy. A copy of a live SQLite database is never guaranteed

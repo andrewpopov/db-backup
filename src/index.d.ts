@@ -235,9 +235,17 @@ export function createSqliteSnapshot(options: {
   allowUnsafeCopy?: boolean;
 }): string;
 
-/** Run `PRAGMA integrity_check` on a SQLite file. Deletes the file and throws if
- * it is not `ok` — a bad backup is worse than a loud failure. */
-export function verifySqliteBackupIntegrity(backupPath: string, runtime?: ResolvedBackupRuntime): void;
+/** Run `PRAGMA integrity_check` on a SQLite file and throw if it is not `ok`.
+ *
+ * **Non-destructive by default.** Pass `deleteOnFailure: true` only when you own
+ * the file being checked — `createSqliteSnapshot` does, to discard a snapshot it
+ * just wrote. Verifying a file you did not create (an admin route vetting a
+ * user-supplied path) must never delete it. */
+export function verifySqliteBackupIntegrity(
+  backupPath: string,
+  runtime?: ResolvedBackupRuntime,
+  options?: { deleteOnFailure?: boolean },
+): void;
 
 /** Atomically replace the database named by `databaseUrl` with `backupEntry`:
  * decompress/copy to a temp path, verify it there, discard the destination's
