@@ -20,6 +20,8 @@ const {
   appendBackupManifestEntry,
   createSqliteSnapshot,
   verifySqliteBackupIntegrity,
+  checkBackupFreshness,
+  writeSuccessStamp,
   normalizeRuntime,
   DEFAULT_COMMAND_TIMEOUT_MS,
 } = require('../index.js') as typeof import('../index');
@@ -837,6 +839,142 @@ describe('@andrewpopov/db-backup', () => {
     );
     expect(fs.existsSync(destPath), 'a corrupt snapshot must not be kept').toBe(false);
     expect(fs.existsSync(sourcePath), 'the source database is never touched').toBe(true);
+  });
+
+
+  it('never prunes the backup it just created, even when the clock jumped backward (BWK-131)', () => {
+    // A host whose clock jumps backward at boot gives the NEW file an older
+    // timestamp than existing ones. A retention policy that trusts the ordering
+    // would then delete the only backup that was just verified. Absorbed from
+    // smarthome's prune_local, which protects `$final` explicitly.
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+
+    // Two existing backups, both NEWER than the one about to be created.
+    for (const stamp of ['20260706-120000Z', '20260707-120000Z']) {
+      fs.writeFileSync(path.join(outputDir, `sqlite-backup-${stamp}.db`), 'old');
+    }
+
+    // fixedNow is 2026-07-05 — earlier than both, i.e. the clock went backward.
+    const result = runBackupJob({
+      allowUnsafeCopy: true,
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      compressSqlite: false,
+      policy: { mode: 'keep-last', keepLast: 1 },
+      runtime: makeRuntime(),
+    });
+
+    expect(fs.existsSync(result.created.fullPath), 'the new backup must survive retention').toBe(true);
+    expect(result.removed.map((e) => e.fileName)).not.toContain(result.created.fileName);
+  });
+
+  it('a snapshot below the minimum size is discarded, not kept (BWK-131)', () => {
+    // An empty or truncated database sails through PRAGMA integrity_check.
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'x');
+
+    expect(() =>
+      runBackupJob({
+        allowUnsafeCopy: true,
+        cwd,
+        databaseUrl: 'file:./app.db',
+        outputDir,
+        compressSqlite: false,
+        minBytes: 32768,
+        runtime: makeRuntime(),
+      }),
+    ).toThrow(/below the 32768-byte minimum/);
+
+    const leftovers = fs.readdirSync(outputDir).filter((f) => f.startsWith('sqlite-backup-'));
+    expect(leftovers, 'the undersized snapshot must not be kept').toEqual([]);
+  });
+
+  it('the .last-success stamp is written only after a fully successful run (BWK-131)', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const stampFile = path.join(outputDir, '.last-success');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'x');
+
+    // A run that fails the size floor must leave no stamp behind.
+    expect(() =>
+      runBackupJob({
+        allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
+        compressSqlite: false, minBytes: 32768, stampFile, runtime: makeRuntime(),
+      }),
+    ).toThrow();
+    expect(fs.existsSync(stampFile), 'a failed run must not stamp success').toBe(false);
+
+    // A clean run stamps.
+    runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
+      compressSqlite: false, stampFile, runtime: makeRuntime(),
+    });
+    expect(fs.readFileSync(stampFile, 'utf8').trim()).toBe(fixedNow.toISOString());
+  });
+
+  it('checkBackupFreshness treats a missing or stale stamp as not fresh', () => {
+    const dir = makeTempDir();
+    const stampFile = path.join(dir, '.last-success');
+
+    // Absence of evidence is not evidence of a backup.
+    expect(checkBackupFreshness({ stampFile, maxAgeHours: 36, now: fixedNow })).toMatchObject({
+      fresh: false,
+      stampedAt: null,
+    });
+
+    writeSuccessStamp(stampFile, new Date(fixedNow.getTime() - 2 * 60 * 60 * 1000));
+    expect(checkBackupFreshness({ stampFile, maxAgeHours: 36, now: fixedNow }).fresh).toBe(true);
+
+    writeSuccessStamp(stampFile, new Date(fixedNow.getTime() - 48 * 60 * 60 * 1000));
+    const stale = checkBackupFreshness({ stampFile, maxAgeHours: 36, now: fixedNow });
+    expect(stale.fresh).toBe(false);
+    expect(Math.round(stale.ageHours!)).toBe(48);
+
+    fs.writeFileSync(stampFile, 'not a date');
+    expect(checkBackupFreshness({ stampFile, maxAgeHours: 36, now: fixedNow }).fresh).toBe(false);
+  });
+
+  it('encryption refuses rather than writing an unencrypted backup when gpg is missing', () => {
+    const dir = makeTempDir();
+    const passphraseFile = path.join(dir, 'pass');
+    fs.writeFileSync(passphraseFile, 'secret');
+    const entry = { fileName: 'x.db', fullPath: path.join(dir, 'x.db'), sizeBytes: 3 } as never;
+    fs.writeFileSync(path.join(dir, 'x.db'), 'db');
+
+    expect(() =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (require('../index.js') as any).encryptBackupEntry(
+        entry,
+        { passphraseFile },
+        makeRuntime({ commandExists: () => false }),
+      ),
+    ).toThrow(/gpg.*unavailable/i);
+  });
+
+  it('restoring an encrypted backup without a passphrase fails loudly', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.mkdirSync(path.join(cwd, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(outputDir, 'sqlite-backup-20260705-150000Z.db.gpg'), 'ciphertext');
+
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl: 'file:./data/app.db',
+        outputDir,
+        backupFile: 'sqlite-backup-20260705-150000Z.db.gpg',
+        createPreRestoreBackup: false,
+        runtime: makeRuntime(),
+      }),
+    ).toThrow(/encrypted; encryption.passphraseFile is required/);
   });
 
   it('lists only supported backup filenames and annotates retention decisions', () => {

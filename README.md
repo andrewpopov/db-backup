@@ -7,7 +7,7 @@
 ## Install
 
 ```bash
-npm install github:andrewpopov/db-backup#v0.8.1
+npm install github:andrewpopov/db-backup#v0.9.0
 ```
 
 Reusable database backup utilities with three retention strategies. **Age-tier**
@@ -53,6 +53,32 @@ Notes:
   both `--keep-last` and `--keep-days`. An env var selects a flat mode only when
   no retention option was passed explicitly, so a stale `DB_BACKUP_KEEP_LAST`
   cannot silently override an explicit `--max-backups`.
+
+## Encryption at rest
+
+```bash
+db-backup backup --prod --encrypt-passphrase-file /var/lib/app/secrets/backup.pass
+```
+
+Runs `gpg --symmetric --cipher-algo AES256` and writes `<name>.db.gz.gpg`, removing
+the plaintext. The passphrase is read from a **file**, never passed as an argument
+(arguments are visible in the process table). If `gpg` is unavailable the backup
+**fails** rather than silently writing plaintext. `restore` decrypts transparently
+and refuses without the passphrase.
+
+## Backup liveness
+
+A cron backup that silently stops producing files is invisible. `--stamp-file` is
+written **only** after a fully successful run:
+
+```bash
+db-backup backup --prod --stamp-file /var/lib/app/backups/.last-success
+db-backup freshness --stamp-file /var/lib/app/backups/.last-success --max-age-hours 36
+```
+
+`freshness` exits non-zero when the last success is too old **or when no backup was
+ever recorded**. Pair it with `--min-bytes` so a truncated database — which passes
+`PRAGMA integrity_check` — fails loudly instead of rotating out a good backup.
 
 ## Supported databases
 
