@@ -977,6 +977,158 @@ describe('@andrewpopov/db-backup', () => {
     ).toThrow(/encrypted; encryption.passphraseFile is required/);
   });
 
+
+  it('uploads off-host and verifies the remote object before pruning or stamping (BWK-131)', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const stampFile = path.join(outputDir, '.last-success');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'database bytes');
+
+    const calls: string[][] = [];
+    const runtime = makeRuntime({
+      commandExists: (c: string) => c === 'rclone',
+      execFileSync: ((cmd: string, args: string[]) => {
+        calls.push([cmd, ...args]);
+        if (args[0] === 'lsjson') {
+          // Report the real local size so verification passes.
+          const local = fs.statSync(path.join(outputDir, fs.readdirSync(outputDir).find((f) => f.startsWith('sqlite-backup-'))!)).size;
+          return Buffer.from(JSON.stringify({ Size: local }));
+        }
+        if (args[0] === 'lsf') return Buffer.from('');
+        return Buffer.from('');
+      }) as never,
+    });
+
+    const result = runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
+      compressSqlite: false, stampFile, runtime,
+      remote: { target: 'offsite:backups/app' },
+    });
+
+    const verbs = calls.map((c) => c[1]);
+    expect(verbs).toContain('copyto');
+    expect(verbs).toContain('lsjson');
+    // Upload+verify must precede any pruning.
+    expect(verbs.indexOf('lsjson')).toBeLessThan(verbs.indexOf('lsf') === -1 ? Infinity : verbs.indexOf('lsf'));
+    expect(result.uploaded).toMatchObject({ target: `offsite:backups/app/${result.created.fileName}` });
+    expect(fs.existsSync(stampFile)).toBe(true);
+  });
+
+  it('a remote size mismatch prunes nothing and stamps nothing (fail-closed)', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const stampFile = path.join(outputDir, '.last-success');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'database bytes');
+    fs.writeFileSync(path.join(outputDir, 'sqlite-backup-20260701-120000Z.db'), 'old');
+    fs.writeFileSync(stampFile, '2026-07-01T00:00:00.000Z\n');
+
+    const runtime = makeRuntime({
+      commandExists: (c: string) => c === 'rclone',
+      execFileSync: ((_c: string, args: string[]) =>
+        args[0] === 'lsjson' ? Buffer.from(JSON.stringify({ Size: 1 })) : Buffer.from('')) as never,
+    });
+
+    expect(() =>
+      runBackupJob({
+        allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
+        compressSqlite: false, stampFile, runtime,
+        policy: { mode: 'keep-last', keepLast: 1 },
+        remote: { target: 'offsite:backups/app' },
+      }),
+    ).toThrow(/Remote size mismatch/);
+
+    expect(fs.existsSync(path.join(outputDir, 'sqlite-backup-20260701-120000Z.db')), 'old backup must survive').toBe(true);
+    expect(fs.readFileSync(stampFile, 'utf8').trim()).toBe('2026-07-01T00:00:00.000Z');
+  });
+
+  it('an unparseable rclone response is a verification failure, not a pass', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+
+    const runtime = makeRuntime({
+      commandExists: (c: string) => c === 'rclone',
+      execFileSync: ((_c: string, args: string[]) =>
+        args[0] === 'lsjson' ? Buffer.from('not json at all') : Buffer.from('')) as never,
+    });
+
+    expect(() =>
+      runBackupJob({
+        allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
+        compressSqlite: false, runtime, remote: { target: 'offsite:x' },
+      }),
+    ).toThrow(/Could not determine remote object size/);
+  });
+
+  it('refuses to report success when rclone is unavailable', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+
+    expect(() =>
+      runBackupJob({
+        allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir,
+        compressSqlite: false, runtime: makeRuntime({ commandExists: () => false }),
+        remote: { target: 'offsite:x' },
+      }),
+    ).toThrow(/rclone.*unavailable/i);
+  });
+
+  it('--skip-remote runs local-only without touching rclone', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+    const calls: string[] = [];
+
+    const result = runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+      remote: { target: 'offsite:x' }, skipRemote: true,
+      runtime: makeRuntime({ execFileSync: ((c: string) => { calls.push(c); return Buffer.from(''); }) as never }),
+    });
+
+    expect(calls).not.toContain('rclone');
+    expect(result.uploaded).toBeNull();
+  });
+
+  it('remote prune never deletes the object it just uploaded', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+    const deleted: string[] = [];
+
+    const runtime = makeRuntime({
+      commandExists: (c: string) => c === 'rclone',
+      execFileSync: ((_c: string, args: string[]) => {
+        if (args[0] === 'lsjson') {
+          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-'))!;
+          return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
+        }
+        if (args[0] === 'lsf') {
+          // The just-uploaded object sorts OLDEST here (clock rolled backward).
+          return Buffer.from(
+            ['sqlite-backup-20260709-120000Z.db', 'sqlite-backup-20260708-120000Z.db', 'sqlite-backup-20260705-150000Z.db'].join('\n'),
+          );
+        }
+        if (args[0] === 'deletefile') deleted.push(String(args[1]));
+        return Buffer.from('');
+      }) as never,
+    });
+
+    const result = runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+      runtime, remote: { target: 'offsite:x', keep: 1 },
+    });
+
+    expect(deleted.some((d) => d.endsWith(result.created.fileName)), 'must never delete the object it just verified').toBe(false);
+    expect(deleted.length).toBeGreaterThan(0);
+  });
+
   it('lists only supported backup filenames and annotates retention decisions', () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');

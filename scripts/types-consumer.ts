@@ -15,6 +15,8 @@ import {
   verifySqliteBackupIntegrity,
   checkBackupFreshness,
   writeSuccessStamp,
+  uploadBackupToRemote,
+  pruneRemoteBackups,
   DEFAULT_CIPHER_ALGO,
   restoreSqliteBackup,
   removeSqliteSidecars,
@@ -41,6 +43,7 @@ import {
   type ResolvedBackupRuntime,
   type BackupEncryption,
   type BackupFreshness,
+  type BackupRemote,
 } from '../src/index';
 
 // Retention policy + the three job entry points.
@@ -192,3 +195,20 @@ restoreBackup({
 });
 
 export const _encryptionContract = { encryption, freshness, _stale, _age, _cipher };
+
+// Off-host replication with verification (BWK-131), as smarthome's cron uses it.
+const remote: BackupRemote = { target: 'offsite:backups/app', keep: 30, configFile: '/var/lib/app/secrets/rclone.conf' };
+const offsiteJob = runBackupJob({
+  mode: 'prod',
+  outputDir: '/var/lib/app/backups',
+  encryption,
+  remote,
+  stampFile: '/var/lib/app/backups/.last-success',
+});
+const _uploadedTo: string | undefined = offsiteJob.uploaded?.target;
+const _prunedRemote: string[] | undefined = offsiteJob.removedRemote;
+
+// A pre-deploy hook wants the fast local-only path.
+runBackupJob({ mode: 'prod', outputDir: '/var/lib/app/backups', remote, skipRemote: true });
+
+export const _remoteContract = { remote, _uploadedTo, _prunedRemote };

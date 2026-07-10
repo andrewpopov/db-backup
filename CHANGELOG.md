@@ -3,6 +3,39 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.10.0
+
+Off-host replication with verification — the last of the four axes on which
+smarthome's `scripts/backup-db.sh` was better than this package (BWK-131).
+db-backup is now a superset of it, so smarthome can migrate without regressing.
+
+- **Feature — off-host upload with remote verification.**
+  `remote: { target, keep, configFile, verify }` uploads via `rclone copyto`,
+  then **re-reads the object** with `rclone lsjson --stat` and compares its byte
+  count to the local artifact. A local-only backup dies with the disk it sits on
+  (sano-os's docs call this the "same-SSD durability gap"; rouge pulls its
+  backups to a Mac by hand).
+- **The fail-closed invariant.** Nothing is pruned and no success is stamped
+  until the remote object has been verified. A failed or unverified upload leaves
+  the previous good backups **and** the previous stamp exactly where they were.
+  An unparseable `rclone` response is a verification *failure*, not a pass. If
+  `rclone` is unavailable the run **refuses** rather than silently skipping the
+  off-site copy.
+- **Remote retention** keeps the newest `keep` objects (default 30, never fewer
+  than 1) and **never deletes the object it just uploaded** — the same
+  clock-rollback protection as the local prune. A remote prune failure is a
+  cleanup miss, not a data-safety issue, so it warns and carries on.
+- `skipRemote` / `--skip-remote` for a fast local-only run, e.g. a pre-migration
+  deploy hook that should not pay for a network round trip.
+- **Fix — the `.last-success` stamp is now written atomically** (write-then-
+  rename). A crash mid-write could otherwise leave a truncated stamp that a
+  freshness monitor would misread.
+
+New CLI flags: `--remote`, `--remote-keep`, `--rclone-config`, `--skip-remote`.
+
+BWK-131 is complete: encryption at rest, size floor, success stamp + freshness,
+never-prune-the-new-backup (0.9.0), and now off-host upload with verification.
+
 ## 0.9.0
 
 Encryption at rest and backup liveness, absorbed from smarthome's

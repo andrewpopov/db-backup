@@ -95,6 +95,10 @@ function parseArgs(argv) {
     minBytes: null,
     stampFile: null,
     maxAgeHours: 36,
+    remoteTarget: null,
+    remoteKeep: null,
+    rcloneConfig: null,
+    skipRemote: false,
     cronCommand: null,
     logPath: null,
   };
@@ -208,6 +212,35 @@ function parseArgs(argv) {
       }
       options.dailySlots = value;
       index += 1;
+      continue;
+    }
+
+    if (arg === '--remote') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --remote');
+      options.remoteTarget = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--remote-keep') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null || value < 1) throw new Error('--remote-keep must be an integer >= 1');
+      options.remoteKeep = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--rclone-config') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --rclone-config');
+      options.rcloneConfig = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--skip-remote') {
+      options.skipRemote = true;
       continue;
     }
 
@@ -619,6 +652,8 @@ function resolveBackupOptions(options = {}) {
   const encryption = options.encryption || null;
   const minBytes = Number(options.minBytes) > 0 ? Number(options.minBytes) : 0;
   const stampFile = options.stampFile || null;
+  const remote = options.remote || null;
+  const skipRemote = options.skipRemote === true;
   const policy = options.policy || DEFAULT_RETENTION_POLICY;
   const runtime = normalizeRuntime(options.runtime || options._runtime);
 
@@ -645,6 +680,8 @@ function resolveBackupOptions(options = {}) {
     encryption,
     minBytes,
     stampFile,
+    remote,
+    skipRemote,
     policy,
     databaseUrl,
     runtime,
@@ -1610,12 +1647,134 @@ function pruneBackupsJob(options = {}) {
   });
 }
 
+
+// ---------------------------------------------------------------------------
+// Off-host replication (BWK-131, absorbed from smarthome's backup-db.sh).
+//
+// A local-only backup dies with the disk it sits on. sano-os's docs flag exactly
+// this ("same-SSD durability gap"), and rouge pulls its backups to a Mac by hand.
+// smarthome solved it properly and this package had nothing.
+//
+// The invariant that makes it safe: NOTHING is pruned and NO success is stamped
+// until the remote object has been re-read and its size matched. A failed or
+// unverified upload leaves the previous good backups — and the previous stamp —
+// exactly where they were.
+// ---------------------------------------------------------------------------
+const DEFAULT_REMOTE_KEEP = 30;
+
+function rcloneEnv(remote) {
+  return remote.configFile ? { ...process.env, RCLONE_CONFIG: remote.configFile } : undefined;
+}
+
+function remoteObjectPath(remote, fileName) {
+  return `${remote.target.replace(/\/+$/, '')}/${fileName}`;
+}
+
+// Re-read the uploaded object and compare its size to the local artifact. rclone
+// reports either an object or a single-element array depending on version, so
+// accept both. An unparseable response is a verification FAILURE, not a pass.
+function verifyRemoteObject(entry, remote, runtime) {
+  const target = remoteObjectPath(remote, entry.fileName);
+  const output = runtime.execFileSync('rclone', ['lsjson', '--stat', target], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: rcloneEnv(remote),
+  });
+
+  let remoteSize = null;
+  try {
+    const parsed = JSON.parse((output || '').toString());
+    const size = Array.isArray(parsed) ? parsed[0] && parsed[0].Size : parsed && parsed.Size;
+    if (typeof size === 'number') {
+      remoteSize = size;
+    }
+  } catch {
+    remoteSize = null;
+  }
+
+  if (remoteSize === null) {
+    throw new Error(`Could not determine remote object size for ${target}; refusing to prune or stamp`);
+  }
+
+  const localSize = fs.statSync(entry.fullPath).size;
+  if (remoteSize !== localSize) {
+    throw new Error(
+      `Remote size mismatch for ${target}: local=${localSize} remote=${remoteSize}; refusing to prune or stamp`
+    );
+  }
+
+  return { target, sizeBytes: remoteSize };
+}
+
+function uploadBackupToRemote(entry, remote, runtime) {
+  if (!remote.target) {
+    throw new Error('remote.target is required to upload a backup');
+  }
+  if (!runtime.commandExists('rclone')) {
+    throw new Error("Refusing to report success: remote upload was requested but the 'rclone' binary is unavailable");
+  }
+
+  const target = remoteObjectPath(remote, entry.fileName);
+  runtime.execFileSync('rclone', ['copyto', entry.fullPath, target], {
+    stdio: 'pipe',
+    env: rcloneEnv(remote),
+  });
+
+  return remote.verify === false ? { target, sizeBytes: null } : verifyRemoteObject(entry, remote, runtime);
+}
+
+// Keep the newest `keep` remote objects, never fewer than 1, and never the object
+// we just uploaded and verified — same clock-rollback protection as the local
+// prune. A prune failure is a cleanup miss, not a data-safety issue: the new
+// backup is already verified on both ends, so warn and carry on.
+function pruneRemoteBackups(remote, protectFileName, runtime) {
+  const keep = Math.max(1, Number(remote.keep) > 0 ? Number(remote.keep) : DEFAULT_REMOTE_KEEP);
+  let listing = '';
+  try {
+    listing = runtime
+      .execFileSync('rclone', ['lsf', remote.target, '--files-only'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: rcloneEnv(remote),
+      })
+      .toString();
+  } catch (error) {
+    console.warn(`[db-backup] Could not list remote backups for pruning: ${error.message}`);
+    return [];
+  }
+
+  const candidates = listing
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((name) => name && name !== protectFileName && parseBackupFileName(name))
+    .sort()
+    .reverse();
+
+  const doomed = candidates.slice(keep - 1);
+  const deleted = [];
+  for (const name of doomed) {
+    try {
+      runtime.execFileSync('rclone', ['deletefile', remoteObjectPath(remote, name)], {
+        stdio: 'pipe',
+        env: rcloneEnv(remote),
+      });
+      deleted.push(name);
+    } catch (error) {
+      console.warn(`[db-backup] Failed to prune remote backup ${name} (leaving it in place): ${error.message}`);
+    }
+  }
+  return deleted;
+}
+
 // `.last-success` is the liveness signal a cron-driven backup otherwise lacks:
 // a job that silently stops producing backups is invisible without one.
 // Absorbed from smarthome's .last-success stamp + check-backup-freshness.sh.
 function writeSuccessStamp(stampFile, now = new Date()) {
-  fs.mkdirSync(path.dirname(stampFile), { recursive: true });
-  fs.writeFileSync(stampFile, `${now.toISOString()}\n`);
+  const dir = path.dirname(stampFile);
+  fs.mkdirSync(dir, { recursive: true });
+  // Write-then-rename: a crash mid-write must never leave a truncated stamp that
+  // a freshness monitor would misread. Absorbed from smarthome's mktemp + mv.
+  const tempPath = path.join(dir, `.last-success.tmp-${process.pid}`);
+  fs.writeFileSync(tempPath, `${now.toISOString()}\n`);
+  fs.renameSync(tempPath, stampFile);
   return stampFile;
 }
 
@@ -1648,6 +1807,16 @@ function runBackupJob(options = {}) {
   return withBackupLock(resolved.outputDir, resolved.runtime, () => {
     const created = createBackup(resolved);
     const now = resolved.runtime.now();
+
+    // Replicate off-host BEFORE anything is pruned or stamped. A local-only
+    // backup dies with the disk it sits on; an unverified remote copy is not a
+    // backup. If either the upload or its verification fails we throw here, so
+    // the previous good backups and the previous stamp both survive untouched.
+    let uploaded = null;
+    if (resolved.remote && !resolved.skipRemote) {
+      uploaded = uploadBackupToRemote(created, resolved.remote, resolved.runtime);
+    }
+
     const backups = listBackups({ outputDir: resolved.outputDir, now });
     const plan = planRetention(backups, resolved.policy, now);
 
@@ -1658,6 +1827,13 @@ function runBackupJob(options = {}) {
     // smarthome's prune_local (BWK-131).
     const doomed = plan.remove.filter((entry) => entry.fileName !== created.fileName);
     const removed = pruneBackups(doomed);
+
+    // Remote retention is best-effort: the new object is verified on both ends,
+    // so a stray old copy is a cleanup miss, not a data-safety issue.
+    const removedRemote =
+      uploaded && resolved.remote
+        ? pruneRemoteBackups(resolved.remote, created.fileName, resolved.runtime)
+        : [];
 
     // Best-effort: a manifest write failure must never fail the backup itself.
     // Safety/pre-restore backups (created via createBackup outside this job)
@@ -1687,6 +1863,8 @@ function runBackupJob(options = {}) {
     return {
       created,
       removed,
+      removedRemote,
+      uploaded,
       kept: plan.keep,
       mode: resolved.mode,
       outputDir: resolved.outputDir,
@@ -1754,6 +1932,10 @@ Options:
   --min-bytes <n>         Discard and fail if the backup is smaller than n bytes
   --stamp-file <path>     Write .last-success only after a fully successful run
   --max-age-hours <n>     Freshness threshold (command: freshness, default 36)
+  --remote <dest>         Upload off-host via rclone and verify (e.g. remote:path)
+  --remote-keep <n>       Remote backups to retain (default 30)
+  --rclone-config <path>  RCLONE_CONFIG for the upload
+  --skip-remote           Local-only run: no upload, no remote prune
   --no-compress           Disable gzip for SQLite backups
   --allow-missing         Skip (don't fail) when the SQLite database is absent
   --json                  Print JSON output
@@ -1843,6 +2025,14 @@ function runCli(argv = process.argv.slice(2)) {
       : null,
     minBytes: options.minBytes,
     stampFile: options.stampFile,
+    remote: options.remoteTarget
+      ? {
+          target: options.remoteTarget,
+          ...(options.remoteKeep ? { keep: options.remoteKeep } : {}),
+          ...(options.rcloneConfig ? { configFile: options.rcloneConfig } : {}),
+        }
+      : null,
+    skipRemote: options.skipRemote,
     runtime: { commandTimeoutMs: options.commandTimeoutMs },
     policy: resolveRetentionPolicy({
       maxBackups: options.maxBackups,
@@ -1976,6 +2166,8 @@ module.exports = {
   writeSuccessStamp,
   readSuccessStamp,
   checkBackupFreshness,
+  uploadBackupToRemote,
+  pruneRemoteBackups,
   DEFAULT_CIPHER_ALGO,
   // Backup-storage helpers (BWK-85, generalized from stoki/pantry):
   MANIFEST_FILENAME,

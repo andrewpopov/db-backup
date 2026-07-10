@@ -50,7 +50,8 @@ try {
     const expected = ['runCli', 'runBackupJob', 'listBackupsWithPlan', 'restoreBackup', 'planRetention', 'resolveBackupDirectories', 'resolveContainedBackupPath', 'readBackupManifest', 'appendBackupManifestEntry', // SQLite engine primitives (BWK-120): the seam consumers build on.
       'createSqliteSnapshot', 'verifySqliteBackupIntegrity', 'restoreSqliteBackup', 'removeSqliteSidecars', 'normalizeRuntime',
       // Encryption at rest + backup liveness (BWK-131).
-      'encryptBackupEntry', 'decryptBackupToPath', 'writeSuccessStamp', 'readSuccessStamp', 'checkBackupFreshness'];
+      'encryptBackupEntry', 'decryptBackupToPath', 'writeSuccessStamp', 'readSuccessStamp', 'checkBackupFreshness',
+      'uploadBackupToRemote', 'pruneRemoteBackups'];
     const missing = expected.filter((k) => typeof t[k] !== 'function');
     if (missing.length) { throw new Error('missing exports: ' + missing.join(', ')); }
     console.log('[verify-pack] exports OK: ' + expected.join(', '));
