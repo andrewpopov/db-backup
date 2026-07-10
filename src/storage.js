@@ -1,12 +1,12 @@
 'use strict';
 
-// Backup-storage helpers generalized from stoki/pantry's admin backup subsystem
-// (BWK-85): resolve a set of candidate backup directories, safely contain a
-// user-supplied restore path, and track backups in a per-directory manifest.
+// Backup-storage helpers: resolve a set of candidate backup directories, safely
+// contain a user-supplied restore path, and track backups in a per-directory
+// manifest.
 //
 // Everything here is policy-free: the caller supplies the candidate directory
-// list and env var name, so bewks/sano/pantry each keep their own directory
-// policy while sharing the mechanism.
+// list and env var name, so each consumer keeps its own directory policy while
+// sharing the mechanism.
 
 const fs = require('fs');
 const path = require('path');
@@ -96,7 +96,7 @@ function appendBackupManifestEntry(directory, entry) {
   const manifestPath = path.join(directory, MANIFEST_FILENAME);
   fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   // The manifest lists every backup path and checksum; keep it as private as the
-  // backups themselves (BWK-132). Not swallowed: a chmod that fails on a file we
+  // backups themselves. Not swallowed: a chmod that fails on a file we
   // just wrote is a real problem, not a cosmetic one.
   fs.chmodSync(manifestPath, 0o600);
   return manifest;

@@ -22,6 +22,8 @@ const {
   verifySqliteBackupIntegrity,
   parseBackupFileName,
   checkBackupFreshness,
+  checkRemoteFreshness,
+  notifyAlert,
   writeSuccessStamp,
   normalizeRuntime,
   DEFAULT_COMMAND_TIMEOUT_MS,
@@ -2025,5 +2027,169 @@ describe('@andrewpopov/db-backup', () => {
     expect(fs.readFileSync(dbPath).equals(originalBytes)).toBe(true);
     const remaining = fs.readdirSync(path.dirname(dbPath)).filter((name) => name.startsWith('.restore-'));
     expect(remaining).toEqual([]);
+  });
+});
+
+describe('checkRemoteFreshness (off-host dead-man switch)', () => {
+  const at = (hoursFromNow: number) =>
+    new Date(fixedNow.getTime() + hoursFromNow * 3600_000).toISOString();
+  const rcloneRuntime = (
+    entries: Array<{ Path: string; ModTime: string; IsDir?: boolean }>,
+  ) =>
+    makeRuntime({
+      commandExists: (c: string) => c === 'rclone',
+      execFileSync: ((command: string, args: string[]) =>
+        command === 'rclone' && args[0] === 'lsjson'
+          ? Buffer.from(JSON.stringify(entries))
+          : Buffer.from('')) as never,
+    });
+
+  it('is fresh when the newest remote object is within the threshold', () => {
+    const s = checkRemoteFreshness({
+      remote: { target: 'r2:b/p' },
+      runtime: rcloneRuntime([
+        { Path: 'old.db.gz', ModTime: at(-30) },
+        { Path: 'new.db.gz', ModTime: at(-2) },
+      ]),
+      maxAgeHours: 24,
+      now: fixedNow,
+    });
+    expect(s).toMatchObject({ fresh: true, clockSkew: false });
+    expect(s.ageHours).toBeCloseTo(2, 5);
+  });
+
+  it('is not fresh when the newest object is older than the threshold', () => {
+    const s = checkRemoteFreshness({
+      remote: { target: 'r2:b/p' },
+      runtime: rcloneRuntime([{ Path: 'x.db.gz', ModTime: at(-48) }]),
+      maxAgeHours: 24,
+      now: fixedNow,
+    });
+    expect(s.fresh).toBe(false);
+  });
+
+  it('is not fresh (stampedAt null) when the remote is empty', () => {
+    const s = checkRemoteFreshness({
+      remote: { target: 'r2:b/p' },
+      runtime: rcloneRuntime([]),
+      maxAgeHours: 24,
+      now: fixedNow,
+    });
+    expect(s).toMatchObject({ fresh: false, stampedAt: null });
+  });
+
+  it('flags a future ModTime as a clock problem, not fresh', () => {
+    const s = checkRemoteFreshness({
+      remote: { target: 'r2:b/p' },
+      runtime: rcloneRuntime([{ Path: 'x.db.gz', ModTime: at(2) }]),
+      maxAgeHours: 24,
+      now: fixedNow,
+    });
+    expect(s).toMatchObject({ fresh: false, clockSkew: true });
+  });
+
+  it('ignores directories when picking the newest object', () => {
+    const s = checkRemoteFreshness({
+      remote: { target: 'r2:b/p' },
+      runtime: rcloneRuntime([
+        { Path: 'today', ModTime: at(-1), IsDir: true },
+        { Path: 'x.db.gz', ModTime: at(-40) },
+      ]),
+      maxAgeHours: 24,
+      now: fixedNow,
+    });
+    expect(s.fresh).toBe(false); // the fresh entry is a directory; the only file is 40h old
+  });
+
+  it('throws when rclone is unavailable — a check that cannot run is not "fresh"', () => {
+    expect(() =>
+      checkRemoteFreshness({
+        remote: { target: 'r2:b/p' },
+        runtime: makeRuntime({ commandExists: () => false }),
+        maxAgeHours: 24,
+        now: fixedNow,
+      }),
+    ).toThrow(/rclone.*unavailable/i);
+  });
+});
+
+describe('notifyAlert', () => {
+  it('POSTs {content} to a Discord webhook via curl, message over stdin', () => {
+    const calls: Array<{ command: string; args: string[]; options: any }> = [];
+    notifyAlert('backup stale', {
+      notifyDiscord: 'https://discord/webhook',
+      runtime: makeRuntime({
+        commandExists: (c: string) => c === 'curl',
+        execFileSync: ((command: string, args: string[], options: any) => {
+          calls.push({ command, args, options });
+        }) as never,
+      }),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe('curl');
+    expect(calls[0].args).toContain('https://discord/webhook');
+    expect(JSON.parse(calls[0].options.input)).toEqual({ content: 'backup stale' });
+  });
+
+  it('runs --notify-command with the message in $DB_BACKUP_ALERT', () => {
+    const calls: Array<{ command: string; args: string[]; options: any }> = [];
+    notifyAlert('boom', {
+      notifyCommand: 'echo hi',
+      runtime: makeRuntime({
+        commandExists: () => true,
+        execFileSync: ((command: string, args: string[], options: any) => {
+          calls.push({ command, args, options });
+        }) as never,
+      }),
+    });
+    expect(calls[0].command).toBe('/bin/sh');
+    expect(calls[0].args).toEqual(['-c', 'echo hi']);
+    expect(calls[0].options.env.DB_BACKUP_ALERT).toBe('boom');
+  });
+
+  it('never throws when curl is missing or the POST fails', () => {
+    expect(() =>
+      notifyAlert('x', { notifyDiscord: 'https://d', runtime: makeRuntime({ commandExists: () => false }) }),
+    ).not.toThrow();
+    expect(() =>
+      notifyAlert('x', {
+        notifyWebhook: 'https://w',
+        runtime: makeRuntime({
+          commandExists: () => true,
+          execFileSync: (() => {
+            throw new Error('network down');
+          }) as never,
+        }),
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe('runCli freshness wiring', () => {
+  it('requires --stamp-file or --remote', () => {
+    expect(() => runCli(['freshness'])).toThrow(/--stamp-file .* or --remote/);
+  });
+
+  it('fires --notify-command and exits non-zero on a stale stamp (end-to-end)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-notify-'));
+    tempDirs.push(dir);
+    const stamp = path.join(dir, '.last-success');
+    const sentinel = path.join(dir, 'alert.txt');
+    fs.writeFileSync(stamp, '2020-01-01T00:00:00.000Z\n'); // ancient → stale
+    const prevExit = process.exitCode;
+    process.exitCode = 0;
+    runCli([
+      'freshness',
+      '--stamp-file',
+      stamp,
+      '--max-age-hours',
+      '1',
+      '--notify-command',
+      `printf '%s' "$DB_BACKUP_ALERT" > ${sentinel}`,
+    ]);
+    expect(process.exitCode).toBe(1);
+    expect(fs.existsSync(sentinel)).toBe(true);
+    expect(fs.readFileSync(sentinel, 'utf8')).toMatch(/STALE/);
+    process.exitCode = prevExit;
   });
 });

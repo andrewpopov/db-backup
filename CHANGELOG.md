@@ -3,6 +3,33 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.12.0
+
+**Feature — an off-host dead-man's switch: remote freshness + alerts on `freshness`.**
+
+The local `--stamp-file` check runs on the backup host, so it can't detect the host
+itself dying, and it only exits non-zero — someone still has to watch it. Two additions
+close that gap, both on the existing `freshness` command (no new command, no breaking
+change):
+
+- **`--remote <rclone-dest>`** — check the newest object's age under the rclone remote
+  instead of a local stamp. Run from a *different* host, it verifies the off-site copy
+  directly, catching host death, a broken timer, a failed upload, and a deleted script
+  alike. New `checkRemoteFreshness(...)` returns the same `BackupFreshness` shape as
+  `checkBackupFreshness`; an unlistable/unavailable remote is an error (alertable), never
+  a silent "fresh". Reuses the upload path's rclone env + object-path helpers.
+- **`--notify-discord` / `--notify-webhook` / `--notify-command`** — on staleness, a
+  missing backup, clock skew, or a check that can't run, deliver an alert. Best-effort and
+  **synchronous** (POST via `curl`, or run a command with the message in
+  `$DB_BACKUP_ALERT`): no new dependency, no `fetch`, so `runCli` stays synchronous and
+  every consumer's `try { runCli() } catch` is unaffected. A failing webhook can neither
+  mask nor manufacture a verdict; the exit code is still driven purely by freshness.
+
+New exports: `checkRemoteFreshness`, `notifyAlert`. `freshness` now accepts `--remote` in
+place of `--stamp-file` (either is required). Absorbed the "who watches the backup, and
+how do they find out" gap that every consumer (rogue/bewks/smarthome/sano-os) had wired
+by hand.
+
 ## 0.11.1
 
 **Fix — a future-dated `.last-success` stamp reported the backup as fresh, forever.**
