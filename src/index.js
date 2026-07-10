@@ -86,6 +86,8 @@ function parseArgs(argv) {
     allowMissing: false,
     maxBackups: null,
     dailySlots: null,
+    keepLast: null,
+    keepDays: null,
     cronCommand: null,
     logPath: null,
   };
@@ -197,6 +199,26 @@ function parseArgs(argv) {
         throw new Error('--daily-slots must be an integer >= 0');
       }
       options.dailySlots = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--keep-last') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null || value < 1) {
+        throw new Error('--keep-last must be an integer >= 1');
+      }
+      options.keepLast = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--keep-days') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null || value < 1) {
+        throw new Error('--keep-days must be an integer >= 1');
+      }
+      options.keepDays = value;
       index += 1;
       continue;
     }
@@ -412,10 +434,13 @@ function loadEnvironment({
 }
 
 // Build a retention policy from CLI/env overrides, falling back to
-// DEFAULT_RETENTION_POLICY. Only maxBackups/dailySlots are tunable from the
-// operational surface; the age-tier anchors stay policy-owned. Precedence:
-// explicit argument > env var > default.
-function resolveRetentionPolicy({ maxBackups, dailySlots, env = process.env } = {}) {
+// DEFAULT_RETENTION_POLICY. Retention has two exclusive shapes: the default
+// age-tier (maxBackups/dailySlots over policy-owned anchors) and the flat modes
+// keep-last / keep-days. The mode axis is resolved first — an explicit keep-*
+// option selects a flat mode and wins over the age-tier knobs; keep-last and
+// keep-days are mutually exclusive. Precedence within a mode: explicit arg > env
+// var > default.
+function resolveRetentionPolicy({ maxBackups, dailySlots, keepLast, keepDays, env = process.env } = {}) {
   const readInt = (value, label, min) => {
     if (value === undefined || value === null || value === '') {
       return null;
@@ -427,6 +452,44 @@ function resolveRetentionPolicy({ maxBackups, dailySlots, env = process.env } = 
     return parsed;
   };
 
+  // Mode axis, resolved before any numeric value. keepLast requires >= 1 so a
+  // flat count can never mean "delete everything".
+  const explicitKeepLast = readInt(keepLast, 'keepLast', 1);
+  const explicitKeepDays = readInt(keepDays, 'keepDays', 1);
+  const explicitAgeTier =
+    readInt(maxBackups, 'maxBackups', 1) !== null || readInt(dailySlots, 'dailySlots', 0) !== null;
+
+  if (explicitKeepLast !== null && explicitKeepDays !== null) {
+    throw new Error('keep-last and keep-days are mutually exclusive');
+  }
+  if ((explicitKeepLast !== null || explicitKeepDays !== null) && explicitAgeTier) {
+    throw new Error('keep-last/keep-days cannot be combined with maxBackups/dailySlots');
+  }
+
+  let resolvedKeepLast = explicitKeepLast;
+  let resolvedKeepDays = explicitKeepDays;
+
+  // An env var may select a flat mode only when NO explicit retention option was
+  // given — otherwise a stale DB_BACKUP_KEEP_LAST would silently override an
+  // explicit --max-backups, inverting the documented arg > env precedence.
+  if (explicitKeepLast === null && explicitKeepDays === null && !explicitAgeTier) {
+    const envKeepLast = readInt(env.DB_BACKUP_KEEP_LAST, 'DB_BACKUP_KEEP_LAST', 1);
+    const envKeepDays = readInt(env.DB_BACKUP_KEEP_DAYS, 'DB_BACKUP_KEEP_DAYS', 1);
+    if (envKeepLast !== null && envKeepDays !== null) {
+      throw new Error('DB_BACKUP_KEEP_LAST and DB_BACKUP_KEEP_DAYS are mutually exclusive');
+    }
+    resolvedKeepLast = envKeepLast;
+    resolvedKeepDays = envKeepDays;
+  }
+
+  if (resolvedKeepLast !== null) {
+    return { mode: 'keep-last', keepLast: resolvedKeepLast };
+  }
+  if (resolvedKeepDays !== null) {
+    return { mode: 'keep-days', keepDays: resolvedKeepDays };
+  }
+
+  // Age-tier axis (default).
   const resolvedMax =
     readInt(maxBackups, 'maxBackups', 1) ??
     readInt(env.DB_BACKUP_MAX_BACKUPS, 'DB_BACKUP_MAX_BACKUPS', 1);
@@ -965,19 +1028,23 @@ function chooseAnchorCandidate(backups, anchor, now, excludedNames) {
   return candidates[0];
 }
 
-function planRetention(backups, policy = DEFAULT_RETENTION_POLICY, now = new Date()) {
-  const selected = [];
-  const selectedNames = new Set();
-
-  // Sort by an EFFECTIVE time (clamped to "now") rather than raw createdAt: a
-  // future-dated backup (clock skew) would otherwise sort first and starve a
-  // daily slot from a legitimately-recent backup.
+// Sort backups newest-first by an EFFECTIVE time (raw createdAt clamped to
+// "now"), so a future-dated backup (clock skew) can't sort ahead of a
+// legitimately-recent one. Shared by every retention mode.
+function sortByEffectiveTime(backups, now) {
   const nowMs = now.getTime();
-  const sorted = [...backups].sort(
+  return [...backups].sort(
     (left, right) =>
       Math.min(new Date(right.createdAt).getTime(), nowMs) -
       Math.min(new Date(left.createdAt).getTime(), nowMs)
   );
+}
+
+// Age-tier selection (the default policy): `dailySlots` most-recent backups,
+// then one backup per age anchor, capped at `maxBackups`.
+function selectAgeTier(sorted, policy, now) {
+  const selected = [];
+  const selectedNames = new Set();
 
   const dailyCount = Math.min(policy.dailySlots, policy.maxBackups);
   sorted.slice(0, dailyCount).forEach((backup, index) => {
@@ -1005,6 +1072,61 @@ function planRetention(backups, policy = DEFAULT_RETENTION_POLICY, now = new Dat
       retentionLabel: anchor.label,
     });
     selectedNames.add(match.fileName);
+  }
+
+  return selected;
+}
+
+// Flat count retention: keep the N most-recent backups.
+function selectKeepLast(sorted, policy) {
+  return sorted.slice(0, policy.keepLast).map((backup) => ({
+    ...backup,
+    retentionReason: 'keep_last',
+    retentionLabel: 'Recent',
+  }));
+}
+
+// Flat age retention: keep every backup younger than `keepDays` days. Always
+// keep at least the single most-recent backup regardless of age, so a long gap
+// between runs can never delete every backup.
+function selectKeepDays(sorted, policy, now) {
+  const nowMs = now.getTime();
+  const cutoffMs = policy.keepDays * DAY_MS;
+  const selected = sorted
+    .filter((backup) => {
+      const effective = Math.min(new Date(backup.createdAt).getTime(), nowMs);
+      return nowMs - effective < cutoffMs;
+    })
+    .map((backup) => ({
+      ...backup,
+      retentionReason: 'keep_days',
+      retentionLabel: 'Within window',
+    }));
+
+  if (selected.length === 0 && sorted.length > 0) {
+    selected.push({
+      ...sorted[0],
+      retentionReason: 'newest',
+      retentionLabel: 'Most recent (age guard)',
+    });
+  }
+
+  return selected;
+}
+
+function planRetention(backups, policy = DEFAULT_RETENTION_POLICY, now = new Date()) {
+  // Absent mode means age-tier, so legacy policy objects (and the shared
+  // DEFAULT_RETENTION_POLICY, which carries no `mode`) behave unchanged.
+  const mode = policy.mode || 'age-tier';
+  const sorted = sortByEffectiveTime(backups, now);
+
+  let selected;
+  if (mode === 'keep-last') {
+    selected = selectKeepLast(sorted, policy);
+  } else if (mode === 'keep-days') {
+    selected = selectKeepDays(sorted, policy, now);
+  } else {
+    selected = selectAgeTier(sorted, policy, now);
   }
 
   const keepMap = new Map(selected.map((item) => [item.fileName, item]));
@@ -1266,8 +1388,10 @@ Options:
   --prod                  Use production env files (.env + .env.production)
   --dev                   Use development env files (.env + .env.local)
   --output-dir <path>     Backup directory (default: backups/database)
-  --max-backups <n>       Max backups to retain (env: DB_BACKUP_MAX_BACKUPS)
-  --daily-slots <n>       Recent daily slots before age tiers (env: DB_BACKUP_DAILY_SLOTS)
+  --max-backups <n>       Age-tier: max backups to retain (env: DB_BACKUP_MAX_BACKUPS)
+  --daily-slots <n>       Age-tier: recent daily slots before age tiers (env: DB_BACKUP_DAILY_SLOTS)
+  --keep-last <n>         Flat retention: keep the N most-recent backups (env: DB_BACKUP_KEEP_LAST)
+  --keep-days <n>         Flat retention: keep backups younger than N days (env: DB_BACKUP_KEEP_DAYS)
   --no-compress           Disable gzip for SQLite backups
   --allow-missing         Skip (don't fail) when the SQLite database is absent
   --json                  Print JSON output
@@ -1329,6 +1453,8 @@ function runCli(argv = process.argv.slice(2)) {
     policy: resolveRetentionPolicy({
       maxBackups: options.maxBackups,
       dailySlots: options.dailySlots,
+      keepLast: options.keepLast,
+      keepDays: options.keepDays,
     }),
   };
 

@@ -10,9 +10,14 @@
 npm install github:andrewpopov/db-backup#v0.5.0
 ```
 
-Reusable database backup utilities with an age-tiered retention strategy
-(defaults, tunable via `--max-backups` / `--daily-slots` or the
-`DB_BACKUP_MAX_BACKUPS` / `DB_BACKUP_DAILY_SLOTS` env vars):
+Reusable database backup utilities with three retention strategies. **Age-tier**
+is the default; **keep-last** and **keep-days** are flat alternatives. The modes
+are mutually exclusive — pick one.
+
+### Age-tier (default)
+
+Tunable via `--max-backups` / `--daily-slots` or the `DB_BACKUP_MAX_BACKUPS` /
+`DB_BACKUP_DAILY_SLOTS` env vars:
 
 - Keep up to **6** backups total (`--max-backups`)
 - Keep **3 recent daily** backups (`--daily-slots`)
@@ -22,6 +27,32 @@ Reusable database backup utilities with an age-tiered retention strategy
 
 The age-tier anchors (week/month/two-months) are policy-owned; only the total
 cap and daily-slot count are exposed on the CLI.
+
+### Flat retention
+
+| Mode | Flag | Env var | Behavior |
+|---|---|---|---|
+| keep-last | `--keep-last <n>` | `DB_BACKUP_KEEP_LAST` | Keep the **N most-recent** backups; rotate out the rest. `n >= 1`. |
+| keep-days | `--keep-days <n>` | `DB_BACKUP_KEEP_DAYS` | Keep every backup **strictly younger than N days**. `n >= 1`. |
+
+```bash
+db-backup backup --prod --keep-last 8      # e.g. 8 weekly backups
+db-backup prune  --keep-days 30            # e.g. a 30-day window
+```
+
+Notes:
+
+- **`keep-days` always retains the single most-recent backup**, even when it is
+  older than the window. A long gap between runs can never delete every backup.
+- `keep-last` requires `n >= 1`, so a flat count can never mean "delete
+  everything".
+- A backup dated in the future (clock skew) is clamped to *now* for both
+  ordering and age, so it is treated as brand new rather than as negative-age.
+- **Precedence:** an explicit CLI argument always beats an env var. Combining a
+  flat option with `--max-backups`/`--daily-slots` is an error, and so is passing
+  both `--keep-last` and `--keep-days`. An env var selects a flat mode only when
+  no retention option was passed explicitly, so a stale `DB_BACKUP_KEEP_LAST`
+  cannot silently override an explicit `--max-backups`.
 
 ## Supported databases
 

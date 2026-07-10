@@ -370,6 +370,185 @@ describe('@andrewpopov/db-backup', () => {
     expect(plan.remove.map((entry) => entry.fileName)).toEqual(['day-90.db.gz']);
   });
 
+  it('age-tier plan is unchanged when the policy carries an explicit mode', () => {
+    // Golden guard: a policy with mode:'age-tier' must produce the identical
+    // keep/remove split (order, reasons, labels) as the mode-less default.
+    const backups = [
+      backupEntry('day-0.db.gz', 0),
+      backupEntry('day-1.db.gz', 1),
+      backupEntry('day-2.db.gz', 2),
+      backupEntry('day-8.db.gz', 8),
+      backupEntry('day-31.db.gz', 31),
+      backupEntry('day-61.db.gz', 61),
+      backupEntry('day-90.db.gz', 90),
+    ];
+
+    const base = planRetention(backups, DEFAULT_RETENTION_POLICY, fixedNow);
+    const explicit = planRetention(
+      backups,
+      { ...DEFAULT_RETENTION_POLICY, mode: 'age-tier' },
+      fixedNow,
+    );
+
+    expect(explicit.keep.map((e) => [e.fileName, e.retentionReason, e.retentionLabel])).toEqual(
+      base.keep.map((e) => [e.fileName, e.retentionReason, e.retentionLabel]),
+    );
+    expect(explicit.remove.map((e) => [e.fileName, e.retentionReason])).toEqual(
+      base.remove.map((e) => [e.fileName, e.retentionReason]),
+    );
+  });
+
+  it('the default policy keeps its exact shape — no `mode` key leaks into plan.policy', () => {
+    // Hard compat requirement: consumers serialize plan.policy, so adding a
+    // `mode` field to DEFAULT_RETENTION_POLICY would change their JSON output.
+    expect(Object.keys(DEFAULT_RETENTION_POLICY).sort()).toEqual([
+      'anchors',
+      'dailySlots',
+      'maxBackups',
+    ]);
+    expect('mode' in DEFAULT_RETENTION_POLICY).toBe(false);
+
+    const plan = planRetention([backupEntry('day-0.db', 0)], DEFAULT_RETENTION_POLICY, fixedNow);
+    expect(plan.policy).toBe(DEFAULT_RETENTION_POLICY);
+    expect(JSON.parse(JSON.stringify(plan.policy))).not.toHaveProperty('mode');
+
+    // resolveRetentionPolicy with no overrides returns the shared default object.
+    expect(resolveRetentionPolicy()).toBe(DEFAULT_RETENTION_POLICY);
+  });
+
+  it('an empty-string retention option means "absent" (pre-existing contract)', () => {
+    // readInt() has always treated '' as not-provided, because callers pass raw
+    // env values through. Pinned here because it decides which mode is selected.
+    expect(resolveRetentionPolicy({ maxBackups: '' })).toBe(DEFAULT_RETENTION_POLICY);
+    expect(resolveRetentionPolicy({ keepLast: '' })).toBe(DEFAULT_RETENTION_POLICY);
+
+    // An absent explicit option therefore lets a flat-mode env var win — which is
+    // why the typed overloads only narrow on a `number` discriminator.
+    expect(resolveRetentionPolicy({ maxBackups: '', env: { DB_BACKUP_KEEP_LAST: '8' } })).toEqual({
+      mode: 'keep-last',
+      keepLast: 8,
+    });
+    expect(resolveRetentionPolicy({ keepLast: '', env: { DB_BACKUP_MAX_BACKUPS: '99' } })).toMatchObject(
+      { maxBackups: 99 },
+    );
+  });
+
+  it('keep-last retains the N most-recent backups', () => {
+    const backups = [
+      backupEntry('day-0.db', 0),
+      backupEntry('day-1.db', 1),
+      backupEntry('day-9.db', 9),
+      backupEntry('day-40.db', 40),
+      backupEntry('day-99.db', 99),
+    ];
+
+    const plan = planRetention(backups, { mode: 'keep-last', keepLast: 2 }, fixedNow);
+
+    expect(plan.keep.map((e) => [e.fileName, e.retentionReason])).toEqual([
+      ['day-0.db', 'keep_last'],
+      ['day-1.db', 'keep_last'],
+    ]);
+    expect(plan.remove.map((e) => e.fileName)).toEqual(['day-9.db', 'day-40.db', 'day-99.db']);
+  });
+
+  it('keep-days retains backups younger than the window', () => {
+    const backups = [
+      backupEntry('day-0.db', 0),
+      backupEntry('day-6.db', 6),
+      backupEntry('day-7.db', 7),
+      backupEntry('day-20.db', 20),
+    ];
+
+    const plan = planRetention(backups, { mode: 'keep-days', keepDays: 7 }, fixedNow);
+
+    // Strictly younger than 7 days: day-0 and day-6 stay; day-7 (exactly at the
+    // boundary) and day-20 rotate out.
+    expect(plan.keep.map((e) => e.fileName)).toEqual(['day-0.db', 'day-6.db']);
+    expect(plan.keep.every((e) => e.retentionReason === 'keep_days')).toBe(true);
+    expect(plan.remove.map((e) => e.fileName)).toEqual(['day-7.db', 'day-20.db']);
+  });
+
+  it('keep-days always keeps the most-recent backup even past the window (age guard)', () => {
+    const backups = [backupEntry('old-30.db', 30), backupEntry('old-45.db', 45)];
+
+    const plan = planRetention(backups, { mode: 'keep-days', keepDays: 7 }, fixedNow);
+
+    expect(plan.keep.map((e) => [e.fileName, e.retentionReason])).toEqual([['old-30.db', 'newest']]);
+    expect(plan.remove.map((e) => e.fileName)).toEqual(['old-45.db']);
+  });
+
+  it('flat modes handle an empty backup list without error', () => {
+    expect(planRetention([], { mode: 'keep-last', keepLast: 3 }, fixedNow)).toMatchObject({
+      keep: [],
+      remove: [],
+    });
+    expect(planRetention([], { mode: 'keep-days', keepDays: 5 }, fixedNow)).toMatchObject({
+      keep: [],
+      remove: [],
+    });
+  });
+
+  it('keep-days clamps a future-dated backup to now (no negative age)', () => {
+    const backups = [
+      backupEntry('future.db', -5), // 5 days in the future (clock skew)
+      backupEntry('day-2.db', 2),
+      backupEntry('day-10.db', 10),
+    ];
+
+    const plan = planRetention(backups, { mode: 'keep-days', keepDays: 7 }, fixedNow);
+
+    // future.db clamps to age 0 (kept); day-2 kept; day-10 rotates out.
+    expect(plan.keep.map((e) => e.fileName).sort()).toEqual(['day-2.db', 'future.db']);
+    expect(plan.remove.map((e) => e.fileName)).toEqual(['day-10.db']);
+  });
+
+  it('resolveRetentionPolicy selects flat modes from args and env', () => {
+    expect(resolveRetentionPolicy({ keepLast: 5 })).toEqual({ mode: 'keep-last', keepLast: 5 });
+    expect(resolveRetentionPolicy({ keepDays: 14 })).toEqual({ mode: 'keep-days', keepDays: 14 });
+    expect(resolveRetentionPolicy({ env: { DB_BACKUP_KEEP_LAST: '8' } })).toEqual({
+      mode: 'keep-last',
+      keepLast: 8,
+    });
+    // Explicit arg wins over env of either mode.
+    expect(resolveRetentionPolicy({ keepDays: 3, env: { DB_BACKUP_KEEP_LAST: '8' } })).toEqual({
+      mode: 'keep-days',
+      keepDays: 3,
+    });
+  });
+
+  it('an explicit age-tier arg beats a stale flat-mode env var', () => {
+    // Regression: a stale DB_BACKUP_KEEP_LAST must not silently override an
+    // explicit --max-backups and switch the whole policy to keep-last.
+    const policy = resolveRetentionPolicy({
+      maxBackups: 9,
+      env: { DB_BACKUP_KEEP_LAST: '8' },
+    });
+
+    expect(policy).toMatchObject({ maxBackups: 9 });
+    expect('mode' in policy && policy.mode).not.toBe('keep-last');
+  });
+
+  it('an explicit flat arg beats a stale age-tier env var', () => {
+    const policy = resolveRetentionPolicy({
+      keepDays: 3,
+      env: { DB_BACKUP_MAX_BACKUPS: '99', DB_BACKUP_DAILY_SLOTS: '9' },
+    });
+
+    expect(policy).toEqual({ mode: 'keep-days', keepDays: 3 });
+  });
+
+  it('resolveRetentionPolicy rejects invalid or conflicting flat options', () => {
+    expect(() => resolveRetentionPolicy({ keepLast: 0 })).toThrow(/keepLast/);
+    expect(() => resolveRetentionPolicy({ keepDays: 0 })).toThrow(/keepDays/);
+    expect(() => resolveRetentionPolicy({ keepLast: 2, keepDays: 2 })).toThrow(/mutually exclusive/);
+    expect(() =>
+      resolveRetentionPolicy({ env: { DB_BACKUP_KEEP_LAST: '2', DB_BACKUP_KEEP_DAYS: '2' } }),
+    ).toThrow(/mutually exclusive/);
+    expect(() => resolveRetentionPolicy({ keepLast: 2, maxBackups: 4 })).toThrow(
+      /cannot be combined/,
+    );
+  });
+
   it('lists only supported backup filenames and annotates retention decisions', () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');

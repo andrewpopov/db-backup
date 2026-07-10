@@ -24,12 +24,51 @@ import {
   type BackupListResult,
   type PruneJobResult,
   type RetentionPolicy,
+  type AgeTierRetentionPolicy,
+  type KeepLastRetentionPolicy,
+  type KeepDaysRetentionPolicy,
   type BackupPlan,
   type BackupManifest,
 } from '../src/index';
 
 // Retention policy + the three job entry points.
 const policy: RetentionPolicy = resolveRetentionPolicy({ maxBackups: 6, dailySlots: 3 });
+
+// Explicit age-tier knobs must keep narrowing to the age-tier shape, so existing
+// consumers can still read maxBackups/dailySlots off the result without a guard.
+const ageTier: AgeTierRetentionPolicy = resolveRetentionPolicy({ maxBackups: 6, dailySlots: 3 });
+const _maxBackups: number = ageTier.maxBackups;
+const _defaultMax: number = DEFAULT_RETENTION_POLICY.maxBackups;
+
+// Flat modes narrow to their own shapes.
+const keepLastPolicy: KeepLastRetentionPolicy = resolveRetentionPolicy({ keepLast: 8 });
+const _keepLast: number = keepLastPolicy.keepLast;
+const keepDaysPolicy: KeepDaysRetentionPolicy = resolveRetentionPolicy({ keepDays: 30 });
+const _keepDays: number = keepDaysPolicy.keepDays;
+
+// A STRING knob may be empty (== absent at runtime), so it must NOT narrow: it
+// falls through to the union overload. This guard fails if someone widens the
+// narrow overloads back to `number | string`.
+// @ts-expect-error string-typed maxBackups cannot promise AgeTierRetentionPolicy
+const _unsound: AgeTierRetentionPolicy = resolveRetentionPolicy({ maxBackups: '6' });
+
+// Conflicting options are a runtime error; the union overload accepts them.
+const _conflicting: RetentionPolicy = resolveRetentionPolicy({ keepLast: 2, maxBackups: 4 });
+
+// With no explicit option the env decides, so the caller gets the union and must
+// narrow on `mode` before touching mode-specific fields.
+const resolved: RetentionPolicy = resolveRetentionPolicy();
+const _described: string =
+  resolved.mode === 'keep-last'
+    ? `keep-last ${resolved.keepLast}`
+    : resolved.mode === 'keep-days'
+      ? `keep-days ${resolved.keepDays}`
+      : `age-tier ${resolved.maxBackups}`;
+
+// Every policy shape is accepted by planRetention.
+planRetention([], keepLastPolicy);
+planRetention([], keepDaysPolicy);
+planRetention([], ageTier);
 
 const jobResult: BackupJobResult = runBackupJob({
   mode: 'prod',

@@ -6,11 +6,33 @@ export interface RetentionAnchor {
   targetAgeDays: number;
 }
 
-export interface RetentionPolicy {
+/** Default retention: keep `dailySlots` most-recent backups plus one per age
+ * anchor, capped at `maxBackups`. `mode` is optional/absent for backward
+ * compatibility and treated as 'age-tier'. */
+export interface AgeTierRetentionPolicy {
+  mode?: 'age-tier';
   maxBackups: number;
   dailySlots: number;
   anchors: RetentionAnchor[];
 }
+
+/** Flat count retention: keep the `keepLast` most-recent backups. */
+export interface KeepLastRetentionPolicy {
+  mode: 'keep-last';
+  keepLast: number;
+}
+
+/** Flat age retention: keep backups younger than `keepDays` days, always
+ * retaining at least the single most-recent backup. */
+export interface KeepDaysRetentionPolicy {
+  mode: 'keep-days';
+  keepDays: number;
+}
+
+export type RetentionPolicy =
+  | AgeTierRetentionPolicy
+  | KeepLastRetentionPolicy
+  | KeepDaysRetentionPolicy;
 
 export interface BackupEntry {
   fileName: string;
@@ -102,7 +124,7 @@ export interface RestoreResult {
   target: string;
 }
 
-export const DEFAULT_RETENTION_POLICY: RetentionPolicy;
+export const DEFAULT_RETENTION_POLICY: AgeTierRetentionPolicy;
 
 export function buildDailyCronEntry(options?: {
   hour?: number;
@@ -113,9 +135,49 @@ export function buildDailyCronEntry(options?: {
 
 export function listBackupsWithPlan(options?: BackupOptions): BackupListResult;
 export function pruneBackupsJob(options?: BackupOptions): PruneJobResult;
+/** A numeric retention knob is always "present", so it pins the mode and a
+ * flat-mode env var can never override it — the narrow return type holds.
+ *
+ * The discriminating field is `number`, not `number | string`, on purpose: an
+ * empty string means "absent" at runtime, so a string-typed knob cannot promise
+ * a narrow return and instead falls through to the union overload below. */
+export function resolveRetentionPolicy(options: {
+  maxBackups: number;
+  dailySlots?: number | string | null;
+  keepLast?: null;
+  keepDays?: null;
+  env?: NodeJS.ProcessEnv;
+}): AgeTierRetentionPolicy;
+export function resolveRetentionPolicy(options: {
+  dailySlots: number;
+  maxBackups?: number | string | null;
+  keepLast?: null;
+  keepDays?: null;
+  env?: NodeJS.ProcessEnv;
+}): AgeTierRetentionPolicy;
+export function resolveRetentionPolicy(options: {
+  keepLast: number;
+  keepDays?: null;
+  maxBackups?: null;
+  dailySlots?: null;
+  env?: NodeJS.ProcessEnv;
+}): KeepLastRetentionPolicy;
+export function resolveRetentionPolicy(options: {
+  keepDays: number;
+  keepLast?: null;
+  maxBackups?: null;
+  dailySlots?: null;
+  env?: NodeJS.ProcessEnv;
+}): KeepDaysRetentionPolicy;
+/** Fallback: no retention option, or one whose presence can't be known
+ * statically (a string may be empty, which means "absent"). The env may then
+ * select any mode, so the caller gets the union and must narrow on `mode`.
+ * Conflicting combinations type-check here but throw at runtime. */
 export function resolveRetentionPolicy(options?: {
   maxBackups?: number | string | null;
   dailySlots?: number | string | null;
+  keepLast?: number | string | null;
+  keepDays?: number | string | null;
   env?: NodeJS.ProcessEnv;
 }): RetentionPolicy;
 export function planRetention(backups: BackupEntry[], policy?: RetentionPolicy, now?: Date): BackupPlan;
