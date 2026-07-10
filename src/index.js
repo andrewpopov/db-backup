@@ -90,6 +90,11 @@ function parseArgs(argv) {
     keepDays: null,
     commandTimeoutMs: null,
     allowUnsafeCopy: false,
+    passphraseFile: null,
+    cipher: null,
+    minBytes: null,
+    stampFile: null,
+    maxAgeHours: 36,
     cronCommand: null,
     logPath: null,
   };
@@ -100,7 +105,8 @@ function parseArgs(argv) {
     commandArg === 'list' ||
     commandArg === 'prune' ||
     commandArg === 'cron' ||
-    commandArg === 'restore'
+    commandArg === 'restore' ||
+    commandArg === 'freshness'
   ) {
     options.command = commandArg;
     argv = argv.slice(1);
@@ -201,6 +207,46 @@ function parseArgs(argv) {
         throw new Error('--daily-slots must be an integer >= 0');
       }
       options.dailySlots = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--encrypt-passphrase-file') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --encrypt-passphrase-file');
+      options.passphraseFile = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--cipher') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --cipher');
+      options.cipher = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--min-bytes') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null) throw new Error('--min-bytes must be an integer >= 0');
+      options.minBytes = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--stamp-file') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --stamp-file');
+      options.stampFile = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--max-age-hours') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null || value < 1) throw new Error('--max-age-hours must be an integer >= 1');
+      options.maxAgeHours = value;
       index += 1;
       continue;
     }
@@ -418,24 +464,28 @@ function buildUniqueSqliteRawBackupPath({ timestamp, outputDir, compressSqlite }
   throw new Error(`Unable to allocate a unique SQLite backup filename for ${timestamp}`);
 }
 
+// `.gpg` is the outermost suffix: a backup is snapshotted, then optionally
+// gzipped, then optionally encrypted. Restore unwinds in the reverse order.
 function parseBackupFileName(fileName) {
-  const sqliteMatch = fileName.match(/^sqlite-backup-(\d{8}-\d{6}Z)(?:-(\d+))?\.db(\.gz)?$/);
+  const sqliteMatch = fileName.match(/^sqlite-backup-(\d{8}-\d{6}Z)(?:-(\d+))?\.db(\.gz)?(\.gpg)?$/);
   if (sqliteMatch) {
     return {
       engine: 'sqlite',
       timestampKey: sqliteMatch[1],
       sequence: sqliteMatch[2] ? Number.parseInt(sqliteMatch[2], 10) : 1,
       compressed: Boolean(sqliteMatch[3]),
+      encrypted: Boolean(sqliteMatch[4]),
     };
   }
 
-  const postgresMatch = fileName.match(/^postgres-backup-(\d{8}-\d{6}Z)(?:-(\d+))?\.dump$/);
+  const postgresMatch = fileName.match(/^postgres-backup-(\d{8}-\d{6}Z)(?:-(\d+))?\.dump(\.gpg)?$/);
   if (postgresMatch) {
     return {
       engine: 'postgres',
       timestampKey: postgresMatch[1],
       sequence: postgresMatch[2] ? Number.parseInt(postgresMatch[2], 10) : 1,
       compressed: false,
+      encrypted: Boolean(postgresMatch[3]),
     };
   }
 
@@ -566,6 +616,9 @@ function resolveBackupOptions(options = {}) {
   const outputDir = path.resolve(cwd, options.outputDir || path.relative(cwd, DEFAULT_OUTPUT_DIR));
   const compressSqlite = options.compressSqlite !== false;
   const allowUnsafeCopy = options.allowUnsafeCopy === true;
+  const encryption = options.encryption || null;
+  const minBytes = Number(options.minBytes) > 0 ? Number(options.minBytes) : 0;
+  const stampFile = options.stampFile || null;
   const policy = options.policy || DEFAULT_RETENTION_POLICY;
   const runtime = normalizeRuntime(options.runtime || options._runtime);
 
@@ -589,6 +642,9 @@ function resolveBackupOptions(options = {}) {
     outputDir,
     compressSqlite,
     allowUnsafeCopy,
+    encryption,
+    minBytes,
+    stampFile,
     policy,
     databaseUrl,
     runtime,
@@ -661,6 +717,100 @@ function sha256File(filePath) {
 // backslashes and double quotes.
 function quoteDotCommandArg(value) {
   return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+
+// Encryption at rest. Absorbed from smarthome's backup-db.sh (BWK-131), which
+// was strictly better than this package on this axis: db-backup wrote plaintext
+// snapshots to disk and left off-siting and secrecy entirely to the operator.
+//
+// gpg symmetric AES256 with a passphrase FILE — never a passphrase argument,
+// which would be visible in the process table. The plaintext artifact is removed
+// once the ciphertext is written and hashed, so it never lingers in the backup
+// directory.
+const DEFAULT_CIPHER_ALGO = 'AES256';
+
+function encryptBackupEntry(entry, encryption, runtime) {
+  const { passphraseFile, cipher = DEFAULT_CIPHER_ALGO } = encryption;
+  if (!passphraseFile) {
+    throw new Error('encryption.passphraseFile is required to encrypt a backup');
+  }
+  if (!fs.existsSync(passphraseFile)) {
+    throw new Error(`Encryption passphrase file not found: ${passphraseFile}`);
+  }
+  if (!runtime.commandExists('gpg')) {
+    throw new Error(
+      'Refusing to write an unencrypted backup: encryption was requested but the ' +
+        "'gpg' binary is unavailable."
+    );
+  }
+
+  const destPath = `${entry.fullPath}.gpg`;
+  runtime.execFileSync(
+    'gpg',
+    [
+      '--batch',
+      '--yes',
+      '--symmetric',
+      '--cipher-algo',
+      cipher,
+      '--passphrase-file',
+      passphraseFile,
+      '-o',
+      destPath,
+      entry.fullPath,
+    ],
+    { stdio: 'pipe' }
+  );
+
+  if (!fs.existsSync(destPath)) {
+    throw new Error(`gpg reported success but produced no output at ${destPath}`);
+  }
+
+  // The plaintext snapshot must not survive alongside the ciphertext.
+  fs.rmSync(entry.fullPath, { force: true });
+
+  const stats = fs.statSync(destPath);
+  return {
+    ...entry,
+    fileName: path.basename(destPath),
+    fullPath: destPath,
+    encrypted: true,
+    sizeBytes: stats.size,
+    sha256: sha256File(destPath),
+  };
+}
+
+function decryptBackupToPath(sourcePath, destPath, encryption, runtime) {
+  const { passphraseFile } = encryption || {};
+  if (!passphraseFile) {
+    throw new Error(
+      `Backup ${path.basename(sourcePath)} is encrypted; encryption.passphraseFile is required to restore it`
+    );
+  }
+  if (!runtime.commandExists('gpg')) {
+    throw new Error(`Backup ${path.basename(sourcePath)} is encrypted but the 'gpg' binary is unavailable`);
+  }
+  runtime.execFileSync(
+    'gpg',
+    ['--batch', '--yes', '--decrypt', '--passphrase-file', passphraseFile, '-o', destPath, sourcePath],
+    { stdio: 'pipe' }
+  );
+}
+
+// A snapshot far smaller than expected is a failure, not a backup: an empty or
+// truncated database sails through `integrity_check`. Absorbed from smarthome's
+// MIN_BACKUP_BYTES floor. Disabled (0) unless the consumer sets it.
+function assertMinimumBackupSize(entry, minBytes) {
+  if (!minBytes || minBytes <= 0) {
+    return;
+  }
+  if (entry.sizeBytes < minBytes) {
+    fs.rmSync(entry.fullPath, { force: true });
+    throw new Error(
+      `Backup ${entry.fileName} is ${entry.sizeBytes} bytes, below the ${minBytes}-byte minimum; discarded`
+    );
+  }
 }
 
 // The SQLite snapshot ENGINE, decoupled from filename/manifest/retention policy.
@@ -807,9 +957,14 @@ function createBackup(options = {}) {
   const now = resolved.runtime.now();
   fs.mkdirSync(resolved.outputDir, { recursive: true });
 
+  const finalize = (entry) => {
+    assertMinimumBackupSize(entry, resolved.minBytes);
+    return resolved.encryption ? encryptBackupEntry(entry, resolved.encryption, resolved.runtime) : entry;
+  };
+
   const engine = detectDatabaseEngine(resolved.databaseUrl);
   if (engine === 'sqlite') {
-    return createSqliteBackup({
+    return finalize(createSqliteBackup({
       databaseUrl: resolved.databaseUrl,
       outputDir: resolved.outputDir,
       compressSqlite: resolved.compressSqlite,
@@ -817,16 +972,18 @@ function createBackup(options = {}) {
       now,
       runtime: resolved.runtime,
       allowUnsafeCopy: resolved.allowUnsafeCopy,
-    });
+    }));
   }
 
   if (engine === 'postgres') {
-    return createPostgresBackup({
-      databaseUrl: resolved.databaseUrl,
-      outputDir: resolved.outputDir,
-      now,
-      runtime: resolved.runtime,
-    });
+    return finalize(
+      createPostgresBackup({
+        databaseUrl: resolved.databaseUrl,
+        outputDir: resolved.outputDir,
+        now,
+        runtime: resolved.runtime,
+      })
+    );
   }
 
   throw new Error('Unsupported DATABASE_URL scheme. Expected file:, postgres://, or postgresql://');
@@ -855,6 +1012,7 @@ function getBackupEntryFromPath(backupPath, now = new Date()) {
     fullPath: backupPath,
     engine: parsed.engine,
     compressed: parsed.compressed,
+    encrypted: Boolean(parsed.encrypted),
     createdAt: createdAt.toISOString(),
     sizeBytes: stats.size,
     ageDays,
@@ -921,6 +1079,7 @@ function restoreSqliteBackup({
   backupEntry,
   cwd = process.cwd(),
   runtime = normalizeRuntime(),
+  encryption = null,
 } = {}) {
   const destinationPath = parseSqlitePath(databaseUrl, cwd);
   fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
@@ -929,15 +1088,29 @@ function restoreSqliteBackup({
     path.dirname(destinationPath),
     `.restore-${runtime.randomId()}.db`
   );
+  // Decryption lands here first; `.gpg` is the outermost layer, so unwind it
+  // before gunzip. Cleaned up alongside tempPath on any failure.
+  const decryptedPath = `${tempPath}.decrypted`;
 
   try {
+    // Unwind the layers in reverse: decrypt -> decompress -> verify -> replace.
+    let sourcePath = backupEntry.fullPath;
+    if (backupEntry.encrypted) {
+      decryptBackupToPath(sourcePath, decryptedPath, encryption, runtime);
+      sourcePath = decryptedPath;
+    }
+
     if (backupEntry.compressed) {
-      const compressed = fs.readFileSync(backupEntry.fullPath);
+      const compressed = fs.readFileSync(sourcePath);
       const decompressed = zlib.gunzipSync(compressed);
       fs.writeFileSync(tempPath, decompressed);
     } else {
-      fs.copyFileSync(backupEntry.fullPath, tempPath);
+      fs.copyFileSync(sourcePath, tempPath);
     }
+
+    // The decrypted plaintext has served its purpose; don't leave it beside the
+    // live database.
+    fs.rmSync(decryptedPath, { force: true });
 
     // Validate the restored file on the TEMP path, BEFORE it ever replaces the
     // live database: if this throws, the catch below cleans up tempPath only —
@@ -959,9 +1132,9 @@ function restoreSqliteBackup({
 
     fs.renameSync(tempPath, destinationPath);
   } catch (error) {
-    if (fs.existsSync(tempPath)) {
+    for (const scratch of [tempPath, decryptedPath]) {
       try {
-        fs.unlinkSync(tempPath);
+        fs.rmSync(scratch, { force: true });
       } catch {
         // Best effort cleanup.
       }
@@ -1072,6 +1245,7 @@ function restoreBackup(options = {}) {
       backupEntry,
       cwd: resolved.cwd,
       runtime: resolved.runtime,
+      encryption: resolved.encryption,
     });
   } else {
     restoreResult = restorePostgresBackup({
@@ -1436,6 +1610,37 @@ function pruneBackupsJob(options = {}) {
   });
 }
 
+// `.last-success` is the liveness signal a cron-driven backup otherwise lacks:
+// a job that silently stops producing backups is invisible without one.
+// Absorbed from smarthome's .last-success stamp + check-backup-freshness.sh.
+function writeSuccessStamp(stampFile, now = new Date()) {
+  fs.mkdirSync(path.dirname(stampFile), { recursive: true });
+  fs.writeFileSync(stampFile, `${now.toISOString()}\n`);
+  return stampFile;
+}
+
+function readSuccessStamp(stampFile) {
+  if (!fs.existsSync(stampFile)) {
+    return null;
+  }
+  const parsed = new Date(fs.readFileSync(stampFile, 'utf8').trim());
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+// Returns { fresh, stampedAt, ageHours, maxAgeHours }. A missing or unparseable
+// stamp is NOT fresh — absence of evidence is not evidence of a backup.
+function checkBackupFreshness({ stampFile, maxAgeHours = 36, now = new Date() } = {}) {
+  if (!stampFile) {
+    throw new Error('stampFile is required to check backup freshness');
+  }
+  const stampedAt = readSuccessStamp(stampFile);
+  if (!stampedAt) {
+    return { fresh: false, stampedAt: null, ageHours: null, maxAgeHours };
+  }
+  const ageHours = (now.getTime() - stampedAt.getTime()) / (60 * 60 * 1000);
+  return { fresh: ageHours <= maxAgeHours, stampedAt, ageHours, maxAgeHours };
+}
+
 function runBackupJob(options = {}) {
   const resolved = resolveBackupOptions(options);
   fs.mkdirSync(resolved.outputDir, { recursive: true });
@@ -1445,7 +1650,14 @@ function runBackupJob(options = {}) {
     const now = resolved.runtime.now();
     const backups = listBackups({ outputDir: resolved.outputDir, now });
     const plan = planRetention(backups, resolved.policy, now);
-    const removed = pruneBackups(plan.remove);
+
+    // NEVER prune the backup we just created and verified, whatever the plan
+    // says. A host whose clock jumped backward at boot gives the new file an
+    // older timestamp than existing ones, and a retention policy that trusts the
+    // ordering would then delete the only known-good backup. Absorbed from
+    // smarthome's prune_local (BWK-131).
+    const doomed = plan.remove.filter((entry) => entry.fileName !== created.fileName);
+    const removed = pruneBackups(doomed);
 
     // Best-effort: a manifest write failure must never fail the backup itself.
     // Safety/pre-restore backups (created via createBackup outside this job)
@@ -1462,6 +1674,14 @@ function runBackupJob(options = {}) {
       });
     } catch (error) {
       console.warn(`[db-backup] Failed to append manifest entry: ${error.message}`);
+    }
+
+    // Stamped only after the backup exists, passed its integrity check, cleared
+    // the size floor, was encrypted if configured, and retention completed. A
+    // failure anywhere above leaves the previous stamp untouched, so a freshness
+    // monitor reads the run as stale rather than silently "successful".
+    if (resolved.stampFile) {
+      writeSuccessStamp(resolved.stampFile, now);
     }
 
     return {
@@ -1517,6 +1737,7 @@ Commands:
   prune                   Apply retention now without taking a backup (no DB needed)
   cron                    Print a daily cron entry
   restore                 Restore database from backup file
+  freshness               Exit non-zero if the last success is older than the threshold
 
 Options:
   --prod                  Use production env files (.env + .env.production)
@@ -1528,6 +1749,11 @@ Options:
   --keep-days <n>         Flat retention: keep backups younger than N days (env: DB_BACKUP_KEEP_DAYS)
   --command-timeout <s>   Bound every external command (env: DB_BACKUP_COMMAND_TIMEOUT_MS)
   --allow-unsafe-copy     Permit a byte copy when sqlite3 is absent (inconsistent)
+  --encrypt-passphrase-file <path>  Encrypt the backup (gpg symmetric AES256)
+  --cipher <algo>         gpg cipher algorithm (default: AES256)
+  --min-bytes <n>         Discard and fail if the backup is smaller than n bytes
+  --stamp-file <path>     Write .last-success only after a fully successful run
+  --max-age-hours <n>     Freshness threshold (command: freshness, default 36)
   --no-compress           Disable gzip for SQLite backups
   --allow-missing         Skip (don't fail) when the SQLite database is absent
   --json                  Print JSON output
@@ -1547,6 +1773,31 @@ function runCli(argv = process.argv.slice(2)) {
 
   if (options.command === 'help') {
     showHelp();
+    return;
+  }
+
+  if (options.command === 'freshness') {
+    if (!options.stampFile) {
+      throw new Error('freshness requires --stamp-file <path>');
+    }
+    const status = checkBackupFreshness({
+      stampFile: options.stampFile,
+      maxAgeHours: options.maxAgeHours,
+    });
+    if (options.json) {
+      console.log(JSON.stringify(status, null, 2));
+    } else if (!status.stampedAt) {
+      console.error(`[db-backup] no successful backup recorded at ${options.stampFile}`);
+    } else {
+      const age = status.ageHours.toFixed(1);
+      const line = `last successful backup is ${age}h old (threshold ${status.maxAgeHours}h), stamped ${status.stampedAt.toISOString()}`;
+      if (status.fresh) console.log(`[db-backup] ${line}`);
+      else console.error(`[db-backup] STALE: ${line}`);
+    }
+    // Non-zero so a cron wrapper or monitor treats staleness as a failure.
+    if (!status.fresh) {
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -1587,6 +1838,11 @@ function runCli(argv = process.argv.slice(2)) {
     outputDir: options.outputDir,
     compressSqlite: options.compressSqlite,
     allowUnsafeCopy: options.allowUnsafeCopy,
+    encryption: options.passphraseFile
+      ? { passphraseFile: options.passphraseFile, ...(options.cipher ? { cipher: options.cipher } : {}) }
+      : null,
+    minBytes: options.minBytes,
+    stampFile: options.stampFile,
     runtime: { commandTimeoutMs: options.commandTimeoutMs },
     policy: resolveRetentionPolicy({
       maxBackups: options.maxBackups,
@@ -1714,6 +1970,13 @@ module.exports = {
   removeSqliteSidecars,
   normalizeRuntime,
   DEFAULT_COMMAND_TIMEOUT_MS,
+  // Encryption at rest + backup liveness (BWK-131, absorbed from smarthome).
+  encryptBackupEntry,
+  decryptBackupToPath,
+  writeSuccessStamp,
+  readSuccessStamp,
+  checkBackupFreshness,
+  DEFAULT_CIPHER_ALGO,
   // Backup-storage helpers (BWK-85, generalized from stoki/pantry):
   MANIFEST_FILENAME,
   expandHome,

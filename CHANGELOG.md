@@ -3,6 +3,45 @@
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 
+## 0.9.0
+
+Encryption at rest and backup liveness, absorbed from smarthome's
+`scripts/backup-db.sh` (BWK-131). Standard 1 of the shared package standards: a
+shared package must be a **superset** of the best implementation across its
+consumers. smarthome's script was strictly better than this package on these
+axes, so migrating it onto db-backup would have been a regression.
+
+- **Feature — encryption at rest.** `encryption: { passphraseFile, cipher }` runs
+  `gpg --symmetric --cipher-algo AES256 --passphrase-file`, producing a `.gpg`
+  artifact and removing the plaintext. A passphrase **file**, never an argument —
+  an argument is visible in the process table. If `gpg` is unavailable the backup
+  **fails** rather than silently writing plaintext. Restore decrypts
+  transparently and refuses loudly without the passphrase. Works for both SQLite
+  and PostgreSQL backups.
+- **Feature — `.last-success` stamp + `freshness` command.** `stampFile` is
+  written only after the backup exists, passes its integrity check, clears the
+  size floor, is encrypted if configured, and retention completes. Any failure
+  leaves the previous stamp untouched. `db-backup freshness --stamp-file <p>
+  --max-age-hours 36` exits non-zero when stale **or when no backup was ever
+  recorded** — absence of evidence is not evidence of a backup. A cron that
+  silently stops producing backups was previously invisible.
+- **Feature — minimum size floor.** `minBytes` discards and fails a snapshot
+  smaller than expected. An empty or truncated database sails through
+  `PRAGMA integrity_check`.
+- **Fix — retention never prunes the backup it just created.** A host whose clock
+  jumped backward at boot gives the new file an older timestamp than existing
+  ones, and a retention policy that trusts the ordering would delete the only
+  freshly-verified backup. Absorbed from smarthome's `prune_local`.
+- Filename grammar now accepts a trailing `.gpg`: a backup is snapshotted, then
+  optionally gzipped, then optionally encrypted. Restore unwinds in reverse.
+
+New CLI flags: `--encrypt-passphrase-file`, `--cipher`, `--min-bytes`,
+`--stamp-file`, `--max-age-hours`. New command: `freshness`.
+
+Still missing versus smarthome, and tracked in BWK-131: off-host upload with
+remote verification (rclone), and fail-closed prune-after-verify. Do not migrate
+smarthome onto this package until those land.
+
 ## 0.8.1
 
 **Fix — the destination path is now correctly quoted for sqlite3's `.backup`

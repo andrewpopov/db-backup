@@ -34,11 +34,29 @@ export type RetentionPolicy =
   | KeepLastRetentionPolicy
   | KeepDaysRetentionPolicy;
 
+export interface BackupEncryption {
+  /** Path to a file containing the symmetric passphrase. A file, never an
+   * argument — a passphrase on the command line is visible in the process table. */
+  passphraseFile: string;
+  /** gpg `--cipher-algo`. Defaults to `DEFAULT_CIPHER_ALGO` (AES256). */
+  cipher?: string;
+}
+
+export interface BackupFreshness {
+  fresh: boolean;
+  /** null when no successful backup has ever been recorded. */
+  stampedAt: Date | null;
+  ageHours: number | null;
+  maxAgeHours: number;
+}
+
 export interface BackupEntry {
   fileName: string;
   fullPath: string;
   engine: 'sqlite' | 'postgres' | 'unknown';
   compressed: boolean;
+  /** True when the artifact is gpg-encrypted (`.gpg` suffix). */
+  encrypted?: boolean;
   createdAt: string;
   sizeBytes: number;
   ageDays?: number;
@@ -60,6 +78,15 @@ export interface BackupOptions {
   policy?: RetentionPolicy;
   /** Permit a plain byte copy when `sqlite3` is unavailable (default false). */
   allowUnsafeCopy?: boolean;
+  /** Encrypt the backup at rest with gpg symmetric AES256. Required to restore
+   * an encrypted backup. */
+  encryption?: BackupEncryption | null;
+  /** Discard and fail if the finished artifact is smaller than this. An empty or
+   * truncated database passes `PRAGMA integrity_check`. 0 disables. */
+  minBytes?: number;
+  /** Write an ISO timestamp here ONLY after a fully successful run, so a
+   * freshness monitor can tell a silent cron failure from a healthy one. */
+  stampFile?: string | null;
   runtime?: BackupRuntime;
   strictProductionEnv?: boolean;
   /** list/prune set this false: they never open the DB, so DATABASE_URL is not required. */
@@ -205,6 +232,40 @@ export function runCli(argv?: string[]): void;
 /** Default process timeout applied to every external command (10 minutes). */
 export const DEFAULT_COMMAND_TIMEOUT_MS: number;
 
+/** gpg `--cipher-algo` default: AES256. */
+export const DEFAULT_CIPHER_ALGO: string;
+
+/** Encrypt a finished backup in place, returning the `.gpg` entry. Removes the
+ * plaintext artifact. Throws rather than leave an unencrypted backup if `gpg` is
+ * unavailable. */
+export function encryptBackupEntry(
+  entry: BackupEntry,
+  encryption: BackupEncryption,
+  runtime: ResolvedBackupRuntime,
+): BackupEntry;
+
+/** Decrypt `sourcePath` to `destPath`. Throws if the backup is encrypted and no
+ * passphrase file was supplied. */
+export function decryptBackupToPath(
+  sourcePath: string,
+  destPath: string,
+  encryption: BackupEncryption,
+  runtime: ResolvedBackupRuntime,
+): void;
+
+/** Record a successful backup. Callers should write this only after the whole
+ * pipeline succeeded. */
+export function writeSuccessStamp(stampFile: string, now?: Date): string;
+export function readSuccessStamp(stampFile: string): Date | null;
+
+/** A missing or unparseable stamp is NOT fresh: absence of evidence is not
+ * evidence of a backup. */
+export function checkBackupFreshness(options: {
+  stampFile: string;
+  maxAgeHours?: number;
+  now?: Date;
+}): BackupFreshness;
+
 /** Build a bounded runtime. Pass `commandTimeoutMs` (or set
  * `DB_BACKUP_COMMAND_TIMEOUT_MS`) to override the default bound. */
 export function normalizeRuntime(runtime?: BackupRuntime): ResolvedBackupRuntime;
@@ -253,9 +314,11 @@ export function verifySqliteBackupIntegrity(
  * can never destroy a good database. */
 export function restoreSqliteBackup(options?: {
   databaseUrl: string;
-  backupEntry: Pick<BackupEntry, 'fullPath' | 'compressed'>;
+  backupEntry: Pick<BackupEntry, 'fullPath' | 'compressed'> & { encrypted?: boolean };
   cwd?: string;
   runtime?: ResolvedBackupRuntime;
+  /** Required when `backupEntry.encrypted` is true. */
+  encryption?: BackupEncryption | null;
 }): { target: string };
 
 /** Remove a SQLite database's `-wal`, `-shm` and `-journal` sidecars. They

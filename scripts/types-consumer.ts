@@ -13,6 +13,9 @@ import {
   planRetention,
   createSqliteSnapshot,
   verifySqliteBackupIntegrity,
+  checkBackupFreshness,
+  writeSuccessStamp,
+  DEFAULT_CIPHER_ALGO,
   restoreSqliteBackup,
   removeSqliteSidecars,
   normalizeRuntime,
@@ -36,6 +39,8 @@ import {
   type BackupPlan,
   type BackupManifest,
   type ResolvedBackupRuntime,
+  type BackupEncryption,
+  type BackupFreshness,
 } from '../src/index';
 
 // Retention policy + the three job entry points.
@@ -157,3 +162,33 @@ export const _contract = {
   manifestEntrySha256,
   updatedManifest,
 };
+
+// Encryption at rest + backup liveness (BWK-131), as smarthome's cron will use it.
+const encryption: BackupEncryption = { passphraseFile: '/var/lib/app/secrets/backup.pass' };
+const _cipher: string = DEFAULT_CIPHER_ALGO;
+
+runBackupJob({
+  mode: 'prod',
+  outputDir: '/var/lib/app/backups',
+  encryption,
+  minBytes: 32_768,
+  stampFile: '/var/lib/app/backups/.last-success',
+});
+
+const stamped: string = writeSuccessStamp('/var/lib/app/backups/.last-success');
+const freshness: BackupFreshness = checkBackupFreshness({
+  stampFile: stamped,
+  maxAgeHours: 36,
+});
+const _stale: boolean = !freshness.fresh;
+const _age: number | null = freshness.ageHours;
+
+// An encrypted backup needs the passphrase to restore.
+restoreBackup({
+  outputDir: '/var/lib/app/backups',
+  backupFile: 'sqlite-backup-20260705-150000Z.db.gz.gpg',
+  createPreRestoreBackup: false,
+  encryption,
+});
+
+export const _encryptionContract = { encryption, freshness, _stale, _age, _cipher };
