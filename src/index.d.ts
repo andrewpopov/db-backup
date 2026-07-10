@@ -42,6 +42,24 @@ export interface BackupEncryption {
   cipher?: string;
 }
 
+export interface BackupRemote {
+  /** rclone destination directory, e.g. `offsite:backups/app`. */
+  target: string;
+  /** Re-read the uploaded object and compare sizes. Default true. Turning this
+   * off means the "backup" is unverified — prefer not to. */
+  verify?: boolean;
+  /** Remote objects to retain. Default 30, never fewer than 1. */
+  keep?: number;
+  /** RCLONE_CONFIG for the upload. */
+  configFile?: string;
+}
+
+export interface BackupUploadResult {
+  target: string;
+  /** Verified byte count; null when `verify: false`. */
+  sizeBytes: number | null;
+}
+
 export interface BackupFreshness {
   fresh: boolean;
   /** null when no successful backup has ever been recorded. */
@@ -87,6 +105,11 @@ export interface BackupOptions {
   /** Write an ISO timestamp here ONLY after a fully successful run, so a
    * freshness monitor can tell a silent cron failure from a healthy one. */
   stampFile?: string | null;
+  /** Replicate off-host via rclone and verify the uploaded object. Nothing is
+   * pruned and no success is stamped until verification passes. */
+  remote?: BackupRemote | null;
+  /** Local-only run: skip the upload and the remote prune. */
+  skipRemote?: boolean;
   runtime?: BackupRuntime;
   strictProductionEnv?: boolean;
   /** list/prune set this false: they never open the DB, so DATABASE_URL is not required. */
@@ -129,6 +152,10 @@ export interface BackupPlan {
 
 export interface BackupJobResult {
   created: BackupEntry;
+  /** Present when `remote` was configured and not skipped. */
+  uploaded?: BackupUploadResult | null;
+  /** Remote objects pruned after a verified upload. */
+  removedRemote?: string[];
   removed: BackupEntry[];
   kept: BackupEntry[];
   mode: string;
@@ -260,6 +287,23 @@ export function readSuccessStamp(stampFile: string): Date | null;
 
 /** A missing or unparseable stamp is NOT fresh: absence of evidence is not
  * evidence of a backup. */
+/** Upload a finished backup off-host and (unless `verify: false`) re-read it to
+ * confirm the byte count. Throws rather than report success when `rclone` is
+ * unavailable or the remote object cannot be verified. */
+export function uploadBackupToRemote(
+  entry: BackupEntry,
+  remote: BackupRemote,
+  runtime: ResolvedBackupRuntime,
+): BackupUploadResult;
+
+/** Best-effort remote retention. Never deletes `protectFileName` — the object
+ * just uploaded and verified. Returns the names actually deleted. */
+export function pruneRemoteBackups(
+  remote: BackupRemote,
+  protectFileName: string,
+  runtime: ResolvedBackupRuntime,
+): string[];
+
 export function checkBackupFreshness(options: {
   stampFile: string;
   maxAgeHours?: number;

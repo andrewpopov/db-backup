@@ -7,7 +7,7 @@
 ## Install
 
 ```bash
-npm install github:andrewpopov/db-backup#v0.9.0
+npm install github:andrewpopov/db-backup#v0.10.0
 ```
 
 Reusable database backup utilities with three retention strategies. **Age-tier**
@@ -65,6 +65,28 @@ the plaintext. The passphrase is read from a **file**, never passed as an argume
 (arguments are visible in the process table). If `gpg` is unavailable the backup
 **fails** rather than silently writing plaintext. `restore` decrypts transparently
 and refuses without the passphrase.
+
+## Off-host replication
+
+A backup on the same disk as the database is not a backup.
+
+```bash
+db-backup backup --prod \
+  --encrypt-passphrase-file /var/lib/app/secrets/backup.pass \
+  --remote offsite:backups/app --remote-keep 30 \
+  --stamp-file /var/lib/app/backups/.last-success
+```
+
+Uploads with `rclone copyto`, then **re-reads the object** and compares its byte
+count to the local artifact. **Nothing is pruned and no success is stamped until
+that verification passes** — a failed or unverified upload leaves the previous
+backups and the previous stamp untouched. An unparseable `rclone` response is a
+failure, not a pass. If `rclone` is missing, the run refuses rather than silently
+skipping the off-site copy.
+
+Remote retention never deletes the object it just uploaded (a host whose clock
+rolled backward would otherwise delete the only verified copy). Use
+`--skip-remote` for a fast local-only run, e.g. a pre-migration deploy hook.
 
 ## Backup liveness
 
