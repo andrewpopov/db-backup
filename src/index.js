@@ -753,13 +753,33 @@ function resolveBackupOptions(options = {}) {
 // a file it did not create — an admin route vetting a user-supplied path — must
 // never have that file deleted underneath it, so the exported default is safe.
 //
-// Subtlety: on a file sqlite3 cannot even open, execFileSync throws and nothing
-// is deleted regardless. Only a *parseable but corrupt* database reaches the
-// deletion branch, which makes an unsafe default very hard to notice in testing.
+// `deleteOnFailure` must survive BOTH failure shapes. sqlite3 reports corruption
+// two different ways, and only one of them returns output:
+//
+//   - a clean "not ok" verdict on stdout  -> execFileSync RETURNS
+//   - `database disk image is malformed`  -> sqlite3 EXITS NON-ZERO, so
+//                                            execFileSync THROWS
+//
+// The realistic corruption case — a valid header with torn interior pages, i.e.
+// what failing storage actually produces — takes the throwing path. Handling only
+// the returning path left `deleteOnFailure` dead exactly when it matters, so a
+// corrupt snapshot survived in the output dir under a valid backup name, occupied
+// a retention slot (evicting a GOOD backup), and was listed as a real backup.
 function verifySqliteBackupIntegrity(backupPath, runtime = normalizeRuntime(), { deleteOnFailure = false } = {}) {
-  const output = runtime.execFileSync('sqlite3', [backupPath, 'PRAGMA integrity_check;'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  let output;
+  try {
+    output = runtime.execFileSync('sqlite3', [backupPath, 'PRAGMA integrity_check;'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    // sqlite3 could not read the file at all (unopenable, or malformed enough to
+    // abort the check). That is still a failed verification — discard the snapshot
+    // if we own it, then surface the original error.
+    if (deleteOnFailure) {
+      fs.rmSync(backupPath, { force: true });
+    }
+    throw err;
+  }
   const firstLine = (output ? output.toString() : '').trim().split(/\r?\n/, 1)[0] || '';
   if (firstLine !== 'ok') {
     if (deleteOnFailure) {

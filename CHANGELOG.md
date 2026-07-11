@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.13.1
+
+**A corrupt snapshot survived the check that rejected it — and got listed as a
+real backup.**
+
+`verifySqliteBackupIntegrity`'s `deleteOnFailure` only fired when `sqlite3`
+*returned* a "not ok" verdict. But sqlite3 reports corruption two ways, and the
+realistic one — a valid header with torn interior pages, i.e. what failing storage
+actually produces — makes it **exit non-zero** (`database disk image is
+malformed`), so `execFileSync` **throws** and the deletion branch never ran.
+
+The source comment even asserted the opposite ("only a *parseable but corrupt*
+database reaches the deletion branch"). A parseable-but-corrupt database takes the
+throwing path too. So `deleteOnFailure` was dead exactly when it mattered.
+
+Consequence: `createSqliteSnapshot` rejected the backup and exited non-zero (the
+gate was sound), but left the corrupt file in the output dir under a valid backup
+name. It then **occupied a retention slot — evicting a good backup** — and `list`
+ranked it `KEEP | Daily slot 1`. A `--latest` restore selector would have picked
+it.
+
+Both failure shapes now delete when the caller owns the file. The v0.8.0
+non-destructive default is preserved and pinned by its own test: a consumer
+vetting a *user-supplied* path still keeps its file on the throwing path.
+
+Found while bumping bewks and sano-os. Not introduced by v0.13.0 — verified
+against v0.12.0, which leaks identically.
+
 All notable changes to `@andrewpopov/db-backup`. Versions are git tags
 (`vX.Y.Z`); see STANDARDS.md.
 

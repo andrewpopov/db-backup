@@ -817,6 +817,49 @@ describe('@andrewpopov/db-backup', () => {
     expect(fs.existsSync(filePath)).toBe(false);
   });
 
+  // The two tests above only cover the shape where sqlite3 RETURNS a "not ok"
+  // verdict. Real disk corruption — a valid header with torn interior pages —
+  // makes sqlite3 EXIT NON-ZERO ("database disk image is malformed"), so
+  // execFileSync THROWS instead. That path skipped the deletion branch entirely,
+  // leaving a corrupt snapshot in the output dir under a valid backup name: it
+  // occupied a retention slot (evicting a good backup) and `list` ranked it as a
+  // real one.
+  it('deletes its own snapshot when sqlite3 THROWS (malformed image), not just when it returns not-ok', () => {
+    const dir = makeTempDir();
+    const filePath = path.join(dir, 'own-snapshot.db');
+    fs.writeFileSync(filePath, 'db bytes');
+
+    const runtime = makeRuntime({
+      commandExists: () => true,
+      execFileSync: (() => {
+        throw new Error('Command failed: sqlite3 ... database disk image is malformed (11)');
+      }) as never,
+    });
+
+    expect(() =>
+      verifySqliteBackupIntegrity(filePath, runtime, { deleteOnFailure: true }),
+    ).toThrow(/malformed/i);
+    expect(fs.existsSync(filePath), 'a snapshot we own must not survive a failed check').toBe(false);
+  });
+
+  it('still does NOT delete a file it does not own when sqlite3 throws (BWK-129 default holds)', () => {
+    // The fix above must not weaken the non-destructive default: a consumer
+    // vetting a user-supplied path must keep its file even on the throwing path.
+    const dir = makeTempDir();
+    const filePath = path.join(dir, 'users-backup.db');
+    fs.writeFileSync(filePath, 'db bytes');
+
+    const runtime = makeRuntime({
+      commandExists: () => true,
+      execFileSync: (() => {
+        throw new Error('Command failed: sqlite3 ... database disk image is malformed (11)');
+      }) as never,
+    });
+
+    expect(() => verifySqliteBackupIntegrity(filePath, runtime)).toThrow(/malformed/i);
+    expect(fs.existsSync(filePath), 'the caller’s file must survive').toBe(true);
+  });
+
   it('createSqliteSnapshot discards its own corrupt snapshot', () => {
     // The one legitimate destructive case: the snapshot is a file the package
     // just wrote, so a bad backup is worse than a loud failure.
