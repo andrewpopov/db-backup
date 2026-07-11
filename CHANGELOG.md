@@ -43,11 +43,26 @@ and renaming a new file into place — a narrow but real window for a scheduled
 job to observe or interleave with a database being replaced.
 
 This was not hypothetical: smarthome's `scripts/backup-db.sh` /
-`scripts/restore-db.sh` had to hand-roll their own separate OS-level `flock`
+`scripts/restore-db.sh` hand-roll their own separate OS-level `flock`
 specifically to cover this gap, with the lock-sharing comment spelling out
 why — "db-backup takes its own lock on the output directory, which would not
-exclude a restore, so keep this one." That is exactly the kind of workaround
-this package exists to make unnecessary.
+exclude a restore, so keep this one."
+
+> **Correction (added after the v0.13.0 release).** The original wording implied
+> smarthome's `flock` is now redundant. **It is not — do not delete it.**
+> smarthome's `restore-db.sh` never calls `restoreBackup()`; it is bespoke shell
+> (gpg decrypt → pm2 quiescence → rescue snapshot → staged migrate → atomic
+> install → auto-rollback). This package's lock is taken *inside* `restoreBackup`,
+> so it cannot exclude a restore path that never enters that function. smarthome's
+> `flock` remains the only thing serializing its restore against its
+> package-driven backup, and its comment is still accurate for that repo.
+>
+> The fix below is real and worth having — but it only makes a local lock
+> redundant for consumers whose **restore actually goes through `restoreBackup()`**
+> (e.g. cairn's `backup:restore`, rouge's `db:backup:restore`, both via the CLI).
+> Those restores now take the lock and can newly throw `Another db-backup run
+> holds the lock` when they collide with a scheduled backup/prune — an intended
+> new failure mode requiring no code change.
 
 `restoreBackup` now wraps its full body (checksum verification, the
 pre-restore safety backup, and the restore itself) in the same
