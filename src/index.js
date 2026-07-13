@@ -83,6 +83,10 @@ function parseArgs(argv) {
     backupFile: null,
     useLatest: false,
     createPreRestoreBackup: true,
+    stopWritersCommand: null,
+    startWritersCommand: null,
+    allowOnlineRestore: false,
+    skipVerify: false,
     allowMissing: false,
     maxBackups: null,
     dailySlots: null,
@@ -196,6 +200,37 @@ function parseArgs(argv) {
 
     if (arg === '--no-pre-backup') {
       options.createPreRestoreBackup = false;
+      continue;
+    }
+
+    if (arg === '--stop-writers-cmd') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --stop-writers-cmd');
+      options.stopWritersCommand = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--start-writers-cmd') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --start-writers-cmd');
+      options.startWritersCommand = value;
+      index += 1;
+      continue;
+    }
+
+    // UNSAFE override: restore refuses by default when it cannot prove the
+    // live SQLite database is quiescent. This forces it through anyway.
+    if (arg === '--force-online') {
+      options.allowOnlineRestore = true;
+      continue;
+    }
+
+    // UNSAFE override: restore refuses by default when 'sqlite3' is
+    // unavailable and the restored backup can't be integrity-checked. This
+    // forces it through anyway, unverified.
+    if (arg === '--skip-verify') {
+      options.skipVerify = true;
       continue;
     }
 
@@ -1229,12 +1264,118 @@ function removeSqliteSidecars(databasePath) {
   }
 }
 
+// Runs a `stopWriters`/`startWriters` hook. Accepts either a synchronous
+// function (called directly) or a shell command string (run via `sh -lc`,
+// bounded by the same runtime.execFileSync timeout as every other external
+// command this package runs). Deliberately synchronous-only: the rest of this
+// package (and restoreBackup/runCli) is a fully synchronous call chain, and
+// accepting an async hook here would force that all the way up through the
+// CLI. A consumer whose stop/start logic is inherently async should wrap it in
+// a small synchronous shell command (or a sync wrapper that blocks) instead.
+function runWriterHook(hook, label, runtime) {
+  if (typeof hook === 'function') {
+    hook();
+    return;
+  }
+  if (typeof hook === 'string') {
+    runtime.execFileSync('sh', ['-lc', hook], { stdio: 'inherit' });
+    return;
+  }
+  throw new Error(`${label} must be a function or a shell command string`);
+}
+
+// Attempts to prove the live SQLite database has no active writer (or reader
+// holding a lock that would block a writer) before we destroy it. `BEGIN
+// EXCLUSIVE; COMMIT;` only succeeds when sqlite3 can take the database's
+// reserved+exclusive locks, which fails immediately (bounded by `.timeout`,
+// so a hung connection can't hang restore forever) if another connection —
+// app or otherwise — holds so much as a shared read lock in a transaction, or
+// any write lock.
+//
+// Fails CLOSED: if the destination doesn't exist yet there is nothing to
+// protect (quiescent by definition), but if sqlite3 itself is unavailable we
+// cannot prove anything, so this reports NOT quiescent rather than assuming
+// the best.
+const QUIESCENCE_CHECK_TIMEOUT_MS = 3000;
+
+function detectSqliteQuiescence(destinationPath, runtime) {
+  if (!fs.existsSync(destinationPath)) {
+    return { quiescent: true, reason: 'no existing database at destination' };
+  }
+  if (!runtime.commandExists('sqlite3')) {
+    return { quiescent: false, reason: "cannot verify: the 'sqlite3' binary is unavailable" };
+  }
+  try {
+    runtime.execFileSync(
+      'sqlite3',
+      ['-cmd', `.timeout ${QUIESCENCE_CHECK_TIMEOUT_MS}`, destinationPath, 'BEGIN EXCLUSIVE; COMMIT;'],
+      { stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+    return { quiescent: true, reason: 'acquired an exclusive lock on the live database' };
+  } catch (error) {
+    const stdErr = error && error.stderr ? error.stderr.toString() : '';
+    const message = (stdErr || (error && error.message) || 'unknown error').trim();
+    return { quiescent: false, reason: `could not acquire an exclusive lock (a writer may be active): ${message}` };
+  }
+}
+
+function rescueSidecarPath(rescueMainPath, suffix) {
+  return `${rescueMainPath}${suffix}`;
+}
+
+// Plain byte copy (main file + whatever sidecars currently exist) of the LIVE
+// database into `<outputDir>/.rescue/` before restore ever unlinks it. This is
+// deliberately NOT a `sqlite3 .backup` (which would consolidate the WAL into a
+// single file): the goal here is to be able to put the live database back
+// EXACTLY as it was if anything goes wrong after this point, not to produce a
+// clean standalone snapshot. No sqlite3 dependency, so it always works.
+function createRescueSnapshot({ destinationPath, outputDir, runtime }) {
+  const rescueDir = path.join(outputDir, '.rescue');
+  ensureBackupDir(rescueDir);
+  const dbName = path.basename(destinationPath, path.extname(destinationPath));
+  const iso = runtime.now().toISOString().replace(/[:.]/g, '-');
+  const rescueMainPath = path.join(rescueDir, `${dbName}-${iso}.db`);
+
+  fs.copyFileSync(destinationPath, rescueMainPath);
+  restrictArtifact(rescueMainPath);
+
+  const sidecarSuffixes = [];
+  for (const suffix of SQLITE_SIDECAR_SUFFIXES) {
+    const sourceSidecar = `${destinationPath}${suffix}`;
+    if (fs.existsSync(sourceSidecar)) {
+      const destSidecar = rescueSidecarPath(rescueMainPath, suffix);
+      fs.copyFileSync(sourceSidecar, destSidecar);
+      restrictArtifact(destSidecar);
+      sidecarSuffixes.push(suffix);
+    }
+  }
+
+  return { mainPath: rescueMainPath, sidecarSuffixes };
+}
+
+// The auto-rollback counterpart to createRescueSnapshot: puts the live
+// database back exactly as it was captured, including only the sidecars that
+// existed at capture time (any sidecar NOT captured is removed, since it
+// belongs to whatever half-installed state the failed restore left behind).
+function restoreFromRescueSnapshot(rescue, destinationPath) {
+  removeSqliteSidecars(destinationPath);
+  fs.copyFileSync(rescue.mainPath, destinationPath);
+  for (const suffix of rescue.sidecarSuffixes) {
+    fs.copyFileSync(rescueSidecarPath(rescue.mainPath, suffix), `${destinationPath}${suffix}`);
+  }
+}
+
 function restoreSqliteBackup({
   databaseUrl,
   backupEntry,
   cwd = process.cwd(),
   runtime = normalizeRuntime(),
   encryption = null,
+  outputDir = null,
+  stopWriters = null,
+  startWriters = null,
+  allowOnlineRestore = false,
+  skipVerify = false,
 } = {}) {
   const destinationPath = parseSqlitePath(databaseUrl, cwd);
   fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
@@ -1246,6 +1387,9 @@ function restoreSqliteBackup({
   // Decryption lands here first; `.gpg` is the outermost layer, so unwind it
   // before gunzip. Cleaned up alongside tempPath on any failure.
   const decryptedPath = `${tempPath}.decrypted`;
+
+  let writersStopped = false;
+  let rescue = null;
 
   try {
     // Unwind the layers in reverse: decrypt -> decompress -> verify -> replace.
@@ -1271,22 +1415,85 @@ function restoreSqliteBackup({
     // Validate the restored file on the TEMP path, BEFORE it ever replaces the
     // live database: if this throws, the catch below cleans up tempPath only —
     // destinationPath is never touched, so a bad backup can't destroy a good DB.
+    //
+    // Absence of sqlite3 used to silently SKIP this check (fail-open, on a
+    // destructive operation). It now aborts instead, unless the caller
+    // explicitly opts out with skipVerify/--skip-verify.
     if (runtime.commandExists('sqlite3')) {
       verifySqliteBackupIntegrity(tempPath, runtime);
+    } else if (!skipVerify) {
+      throw new Error(
+        "Refusing to restore: the 'sqlite3' binary is unavailable, so the restored " +
+          'backup cannot be integrity-checked before it replaces the live database. ' +
+          'Install sqlite3, or pass skipVerify / --skip-verify to restore UNVERIFIED ' +
+          '(a corrupt backup could then destroy a good database).'
+      );
+    } else {
+      console.warn(
+        `[db-backup] WARNING: restoring ${path.basename(backupEntry.fullPath)} without integrity ` +
+          "verification ('sqlite3' unavailable, skipVerify set). UNSAFE."
+      );
     }
 
     if (fs.existsSync(destinationPath)) {
-      fs.unlinkSync(destinationPath);
+      // Writer quiescence: refuse to destroy a database that may still be
+      // written to. This is the fix for the data-loss defect where restore
+      // unlinked a live, open database out from under a running app — the app
+      // kept writing to the now-unlinked inode, and every write made after the
+      // restore was silently lost on next open.
+      if (stopWriters) {
+        runWriterHook(stopWriters, 'stopWriters', runtime);
+        writersStopped = true;
+      }
+
+      const quiescence = detectSqliteQuiescence(destinationPath, runtime);
+      if (!quiescence.quiescent) {
+        if (!allowOnlineRestore) {
+          throw new Error(
+            `Refusing to restore over ${destinationPath}: could not prove no writer is ` +
+              `active (${quiescence.reason}). Restoring over a live database can silently ` +
+              'destroy writes made after the restore. Pass stopWriters (config) so this ' +
+              'package can quiesce the database itself, or allowOnlineRestore / ' +
+              '--force-online to override at your own risk (UNSAFE).'
+          );
+        }
+        console.warn(
+          `[db-backup] WARNING: restoring over ${destinationPath} without proof it is quiescent ` +
+            `(${quiescence.reason}); allowOnlineRestore is set. This can silently lose writes ` +
+            'made after the restore. UNSAFE.'
+        );
+      }
+
+      // Rescue snapshot: ALWAYS taken (not gated behind createPreRestoreBackup)
+      // right before the live file is touched. If anything fails from here on,
+      // the catch below puts this back so the live database is never left
+      // destroyed — this is what converts "silent data loss" into "recoverable".
+      rescue = createRescueSnapshot({
+        destinationPath,
+        outputDir: outputDir || path.dirname(destinationPath),
+        runtime,
+      });
     }
 
-    // The `-wal`/`-shm`/`-journal` sidecars belong to the database we just
-    // deleted. Left in place, SQLite replays the old WAL's frames onto the
-    // restored file on the next open — silently resurrecting pre-restore rows
-    // while `PRAGMA integrity_check` still reports "ok". The snapshot is a
-    // complete database, so the old sidecars are never wanted.
-    removeSqliteSidecars(destinationPath);
+    try {
+      if (fs.existsSync(destinationPath)) {
+        fs.unlinkSync(destinationPath);
+      }
 
-    fs.renameSync(tempPath, destinationPath);
+      // The `-wal`/`-shm`/`-journal` sidecars belong to the database we just
+      // deleted. Left in place, SQLite replays the old WAL's frames onto the
+      // restored file on the next open — silently resurrecting pre-restore rows
+      // while `PRAGMA integrity_check` still reports "ok". The snapshot is a
+      // complete database, so the old sidecars are never wanted.
+      removeSqliteSidecars(destinationPath);
+
+      fs.renameSync(tempPath, destinationPath);
+    } catch (swapError) {
+      if (rescue) {
+        restoreFromRescueSnapshot(rescue, destinationPath);
+      }
+      throw swapError;
+    }
   } catch (error) {
     for (const scratch of [tempPath, decryptedPath]) {
       try {
@@ -1296,10 +1503,25 @@ function restoreSqliteBackup({
       }
     }
     throw error;
+  } finally {
+    if (writersStopped && startWriters) {
+      try {
+        runWriterHook(startWriters, 'startWriters', runtime);
+      } catch (startError) {
+        // Never let a failed restart mask the restore's real outcome (success
+        // or the original error) — but never swallow it silently either. The
+        // app may need a manual restart.
+        console.error(
+          `[db-backup] WARNING: startWriters failed after restore: ${startError.message}. ` +
+            'The application may need to be restarted manually.'
+        );
+      }
+    }
   }
 
   return {
     target: destinationPath,
+    rescuePath: rescue ? rescue.mainPath : null,
   };
 }
 
@@ -1405,6 +1627,16 @@ function restoreBackup(options = {}) {
         cwd: resolved.cwd,
         runtime: resolved.runtime,
         encryption: resolved.encryption,
+        // Only anchor the rescue snapshot under outputDir when it already
+        // exists — mirrors the advisory-lock behavior just below: a `--file`
+        // backup outside outputDir (which may not exist at all) must not
+        // create it as a side effect. restoreSqliteBackup falls back to the
+        // live database's own directory when this is null.
+        outputDir: fs.existsSync(resolved.outputDir) ? resolved.outputDir : null,
+        stopWriters: options.stopWriters || null,
+        startWriters: options.startWriters || null,
+        allowOnlineRestore: options.allowOnlineRestore === true,
+        skipVerify: options.skipVerify === true,
       });
     } else {
       restoreResult = restorePostgresBackup({
@@ -1422,6 +1654,7 @@ function restoreBackup(options = {}) {
       engine: databaseEngine,
       restoredAt: now.toISOString(),
       target: restoreResult.target,
+      rescuePath: restoreResult.rescuePath || null,
     };
   };
 
@@ -2191,6 +2424,14 @@ Options:
   --file <name|path>      Backup file to restore (command: restore)
   --latest                Restore latest backup in output-dir (command: restore)
   --no-pre-backup         Skip safety backup before restore (command: restore)
+  --stop-writers-cmd <c>  Shell command run to quiesce writers before restore
+                          replaces a live SQLite DB (command: restore)
+  --start-writers-cmd <c> Shell command run after restore to bring writers
+                          back up, incl. on failure (command: restore)
+  --force-online          UNSAFE: restore even if writer quiescence cannot be
+                          proven (command: restore). Can silently lose writes.
+  --skip-verify           UNSAFE: restore without integrity verification when
+                          'sqlite3' is unavailable (command: restore)
   --help                  Show help
 `);
 }
@@ -2373,6 +2614,10 @@ function runCli(argv = process.argv.slice(2)) {
       backupFile: options.backupFile,
       useLatest: options.useLatest,
       createPreRestoreBackup: options.createPreRestoreBackup,
+      stopWriters: options.stopWritersCommand,
+      startWriters: options.startWritersCommand,
+      allowOnlineRestore: options.allowOnlineRestore,
+      skipVerify: options.skipVerify,
     });
 
     if (options.json) {
@@ -2385,6 +2630,9 @@ function runCli(argv = process.argv.slice(2)) {
     console.log(`[db-backup] Restored backup: ${restoreResult.restored.fileName}`);
     if (restoreResult.preRestoreBackup) {
       console.log(`[db-backup] Safety backup created: ${restoreResult.preRestoreBackup.fileName}`);
+    }
+    if (restoreResult.rescuePath) {
+      console.log(`[db-backup] Rescue snapshot of the pre-restore live database: ${restoreResult.rescuePath}`);
     }
     console.log(`[db-backup] Restore target: ${restoreResult.target}`);
     console.log('[db-backup] Restore completed. Restart your application before serving traffic.');
@@ -2448,6 +2696,7 @@ module.exports = {
   verifySqliteBackupIntegrity,
   restoreSqliteBackup,
   removeSqliteSidecars,
+  detectSqliteQuiescence,
   normalizeRuntime,
   DEFAULT_COMMAND_TIMEOUT_MS,
   // Encryption at rest + backup liveness.

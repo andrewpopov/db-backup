@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.14.0
+
+**Data-loss fix — `restore` against a LIVE, running database now ABORTS
+instead of silently eating writes.**
+
+`restoreSqliteBackup` unlinked the destination file with no check that any
+writer had been stopped. Consumer-side, cairn's
+`db-backup restore --prod --latest` runs against the live
+`/srv/cairn/packages/api/prisma/cairn.db` while the API is up: the API holds
+an open fd, restore unlinks it, the app keeps writing to the now-unlinked
+inode, and on restart it opens the restored file — every write made between
+the restore and the restart is gone, silently (and on SQLite this can also
+corrupt via stale `-wal` interplay). There was no error, no log line, nothing
+— the only symptom is data that used to be there isn't anymore.
+
+Three independent changes, all restore-only (`backup` is unaffected):
+
+- **Rescue snapshot, always.** Before the live database is ever unlinked, a
+  byte-for-byte copy of it (plus any `-wal`/`-shm`/`-journal` sidecars) is
+  written to `<outputDir>/.rescue/<dbname>-<ISO>.db`. If anything fails after
+  that point, the live database is automatically restored from this copy
+  instead of being left missing — `RestoreResult.rescuePath` reports where it
+  landed. This is not gated behind `--no-pre-backup`; it always runs.
+- **Writer quiescence, refuse unless proven safe.** New `stopWriters` /
+  `startWriters` options (a synchronous function or a shell-command string;
+  CLI: `--stop-writers-cmd`, `--start-writers-cmd`) let a consumer quiesce its
+  own app. Either way, restore then attempts to PROVE quiescence with a
+  bounded `BEGIN EXCLUSIVE; COMMIT;` against the live database. If that
+  cannot be proven — no `stopWriters` was given, or it ran but a writer is
+  still active — restore **refuses** with a clear error, unless the caller
+  passes the explicit, loudly-documented-as-unsafe override
+  `allowOnlineRestore` (CLI: `--force-online`). `startWriters` runs in a
+  `finally`, so it also fires on the failure path if `stopWriters` ran.
+- **`sqlite3` absence is no longer a silent skip.** Restore previously
+  skipped `verifySqliteBackupIntegrity` outright (fail-open) when `sqlite3`
+  wasn't installed. It now **aborts** in that case, unless the caller passes
+  `skipVerify` (CLI: `--skip-verify`) — logged loudly as unsafe. `backup`
+  keeps its existing leniency; this only tightens `restore`.
+
+`RestoreResult` gained `rescuePath: string | null`. Backward compatible
+otherwise — but a `restore` run against a live SQLite database that used to
+silently succeed (and silently lose data) will now throw unless one of the
+above options is set. That is the point of this release: it is correct for
+`restore` to fail loudly on a live DB rather than eat writes quietly.
+
 ## 0.13.1
 
 **A corrupt snapshot survived the check that rejected it — and got listed as a

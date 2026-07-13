@@ -191,10 +191,35 @@ export interface PruneJobResult {
   policy: RetentionPolicy;
 }
 
+/** A hook run around a live SQLite restore: either a synchronous function
+ * (called directly) or a shell command string (run via `sh -lc`, bounded by
+ * the same command timeout as every other external command this package
+ * runs). Deliberately synchronous-only — the whole call chain from
+ * `restoreBackup` down through `runCli` is synchronous. */
+export type WriterHook = (() => void) | string;
+
 export interface RestoreOptions extends BackupOptions {
   backupFile?: string;
   useLatest?: boolean;
   createPreRestoreBackup?: boolean;
+  /** Run before a SQLite restore unlinks the live database, to quiesce
+   * writers (e.g. stop the app). Quiescence is then PROVEN (an exclusive
+   * lock is attempted) regardless of whether this is provided. */
+  stopWriters?: WriterHook | null;
+  /** Run after a SQLite restore installs the new database (in a `finally`,
+   * so it also runs on the failure path) to bring writers back up. Only
+   * invoked if `stopWriters` actually ran. */
+  startWriters?: WriterHook | null;
+  /** UNSAFE. Restore even when writer quiescence cannot be proven (no
+   * `stopWriters`, or `stopWriters` ran but an exclusive lock still can't be
+   * acquired). Restoring over a database with an active writer can silently
+   * lose every write made after the restore. Default: false (refuse). */
+  allowOnlineRestore?: boolean;
+  /** UNSAFE. Restore a SQLite backup without integrity verification when the
+   * `sqlite3` binary is unavailable, instead of aborting. Default: false
+   * (abort). Does not affect `backup`, which already tolerates a missing
+   * `sqlite3` for `pg_restore`-style verification. */
+  skipVerify?: boolean;
 }
 
 export interface RestoreResult {
@@ -205,6 +230,11 @@ export interface RestoreResult {
   engine: 'sqlite' | 'postgres' | 'unknown';
   restoredAt: string;
   target: string;
+  /** Path to the always-taken rescue copy of the pre-restore live SQLite
+   * database (under `<outputDir>/.rescue/`), or null for a Postgres restore
+   * or a SQLite restore where no live database existed yet. If restore fails
+   * after this point, the live database is automatically restored from here. */
+  rescuePath: string | null;
 }
 
 export const DEFAULT_RETENTION_POLICY: AgeTierRetentionPolicy;
@@ -404,7 +434,17 @@ export function verifySqliteBackupIntegrity(
 /** Atomically replace the database named by `databaseUrl` with `backupEntry`:
  * decompress/copy to a temp path, verify it there, discard the destination's
  * `-wal`/`-shm`/`-journal` sidecars, then rename into place. A corrupt backup
- * can never destroy a good database. */
+ * can never destroy a good database.
+ *
+ * Safety, in order, when a live database exists at the destination:
+ *   1. `sqlite3` missing -> ABORTS unless `skipVerify` (backup unverified).
+ *   2. `stopWriters` (if given) runs, then quiescence is PROVEN via an
+ *      exclusive-lock attempt -> ABORTS unless proven (or `allowOnlineRestore`).
+ *   3. A rescue copy of the live database (+ sidecars) is ALWAYS taken under
+ *      `<outputDir>/.rescue/` before the live file is touched. Any failure
+ *      from that point on restores it automatically.
+ *   4. `startWriters` (if `stopWriters` ran) runs in a `finally`, including
+ *      on the failure path. */
 export function restoreSqliteBackup(options?: {
   databaseUrl: string;
   backupEntry: Pick<BackupEntry, 'fullPath' | 'compressed'> & { encrypted?: boolean };
@@ -412,12 +452,29 @@ export function restoreSqliteBackup(options?: {
   runtime?: ResolvedBackupRuntime;
   /** Required when `backupEntry.encrypted` is true. */
   encryption?: BackupEncryption | null;
-}): { target: string };
+  /** Directory under which `.rescue/` is created. Defaults to the live
+   * database's own directory. */
+  outputDir?: string | null;
+  stopWriters?: WriterHook | null;
+  startWriters?: WriterHook | null;
+  allowOnlineRestore?: boolean;
+  skipVerify?: boolean;
+}): { target: string; rescuePath: string | null };
 
 /** Remove a SQLite database's `-wal`, `-shm` and `-journal` sidecars. They
  * describe the database they were created for, so they must be discarded
  * whenever that file is replaced wholesale. No-op when absent. */
 export function removeSqliteSidecars(databasePath: string): void;
+
+/** Attempts to prove no writer (or blocking reader) currently holds a lock on
+ * `destinationPath`, via a bounded `BEGIN EXCLUSIVE; COMMIT;`. Fails CLOSED:
+ * a missing database is trivially quiescent, but a missing `sqlite3` binary
+ * or a held lock both report `quiescent: false`. Used by `restoreSqliteBackup`
+ * to decide whether a restore may proceed. */
+export function detectSqliteQuiescence(
+  destinationPath: string,
+  runtime?: ResolvedBackupRuntime,
+): { quiescent: boolean; reason: string };
 
 // --- Backup-storage helpers ---
 
