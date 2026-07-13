@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.16.1
+
+Fix — the S3 remote ignored `AWS_REGION` / `AWS_DEFAULT_REGION` and defaulted to
+`us-east-1`, so a bucket in any other region was unreachable: AWS answers with
+`301 PermanentRedirect`. The first real backup on the Pi (a us-west-2 bucket) hit
+exactly this. It failed CLOSED — exit 1, no false success — but it failed.
+
+Region now resolves as: explicit `--s3-region` > `AWS_REGION` > `AWS_DEFAULT_REGION`
+> fallback, and it reads from the INJECTED env bag (the way credentials and timeouts
+already did) rather than `process.env` directly, so it is both correct and testable.
+
+A code comment asserted that us-east-1 was the region every AWS account could reach
+every bucket through. That was false; prod disproved it on the first attempt.
+
 ## 0.16.0
 
 **Native S3-compatible off-host remote — AWS S3 and Cloudflare R2, no `rclone`
