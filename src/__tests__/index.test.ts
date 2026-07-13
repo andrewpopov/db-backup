@@ -1651,6 +1651,74 @@ describe('@andrewpopov/db-backup', () => {
     expect(seenHosts.every((h) => h === 's3.us-east-1.amazonaws.com')).toBe(true);
   });
 
+  // The first real backup on the Pi failed with:
+  //   301 PermanentRedirect - The bucket you are attempting to access must be
+  //   addressed using the specified endpoint
+  // because the region defaulted to us-east-1 and AWS_REGION -- the env var every
+  // AWS SDK and the CLI honor, and the one set in /etc/db-backup/s3.env -- was
+  // IGNORED. A bucket lives in ONE region; the request must go to that region's
+  // endpoint. It failed closed (exit 1, no false success), but it failed.
+  it('honors AWS_REGION from the environment so a non-us-east-1 bucket is reachable', async () => {
+    const cwd = makeTempDir();
+    const filePath = path.join(cwd, 'sqlite-backup-20260705-150000Z.db.gz');
+    fs.writeFileSync(filePath, 'payload');
+
+    const seenHosts: string[] = [];
+    const { fetchImpl } = makeFakeS3({ onRequest: (url) => seenHosts.push(new URL(url).host) });
+
+    await uploadBackupToS3(
+      { fileName: path.basename(filePath), fullPath: filePath } as never,
+      { bucket: 'b' } as never,
+      normalizeRuntime({
+        fetchImpl,
+        env: { ...S3_CREDS_ENV, AWS_REGION: 'us-west-2' },
+      } as never),
+    );
+
+    expect(seenHosts.every((h) => h === 's3.us-west-2.amazonaws.com')).toBe(true);
+    expect(seenHosts.some((h) => h.includes('us-east-1'))).toBe(false);
+  });
+
+  it('honors AWS_DEFAULT_REGION as a fallback', async () => {
+    const cwd = makeTempDir();
+    const filePath = path.join(cwd, 'sqlite-backup-20260705-150000Z.db.gz');
+    fs.writeFileSync(filePath, 'payload');
+
+    const seenHosts: string[] = [];
+    const { fetchImpl } = makeFakeS3({ onRequest: (url) => seenHosts.push(new URL(url).host) });
+
+    await uploadBackupToS3(
+      { fileName: path.basename(filePath), fullPath: filePath } as never,
+      { bucket: 'b' } as never,
+      normalizeRuntime({
+        fetchImpl,
+        env: { ...S3_CREDS_ENV, AWS_DEFAULT_REGION: 'eu-central-1' },
+      } as never),
+    );
+
+    expect(seenHosts.every((h) => h === 's3.eu-central-1.amazonaws.com')).toBe(true);
+  });
+
+  it('an explicit --s3-region still wins over the environment', async () => {
+    const cwd = makeTempDir();
+    const filePath = path.join(cwd, 'sqlite-backup-20260705-150000Z.db.gz');
+    fs.writeFileSync(filePath, 'payload');
+
+    const seenHosts: string[] = [];
+    const { fetchImpl } = makeFakeS3({ onRequest: (url) => seenHosts.push(new URL(url).host) });
+
+    await uploadBackupToS3(
+      { fileName: path.basename(filePath), fullPath: filePath } as never,
+      { bucket: 'b', region: 'ap-south-1' } as never,
+      normalizeRuntime({
+        fetchImpl,
+        env: { ...S3_CREDS_ENV, AWS_REGION: 'us-west-2' },
+      } as never),
+    );
+
+    expect(seenHosts.every((h) => h === 's3.ap-south-1.amazonaws.com')).toBe(true);
+  });
+
   it('refuses with a clear error naming the env vars when S3 credentials are absent', async () => {
     const cwd = makeTempDir();
     const filePath = path.join(cwd, 'sqlite-backup-20260705-150000Z.db.gz');

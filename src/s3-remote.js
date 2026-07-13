@@ -111,21 +111,33 @@ function resolveS3Credentials(env = process.env) {
 // interaction with virtual-hosted-style) and is what the constrained "endpoint
 // or https://s3.{region}.amazonaws.com" contract this package documents calls
 // for.
-function resolveS3Endpoint(s3) {
+function resolveS3Endpoint(s3, env = process.env) {
   if (s3.endpoint) {
     const parsed = new URL(s3.endpoint);
     return { host: parsed.host, protocol: parsed.protocol };
   }
-  const region = resolveS3Region(s3);
+  const region = resolveS3Region(s3, env);
   return { host: `s3.${region}.amazonaws.com`, protocol: 'https:' };
 }
 
-// `auto` is R2's own documented region value (it ignores the region and
-// resolves the bucket's actual location); AWS has no such shortcut, so a
-// request with no explicit endpoint defaults to `us-east-1`, the SigV4-legal
-// region every AWS account can reach every bucket through.
-function resolveS3Region(s3) {
+// `auto` is R2's own documented region value (it ignores the region and resolves
+// the bucket's actual location). AWS has no such shortcut: a bucket lives in ONE
+// region and the request MUST go to that region's endpoint.
+//
+// An earlier comment here claimed us-east-1 was "the SigV4-legal region every AWS
+// account can reach every bucket through". That is false, and prod proved it: a
+// us-west-2 bucket answers the us-east-1 endpoint with
+// `301 PermanentRedirect - The bucket you are attempting to access must be
+// addressed using the specified endpoint`.
+//
+// So honor AWS_REGION / AWS_DEFAULT_REGION — the convention every AWS SDK and the
+// CLI follow — before falling back. The fallback stays us-east-1 only because a
+// bucket that genuinely lives there needs no configuration; anywhere else, the env
+// var (or --s3-region) is what makes the request land.
+function resolveS3Region(s3, env = process.env) {
   if (s3.region) return s3.region;
+  const fromEnv = (env && (env.AWS_REGION || env.AWS_DEFAULT_REGION)) || '';
+  if (String(fromEnv).trim()) return String(fromEnv).trim();
   return s3.endpoint ? 'auto' : 'us-east-1';
 }
 
@@ -227,8 +239,8 @@ async function defaultAsyncFetch(url, options, timeoutMs) {
 // tests inject a mock, production defaults to the real async `fetch`), and
 // redact credentials from any thrown error. Async: callers must await it.
 async function s3Request({ method, s3, runtime, canonicalPath, query = {}, body = null, extraHeaders = {} }) {
-  const { host, protocol } = resolveS3Endpoint(s3);
-  const region = resolveS3Region(s3);
+  const { host, protocol } = resolveS3Endpoint(s3, runtime.env);
+  const region = resolveS3Region(s3, runtime.env);
   const credentials = resolveS3Credentials(runtime.env);
   const payloadHash = body ? sha256Hex(body) : EMPTY_PAYLOAD_HASH;
   const date = runtime.now ? runtime.now() : new Date();
