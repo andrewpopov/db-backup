@@ -1,6 +1,6 @@
 {
   "name": "@andrewpopov/db-backup",
-  "version": "0.17.1",
+  "version": "0.17.2",
   "description": "Reusable database backup manager with age-tier retention (SQLite raw/gzip + Postgres pg_dump)",
   "main": "src/index.js",
   "types": "src/index.d.ts",
@@ -42,7 +42,8 @@
   "scripts": {
     "test": "vitest run",
     "verify:pack": "node scripts/verify-pack.mjs",
-    "verify:types": "tsc --noEmit -p tsconfig.types.json"
+    "verify:types": "tsc --noEmit -p tsconfig.types.json",
+    "verify": "npm run verify:types && npm test && npm run verify:pack && npm audit --omit=dev --audit-level=high"
   },
   "dependencies": {
     "dotenv": "^16.5.0"

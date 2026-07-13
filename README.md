@@ -10,7 +10,7 @@ to be trustworthy without a human watching it.
 ## Install
 
 ```bash
-npm install github:andrewpopov/db-backup#v0.11.1
+npm install github:andrewpopov/db-backup#v0.17.1
 ```
 
 ## Retention
@@ -779,6 +779,17 @@ console.log(result.rescuePath); // e.g. ./backups/database/.rescue/app-2026-07-1
 `allowOnlineRestore` and `skipVerify` are documented escape hatches, not
 defaults — using either means restore can no longer prove it won't destroy
 data. `backup` is unaffected by any of this; only `restore` changed.
+
+## Verify locally
+
+```bash
+npm ci
+npm run verify
+```
+
+The local release gate runs type checks, the backup behavior suite, packed
+artifact smoke checks, and the runtime dependency audit. It does not replace
+the real-service restore drills required for a production deployment.
 
 ## What stays app-specific
 
