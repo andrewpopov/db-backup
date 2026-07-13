@@ -797,3 +797,8 @@ The package does not decide where backups should live, who can trigger them, or
 how a web UI should present them. Those concerns belong in the host application —
 an admin controller, a settings layer — as a thin adapter over the programmatic
 API, not inside the package.
+
+## Project policies
+
+See [Contributing](./CONTRIBUTING.md), [Support](./SUPPORT.md), and the
+[Security Policy](./SECURITY.md). This package is licensed under [MIT](./LICENSE).
