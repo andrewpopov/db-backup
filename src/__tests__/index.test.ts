@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import zlib from 'zlib';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const require = createRequire(import.meta.url);
 const {
@@ -27,6 +27,8 @@ const {
   writeSuccessStamp,
   normalizeRuntime,
   DEFAULT_COMMAND_TIMEOUT_MS,
+  restoreSqliteBackup,
+  detectSqliteQuiescence,
 } = require('../index.js') as typeof import('../index');
 
 const fixedNow = new Date('2026-07-05T15:00:00.000Z');
@@ -352,6 +354,8 @@ describe('@andrewpopov/db-backup', () => {
       outputDir,
       backupFile: path.basename(backupPath),
       createPreRestoreBackup: false,
+      skipVerify: true,
+      allowOnlineRestore: true,
       runtime: makeRuntime(),
       allowUnsafeCopy: true,
     });
@@ -385,6 +389,8 @@ describe('@andrewpopov/db-backup', () => {
       outputDir,
       backupFile: path.basename(backupPath),
       createPreRestoreBackup: false,
+      skipVerify: true,
+      allowOnlineRestore: true,
       runtime: makeRuntime(),
       allowUnsafeCopy: true,
     });
@@ -411,6 +417,8 @@ describe('@andrewpopov/db-backup', () => {
       outputDir,
       backupFile: path.basename(backupPath),
       createPreRestoreBackup: false,
+      skipVerify: true,
+      allowOnlineRestore: true,
       allowMissing: true,
       runtime: makeRuntime(),
       allowUnsafeCopy: true,
@@ -1568,6 +1576,8 @@ describe('@andrewpopov/db-backup', () => {
       outputDir,
       backupFile: created.created.fileName,
       createPreRestoreBackup: false,
+      skipVerify: true,
+      allowOnlineRestore: true,
       runtime,
     });
 
@@ -1596,6 +1606,8 @@ describe('@andrewpopov/db-backup', () => {
       outputDir,
       useLatest: true,
       createPreRestoreBackup: false,
+      skipVerify: true,
+      allowOnlineRestore: true,
       runtime: newerRuntime,
     });
 
@@ -1962,6 +1974,8 @@ describe('@andrewpopov/db-backup', () => {
       outputDir,
       backupFile: backupPath, // absolute path, outside outputDir
       createPreRestoreBackup: false,
+      skipVerify: true,
+      allowOnlineRestore: true,
       runtime: makeRuntime(),
       allowUnsafeCopy: true,
     });
@@ -2047,6 +2061,8 @@ describe('@andrewpopov/db-backup', () => {
       outputDir,
       backupFile: path.basename(backupPath),
       createPreRestoreBackup: false,
+      skipVerify: true,
+      allowOnlineRestore: true,
       runtime: makeRuntime(),
       allowUnsafeCopy: true,
     });
@@ -2310,5 +2326,254 @@ describe('runCli freshness wiring', () => {
     expect(fs.existsSync(sentinel)).toBe(true);
     expect(fs.readFileSync(sentinel, 'utf8')).toMatch(/STALE/);
     process.exitCode = prevExit;
+  });
+});
+
+// --- Restore safety: writer quiescence, rescue snapshot, fail-closed sqlite3 ---
+//
+// Regression coverage for the data-loss defect where `restore` unlinked a LIVE,
+// open SQLite database with no proof writers were stopped: a running app kept
+// writing to the now-unlinked inode, and every write made after the restore was
+// silently lost on next open (the cairn `db-backup restore --prod --latest`
+// scenario, run against a live /srv/cairn/.../cairn.db while the API is up).
+describe('restore safety: writer quiescence, rescue snapshot, fail-closed sqlite3', () => {
+  // A runtime whose sqlite3 exists and whose `BEGIN EXCLUSIVE; COMMIT;` lock
+  // attempt either succeeds (quiescent) or fails (a writer is "active"),
+  // independent of the separate `PRAGMA integrity_check;` call the temp-file
+  // verification step makes.
+  function makeSqliteRuntime({ lockSucceeds }: { lockSucceeds: boolean }) {
+    return makeRuntime({
+      commandExists: (command) => command === 'sqlite3',
+      execFileSync: (command: string, args: string[]) => {
+        if (command === 'sqlite3' && args[1] === 'PRAGMA integrity_check;') {
+          return Buffer.from('ok\n') as unknown as void;
+        }
+        if (command === 'sqlite3' && args.includes('BEGIN EXCLUSIVE; COMMIT;')) {
+          if (!lockSucceeds) {
+            const error = new Error('database is locked') as Error & { stderr?: Buffer };
+            error.stderr = Buffer.from('Error: database is locked');
+            throw error;
+          }
+          return undefined;
+        }
+        return undefined;
+      },
+    });
+  }
+
+  it('HEADLINE (data loss): restoring while the DB is in use aborts, and the live DB is untouched', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    const liveBytes = Buffer.from('live database bytes still being written by the app');
+    fs.writeFileSync(dbPath, liveBytes);
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath, 'a backup that would otherwise be restored');
+
+    // No stopWriters given, and the exclusive-lock probe fails: quiescence
+    // cannot be proven — this MUST refuse rather than destroy the live DB.
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl: 'file:./app.db',
+        outputDir,
+        backupFile: path.basename(backupPath),
+        createPreRestoreBackup: false,
+        runtime: makeSqliteRuntime({ lockSucceeds: false }),
+      }),
+    ).toThrow(/could not prove no writer is active/i);
+
+    expect(fs.readFileSync(dbPath).equals(liveBytes)).toBe(true);
+    // No rescue snapshot either — restore never got far enough to need one.
+    expect(fs.existsSync(path.join(outputDir, '.rescue'))).toBe(false);
+  });
+
+  it('allowOnlineRestore overrides the quiescence guard (documented UNSAFE escape hatch)', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(dbPath, 'old database');
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath, 'restored database');
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      allowOnlineRestore: true,
+      runtime: makeSqliteRuntime({ lockSucceeds: false }),
+    });
+
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('restored database');
+    expect(result.rescuePath).toBeTruthy();
+  });
+
+  it('stopWriters is called before the unlink, and startWriters after — including on a later failure path', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(dbPath, 'old database');
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath, 'restored database');
+
+    const calls: string[] = [];
+    const result = restoreBackup({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      stopWriters: () => calls.push('stop'),
+      startWriters: () => calls.push('start'),
+      // Lock succeeds only AFTER stopWriters would have quiesced the app —
+      // this is exactly the "stopWriters proves it" path.
+      runtime: makeSqliteRuntime({ lockSucceeds: true }),
+    });
+
+    expect(calls).toEqual(['stop', 'start']);
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('restored database');
+    expect(result.rescuePath).toBeTruthy();
+
+    // --- now the failure path: startWriters must still run ---
+    // A fresh cwd/outputDir so `.rescue` doesn't already exist as a directory
+    // from the successful restore above (a file there blocks `.rescue` from
+    // being created at all, forcing the rescue-snapshot step to throw — a
+    // failure that happens AFTER stopWriters ran but BEFORE the live DB is
+    // ever touched).
+    const cwd2 = makeTempDir();
+    const outputDir2 = path.join(cwd2, 'backups');
+    const dbPath2 = path.join(cwd2, 'app.db');
+    fs.mkdirSync(outputDir2, { recursive: true });
+    fs.writeFileSync(dbPath2, 'old database again');
+    const backupPath2 = path.join(outputDir2, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath2, 'restored database');
+    fs.writeFileSync(path.join(outputDir2, '.rescue'), 'blocking file, not a directory');
+
+    const failCalls: string[] = [];
+    expect(() =>
+      restoreBackup({
+        cwd: cwd2,
+        databaseUrl: 'file:./app.db',
+        outputDir: outputDir2,
+        backupFile: path.basename(backupPath2),
+        createPreRestoreBackup: false,
+        stopWriters: () => failCalls.push('stop'),
+        startWriters: () => failCalls.push('start'),
+        runtime: makeSqliteRuntime({ lockSucceeds: true }),
+      }),
+    ).toThrow();
+
+    expect(failCalls).toEqual(['stop', 'start']);
+    // The live DB was never touched — the rescue step failed before the unlink.
+    expect(fs.readFileSync(dbPath2, 'utf8')).toBe('old database again');
+  });
+
+  it('RESCUE SNAPSHOT: a failure after the unlink restores the live DB from the rescue copy, not left missing', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    const liveBytes = 'the live database, must survive a failed restore';
+    fs.writeFileSync(dbPath, liveBytes);
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath, 'restored database');
+
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+      throw new Error('simulated failure installing the restored copy');
+    });
+
+    try {
+      expect(() =>
+        restoreBackup({
+          cwd,
+          databaseUrl: 'file:./app.db',
+          outputDir,
+          backupFile: path.basename(backupPath),
+          createPreRestoreBackup: false,
+          allowOnlineRestore: true, // isolate this test to the rescue mechanism
+          runtime: makeSqliteRuntime({ lockSucceeds: false }),
+        }),
+      ).toThrow(/simulated failure installing/);
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    // This is the assertion that proves data loss is impossible: the live DB
+    // was unlinked mid-restore, but the catch block put the rescue copy back.
+    expect(fs.existsSync(dbPath)).toBe(true);
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe(liveBytes);
+  });
+
+  it('sqlite3 absent: restore aborts (fail closed) unless skipVerify is passed', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(dbPath, 'old database');
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db');
+    fs.writeFileSync(backupPath, 'restored database');
+
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl: 'file:./app.db',
+        outputDir,
+        backupFile: path.basename(backupPath),
+        createPreRestoreBackup: false,
+        runtime: makeRuntime({ commandExists: () => false }),
+      }),
+    ).toThrow(/sqlite3.*unavailable/i);
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('old database');
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl: 'file:./app.db',
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      skipVerify: true,
+      allowOnlineRestore: true,
+      runtime: makeRuntime({ commandExists: () => false }),
+    });
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('restored database');
+    expect(result.target).toBe(dbPath);
+  });
+
+  it('detectSqliteQuiescence: a nonexistent destination is trivially quiescent; a missing sqlite3 binary is not', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+
+    expect(detectSqliteQuiescence(dbPath, makeRuntime({ commandExists: () => true })).quiescent).toBe(true);
+
+    fs.writeFileSync(dbPath, 'exists');
+    expect(detectSqliteQuiescence(dbPath, makeRuntime({ commandExists: () => false })).quiescent).toBe(false);
+  });
+
+  // restoreSqliteBackup directly (not through restoreBackup) so this exercises
+  // the same quiescence guard the manual data-loss regression check patches.
+  it('restoreSqliteBackup: refuses a live restore with no stopWriters and an unprovable lock', () => {
+    const cwd = makeTempDir();
+    const dbPath = path.join(cwd, 'app.db');
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(dbPath, 'live bytes');
+    const backupPath = path.join(outputDir, 'candidate.db');
+    fs.writeFileSync(backupPath, 'candidate bytes');
+
+    expect(() =>
+      restoreSqliteBackup({
+        databaseUrl: 'file:./app.db',
+        backupEntry: { fullPath: backupPath, compressed: false },
+        cwd,
+        outputDir,
+        runtime: makeSqliteRuntime({ lockSucceeds: false }),
+      }),
+    ).toThrow(/could not prove no writer is active/i);
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('live bytes');
   });
 });

@@ -202,6 +202,10 @@ db-backup restore --prod --output-dir /var/backups/myapp --file sqlite-backup-20
 
 # Restore from the latest backup in output-dir
 db-backup restore --prod --output-dir /var/backups/myapp --latest
+
+# Restore against a LIVE database: quiesce the app around the swap
+db-backup restore --prod --output-dir /var/backups/myapp --latest \
+  --stop-writers-cmd "pm2 stop myapp" --start-writers-cmd "pm2 start myapp"
 ```
 
 ## Adoption recipes
@@ -375,8 +379,8 @@ from `new Date()`.
 ## Restore behavior
 
 - `restore` requires `--file <name|path>` or `--latest`.
-- By default, a safety backup is created before restore.
-- Disable safety backup with `--no-pre-backup`.
+- By default, a safety backup is created before restore. Disable with
+  `--no-pre-backup`.
 - SQLite restore replaces the configured DB file.
 - PostgreSQL restore uses `pg_restore --clean --if-exists --single-transaction`.
 - PostgreSQL restore targets are redacted in return values so passwords are not
@@ -387,6 +391,59 @@ from `new Date()`.
   exist — a `--file` outside `outputDir` needs no local lock.
 
 After restore, restart the application before serving traffic.
+
+### SQLite restore is safe by default: it refuses rather than destroys
+
+Since 0.14.0, restoring over a **live** SQLite database — one still open in a
+running app — no longer silently eats writes made after the restore. This is
+exactly the failure mode that used to hit an app like cairn, whose
+`db-backup restore --prod --latest` ran against the live `cairn.db` while the
+API was up: the API held an open fd, restore unlinked it out from under the
+process, and every write the app made between the restore and its next
+restart vanished with no error at all.
+
+Restore now does three things, in order, whenever a live database exists at
+the destination:
+
+1. **Verifies integrity first.** The restored backup is checked with
+   `PRAGMA integrity_check` on a temp path before it ever touches the live
+   file. If `sqlite3` isn't installed, restore now **aborts** instead of
+   silently skipping this check — pass `skipVerify` (`--skip-verify`) to
+   proceed unverified anyway (unsafe).
+2. **Proves writers are quiesced, or refuses.** Pass `stopWriters` /
+   `startWriters` (a synchronous function, or a shell-command string — CLI:
+   `--stop-writers-cmd <cmd>` / `--start-writers-cmd <cmd>`) so this package
+   can quiesce your app itself. Either way, restore attempts to prove
+   quiescence with a bounded `BEGIN EXCLUSIVE; COMMIT;` against the live
+   database. If that can't be proven, restore **refuses** with a clear error
+   — pass `allowOnlineRestore` (`--force-online`) to override at your own
+   risk. `startWriters` always runs afterward (even if the restore itself
+   fails), so a stopped app is never left down.
+3. **Takes a rescue snapshot before touching anything.** A byte-for-byte copy
+   of the live database (plus its `-wal`/`-shm`/`-journal` sidecars, if any)
+   is written to `<outputDir>/.rescue/<dbname>-<ISO>.db` — always, not just
+   when the pre-restore safety backup is enabled. If any later step fails,
+   the live database is automatically restored from this copy instead of
+   being left missing or half-swapped. `RestoreResult.rescuePath` reports
+   where it landed.
+
+```js
+const { restoreBackup } = require('@andrewpopov/db-backup');
+
+const result = restoreBackup({
+  databaseUrl: 'file:./data/app.db',
+  outputDir: './backups/database',
+  useLatest: true,
+  stopWriters: 'pm2 stop my-app',
+  startWriters: 'pm2 start my-app',
+});
+
+console.log(result.rescuePath); // e.g. ./backups/database/.rescue/app-2026-07-12T...db
+```
+
+`allowOnlineRestore` and `skipVerify` are documented escape hatches, not
+defaults — using either means restore can no longer prove it won't destroy
+data. `backup` is unaffected by any of this; only `restore` changed.
 
 ## What stays app-specific
 
