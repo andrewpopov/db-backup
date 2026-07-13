@@ -2,9 +2,7 @@
 
 const { runCli } = require('./index');
 
-try {
-  runCli(process.argv.slice(2));
-} catch (error) {
+runCli(process.argv.slice(2)).catch((error) => {
   if (error && error.stderr) {
     const stderrText = error.stderr.toString().trim();
     if (stderrText) {
@@ -13,4 +11,4 @@ try {
   }
   console.error(`[db-backup] ${error.message}`);
   process.exit(1);
-}
+});

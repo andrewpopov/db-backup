@@ -47,7 +47,7 @@ try {
   // 3. Require it as a consumer would and assert the public surface resolves.
   const smoke = `
     const t = require('${pkg.name}');
-    const expected = ['runCli', 'runBackupJob', 'listBackupsWithPlan', 'restoreBackup', 'planRetention', 'resolveBackupDirectories', 'resolveContainedBackupPath', 'readBackupManifest', 'appendBackupManifestEntry', // SQLite engine primitives (BWK-120): the seam consumers build on.
+    const expected = ['runCli', 'runBackupJob', 'runBackupJobAsync', 'listBackupsWithPlan', 'restoreBackup', 'planRetention', 'resolveBackupDirectories', 'resolveContainedBackupPath', 'readBackupManifest', 'appendBackupManifestEntry', // SQLite engine primitives (BWK-120): the seam consumers build on.
       'createSqliteSnapshot', 'verifySqliteBackupIntegrity', 'restoreSqliteBackup', 'removeSqliteSidecars', 'normalizeRuntime',
       // Encryption at rest + backup liveness (BWK-131).
       'encryptBackupEntry', 'decryptBackupToPath', 'writeSuccessStamp', 'readSuccessStamp', 'checkBackupFreshness',
@@ -64,7 +64,7 @@ try {
   //     even though CJS `require` sees it. Catches the ESM/CJS interop gap.
   const esmSmoke = `
     import * as ns from '${pkg.name}';
-    const named = ['runBackupJob', 'resolveBackupDirectories', 'resolveContainedBackupPath', 'readBackupManifest', 'appendBackupManifestEntry'];
+    const named = ['runBackupJob', 'runBackupJobAsync', 'resolveBackupDirectories', 'resolveContainedBackupPath', 'readBackupManifest', 'appendBackupManifestEntry'];
     const missing = named.filter((k) => typeof ns[k] !== 'function');
     if (missing.length) { throw new Error('missing ESM named exports: ' + missing.join(', ')); }
     console.log('[verify-pack] ESM named exports OK');

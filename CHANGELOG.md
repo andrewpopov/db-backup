@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.16.0
+
+**Native S3-compatible off-host remote — AWS S3 and Cloudflare R2, no `rclone`
+binary required — uploaded asynchronously so it can never block an in-process
+caller's event loop.**
+
+`uploadBackupToRemote` shelled out to `rclone` and hard-failed if the binary
+was absent. Three apps (cairn, savoro, sano-os) have no off-host backups at
+all today because none of them wanted to install and configure `rclone`. R2
+speaks the S3 API, so one native implementation covers both AWS and R2.
+
+An earlier iteration of this feature made the S3 upload "synchronous" by
+blocking the calling thread on a `worker_threads` + `Atomics.wait` bridge
+around `fetch`. That is fine for the CLI (a one-shot batch process) but wrong
+for this package's other real consumer: `bewks` imports `runBackupJob` and
+calls it in-process from a Next.js API route
+(`src/controllers/admin.controller.ts`). `Atomics.wait` blocks the **entire
+Node event loop**, not just the calling logical thread — an admin-triggered
+backup with S3 configured would have frozen the whole server (every request,
+every health check) for the duration of the upload. That design shipped
+without ever landing in a release and is fully replaced below; nothing above
+describes what actually ships.
+
+- **Two backup-job entry points, split by whether S3 can block anything:**
+  - **`runBackupJobAsync(options)`** (new) — `await` it. Supports `remote`
+    (rclone), `s3` (native AWS S3/R2), and local-only (`skipRemote`) backups.
+    The S3 upload runs on the real, `await`ed `fetch` — no worker thread, no
+    `Atomics.wait`, nothing in the call chain can block the event loop. This
+    is the correct entry point for any in-process/library caller (e.g.
+    bewks's admin route) and is what the CLI now awaits internally for every
+    `backup` invocation.
+  - **`runBackupJob(options)`** (unchanged for its existing use cases) —
+    synchronous. Supports `remote` (rclone) and local-only (`skipRemote`)
+    backups exactly as every current consumer (bewks in-process, and
+    cairn/savoro/mizen via CLI) already uses it — zero breakage. **It now
+    THROWS if `s3` is configured**, naming `runBackupJobAsync` and the CLI as
+    the alternatives, rather than either blocking the event loop or silently
+    falling back to some other behavior.
+- **`src/sync-fetch.js` (the worker-thread/`Atomics.wait` bridge) is deleted.**
+  There is exactly one S3 HTTP call chain left (`s3-remote.js`), and it is
+  fully async top to bottom; no code path in this package can block the event
+  loop on a network call.
+- **`--s3-bucket <name>`** (and `s3: { bucket }` programmatically) configures
+  a second, independent remote type alongside `--remote` (rclone) — the two
+  are mutually exclusive (configuring both is a hard error, CLI and both job
+  functions). `--s3-prefix`, `--s3-endpoint` (omit for AWS, set to e.g.
+  `https://<account>.r2.cloudflarestorage.com` for R2), `--s3-region`
+  (default: `auto` when `--s3-endpoint` is set — R2's own convention —
+  otherwise `us-east-1`), `--s3-timeout <s>` (env: `DB_BACKUP_S3_TIMEOUT_MS`,
+  default 300s) round out the config. `--remote-keep` is shared between both
+  remote types.
+- **Credentials come from the environment ONLY**: `AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY` (or the `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`
+  aliases). There is no CLI flag or config field for a secret — a flag would
+  leak into `ps` output and shell history. Absent credentials fail with a
+  message naming the exact env vars, and no error message (S3 error response,
+  network failure) ever contains the access key or secret key.
+- **Signing:** AWS Signature Version 4, implemented with `node:crypto` — no
+  new runtime dependency, matching the zero-dep standard this package already
+  holds itself to (still just `dotenv`). The payload hash is a real SHA-256 of
+  the file (not `UNSIGNED-PAYLOAD`) since the file is already being read for
+  the upload.
+- **Fail-closed, same invariant as the rclone remote:** `uploadBackupToS3`
+  (now `async`) PUTs the object, then HEADs it and compares Content-Length
+  (and, for a single-part PUT, the ETag against the file's MD5) before
+  resolving. A mismatch, a non-2xx response, or missing credentials all
+  THROW/reject — nothing is pruned and no `--stamp-file` is written on an
+  unverified upload.
+- **Upload is a buffered single-part PUT** — the whole file is read into
+  memory and sent as one request. Appropriate for SQLite/`pg_dump`-sized
+  backups, not arbitrarily large ones. S3 itself caps a single-part PUT at
+  5 GiB (`S3_SINGLE_PART_LIMIT_BYTES`); above that, `uploadBackupToS3` throws
+  *before* reading the file rather than attempting an upload S3 would reject.
+  Multipart upload is not implemented (out of scope — a materially larger,
+  stateful protocol).
+- **Remote retention**: `pruneS3Backups` (now `async`) lists the bucket/prefix
+  (paginated `list-type=2`) and deletes the oldest objects beyond
+  `--remote-keep` (default 30), same best-effort semantics as
+  `pruneRemoteBackups` — a listing/delete failure warns rather than fails the
+  run, and the object just uploaded and verified is never a deletion
+  candidate.
+- **The v0.15.0 no-remote fail-closed guard recognizes S3**: a backup with
+  `--s3-bucket`/`s3` configured does not abort as "local-only" — the guard
+  checks `remote OR s3`, not `remote` alone. This applies to both job
+  functions.
+- **rclone path is completely unaffected and untouched** — same
+  `uploadBackupToRemote`/`pruneRemoteBackups`, same behavior, in both
+  `runBackupJob` and `runBackupJobAsync`.
+- New exports: `runBackupJobAsync`, `uploadBackupToS3` (now async),
+  `verifyS3Object` (now async), `pruneS3Backups` (now async), `signS3Request`,
+  `resolveS3Credentials`, `S3_SINGLE_PART_LIMIT_BYTES`, `DEFAULT_S3_KEEP`,
+  `DEFAULT_S3_TIMEOUT_MS`.
+- `runCli` is now `async` (`Promise<void>`); the CLI bin entry (`src/cli.js`)
+  awaits it. Every other command (`list`, `prune`, `cron`, `restore`,
+  `freshness`) behaves exactly as before — only `backup`'s upload step is
+  actually asynchronous.
+
 ## 0.15.0
 
 **Data-loss fix — `backup` with no offsite remote configured and no explicit
