@@ -54,10 +54,30 @@ export interface BackupRemote {
   configFile?: string;
 }
 
+/** Native S3-compatible off-host remote (AWS S3 or Cloudflare R2 — R2 speaks
+ * the S3 API). AWS Signature V4, signed with node:crypto, sent over `fetch` —
+ * no rclone binary required. Mutually exclusive with `remote` (rclone). */
+export interface BackupS3Remote {
+  bucket: string;
+  /** Key prefix under the bucket. Default: none (objects at the bucket root). */
+  prefix?: string;
+  /** S3-compatible endpoint override, e.g. Cloudflare R2:
+   * `https://<account>.r2.cloudflarestorage.com`. Omit for AWS S3. */
+  endpoint?: string;
+  /** SigV4 signing region. Default: `auto` when `endpoint` is set (R2's own
+   * convention), otherwise `us-east-1`. */
+  region?: string;
+  /** Remote objects to retain. Default 30, never fewer than 1. */
+  keep?: number;
+}
+
 export interface BackupUploadResult {
   target: string;
-  /** Verified byte count; null when `verify: false`. */
+  /** Verified byte count; null when `verify: false` (rclone remote only —
+   * the S3 remote always verifies). */
   sizeBytes: number | null;
+  /** S3 remote only: the verified object's ETag (unquoted). */
+  etag?: string | null;
 }
 
 export interface BackupFreshness {
@@ -111,8 +131,15 @@ export interface BackupOptions {
    * freshness monitor can tell a silent cron failure from a healthy one. */
   stampFile?: string | null;
   /** Replicate off-host via rclone and verify the uploaded object. Nothing is
-   * pruned and no success is stamped until verification passes. */
+   * pruned and no success is stamped until verification passes. Mutually
+   * exclusive with `s3`. */
   remote?: BackupRemote | null;
+  /** Replicate off-host to S3 (AWS or R2, native SigV4 — no rclone) and
+   * verify the uploaded object the same way `remote` does. Mutually
+   * exclusive with `remote`. Credentials come from the environment only
+   * (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or the `S3_*` aliases) —
+   * there is no credential field here on purpose. */
+  s3?: BackupS3Remote | null;
   /** Local-only run: skip the upload and the remote prune. */
   skipRemote?: boolean;
   /** Filename prefix. Defaults to `sqlite-backup` / `postgres-backup`. Set this
@@ -133,6 +160,23 @@ export interface BackupOptions {
   };
 }
 
+/** The response shape `fetchImpl` must (eventually) produce. The S3 remote's
+ * whole call chain is async (see s3-remote.js) and always `await`s this, so a
+ * `fetchImpl` may return either the value directly or a `Promise` of it —
+ * production's default is the real, async `fetch`; tests may inject either a
+ * synchronous mock or an async one. */
+export interface S3FetchResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+export type S3FetchImpl = (
+  url: string,
+  options: { method: string; headers: Record<string, string>; body?: Buffer },
+  timeoutMs: number,
+) => S3FetchResponse | Promise<S3FetchResponse>;
+
 /** The injectable runtime. Every field is optional; `normalizeRuntime` fills the
  * gaps and returns a `ResolvedBackupRuntime`. */
 export interface BackupRuntime {
@@ -144,6 +188,16 @@ export interface BackupRuntime {
   /** Process timeout applied to every external command. Overrides
    * `DB_BACKUP_COMMAND_TIMEOUT_MS`; defaults to `DEFAULT_COMMAND_TIMEOUT_MS`. */
   commandTimeoutMs?: number | string | null;
+  /** Where S3 credentials and `DB_BACKUP_S3_TIMEOUT_MS` are read from. Default
+   * `process.env`; override to test credential resolution without mutating
+   * the real environment. */
+  env?: NodeJS.ProcessEnv;
+  /** The S3 remote's injectable HTTP layer. Default: the real, async global
+   * `fetch`. Tests inject a mock here so no test ever touches the network. */
+  fetchImpl?: S3FetchImpl | null;
+  /** Bound every S3 HTTP request (PUT/HEAD/GET/DELETE). Overrides
+   * `DB_BACKUP_S3_TIMEOUT_MS`; defaults to `DEFAULT_S3_TIMEOUT_MS`. */
+  s3TimeoutMs?: number | string | null;
 }
 
 /** A fully-resolved runtime: every command it runs is bounded by a timeout. */
@@ -154,6 +208,9 @@ export interface ResolvedBackupRuntime {
   now: () => Date;
   randomId: () => string;
   commandTimeoutMs: number;
+  env: NodeJS.ProcessEnv;
+  fetchImpl: S3FetchImpl | null;
+  s3TimeoutMs: number | string | null;
 }
 
 export interface BackupPlan {
@@ -196,8 +253,8 @@ export interface PruneJobResult {
 /** A hook run around a live SQLite restore: either a synchronous function
  * (called directly) or a shell command string (run via `sh -lc`, bounded by
  * the same command timeout as every other external command this package
- * runs). Deliberately synchronous-only — the whole call chain from
- * `restoreBackup` down through `runCli` is synchronous. */
+ * runs). Deliberately synchronous-only — `restoreBackup` itself is
+ * synchronous (it never touches S3; only a backup job's upload step can). */
 export type WriterHook = (() => void) | string;
 
 export interface RestoreOptions extends BackupOptions {
@@ -305,8 +362,18 @@ export function parseBackupFileName(
 
 export function planRetention(backups: BackupEntry[], policy?: RetentionPolicy, now?: Date): BackupPlan;
 export function restoreBackup(options?: RestoreOptions): RestoreResult;
+/** Synchronous backup job. Supports `remote` (rclone) and local-only
+ * (`skipRemote`) backups. THROWS if `s3` is configured — uploading it would
+ * block the event loop for the whole upload. Use `runBackupJobAsync` (or the
+ * CLI) for an S3/R2 remote. */
 export function runBackupJob(options?: BackupOptions): BackupJobResult;
-export function runCli(argv?: string[]): void;
+/** Async backup job. Supports everything `runBackupJob` supports plus a
+ * native S3/R2 remote (`s3`), uploaded over the real async `fetch` — no
+ * worker thread, no event-loop block. This is the correct entry point for
+ * any in-process/library caller (e.g. a Next.js API route) that may have an
+ * S3 remote configured; the CLI awaits this for every `backup` run. */
+export function runBackupJobAsync(options?: BackupOptions): Promise<BackupJobResult>;
+export function runCli(argv?: string[]): Promise<void>;
 
 /** Default process timeout applied to every external command (10 minutes). */
 export const DEFAULT_COMMAND_TIMEOUT_MS: number;
@@ -355,6 +422,80 @@ export function pruneRemoteBackups(
   protectFileName: string,
   runtime: ResolvedBackupRuntime,
 ): string[];
+
+// ---------------------------------------------------------------------------
+// Native S3-compatible remote (AWS S3 + Cloudflare R2). See BackupS3Remote.
+// ---------------------------------------------------------------------------
+
+/** Default remote objects retained under an S3 remote (30, mirrors
+ * `DEFAULT_REMOTE_KEEP` for rclone). */
+export const DEFAULT_S3_KEEP: number;
+
+/** Default bound on every S3 HTTP request: 5 minutes. */
+export const DEFAULT_S3_TIMEOUT_MS: number;
+
+/** S3's own single-part PUT ceiling (5 GiB). `uploadBackupToS3` throws before
+ * reading the file if it exceeds this — this package does not implement
+ * multipart upload. */
+export const S3_SINGLE_PART_LIMIT_BYTES: number;
+
+/** Resolve S3 credentials from the environment: `AWS_ACCESS_KEY_ID` /
+ * `AWS_SECRET_ACCESS_KEY`, or the `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`
+ * aliases. Never accepts a CLI flag. Throws a message naming the env vars
+ * when absent. */
+export function resolveS3Credentials(
+  env?: NodeJS.ProcessEnv,
+): { accessKeyId: string; secretAccessKey: string };
+
+/** The AWS Signature Version 4 primitive. `service` defaults to `s3` — every
+ * production caller in this package uses that default; it is only a
+ * parameter so the algorithm can be exercised against AWS's published
+ * "get-vanilla" (service: "service") test vector. */
+export function signS3Request(options: {
+  method: string;
+  host: string;
+  canonicalPath: string;
+  query?: Record<string, string>;
+  payloadHash: string;
+  region: string;
+  service?: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  date?: Date;
+}): { amzDate: string; authorization: string; signedHeaders: string; canonicalRequest: string; stringToSign: string };
+
+/** Buffered PUT of `entry.fullPath` to the S3 remote, then HEAD-verify it
+ * (size, and ETag for a single-part upload) before resolving. Async — no
+ * worker thread, no event-loop block; uses the real `fetch`. Rejects — never
+ * resolves as success — if credentials are absent, the file exceeds
+ * `S3_SINGLE_PART_LIMIT_BYTES`, the PUT is not 2xx, or verification fails. */
+export function uploadBackupToS3(
+  entry: BackupEntry,
+  s3: BackupS3Remote,
+  runtime: ResolvedBackupRuntime,
+): Promise<BackupUploadResult>;
+
+/** Re-read an already-uploaded object and compare it to `entry`. Async.
+ * Exposed for direct use (e.g. verifying a backup uploaded out of band);
+ * `uploadBackupToS3` calls this itself after every PUT. */
+export function verifyS3Object(
+  entry: BackupEntry,
+  s3: BackupS3Remote,
+  runtime: ResolvedBackupRuntime,
+  expectedMd5Hex?: string,
+): Promise<BackupUploadResult>;
+
+/** Best-effort S3 retention: keep the newest `s3.keep` objects under the
+ * bucket/prefix, protecting `protectFileName` (the object just uploaded and
+ * verified). Async. A listing or delete failure is a cleanup miss (warns),
+ * never a data-safety issue — mirrors `pruneRemoteBackups`. */
+export function pruneS3Backups(
+  s3: BackupS3Remote,
+  protectFileName: string,
+  runtime: ResolvedBackupRuntime,
+  namePrefix?: string | null,
+  parseBackupFileNameFn?: typeof parseBackupFileName,
+): Promise<string[]>;
 
 export function checkBackupFreshness(options: {
   stampFile: string;

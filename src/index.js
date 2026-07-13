@@ -17,6 +17,16 @@ const {
   readBackupManifest,
   appendBackupManifestEntry,
 } = require('./storage');
+const {
+  resolveS3Credentials,
+  signS3Request,
+  uploadBackupToS3,
+  verifyS3Object,
+  pruneS3Backups,
+  S3_SINGLE_PART_LIMIT_BYTES,
+  DEFAULT_S3_KEEP,
+  DEFAULT_S3_TIMEOUT_MS,
+} = require('./s3-remote');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -103,6 +113,11 @@ function parseArgs(argv) {
     remoteTarget: null,
     remoteKeep: null,
     rcloneConfig: null,
+    s3Bucket: null,
+    s3Prefix: null,
+    s3Endpoint: null,
+    s3Region: null,
+    s3TimeoutMs: null,
     skipRemote: false,
     cronCommand: null,
     logPath: null,
@@ -289,6 +304,46 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--s3-bucket') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --s3-bucket');
+      options.s3Bucket = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--s3-prefix') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --s3-prefix');
+      options.s3Prefix = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--s3-endpoint') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --s3-endpoint');
+      options.s3Endpoint = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--s3-region') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --s3-region');
+      options.s3Region = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--s3-timeout') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null || value < 1) throw new Error('--s3-timeout must be an integer >= 1 (seconds)');
+      options.s3TimeoutMs = value * 1000;
+      index += 1;
+      continue;
+    }
+
     if (arg === '--skip-remote') {
       options.skipRemote = true;
       continue;
@@ -421,6 +476,12 @@ function parseArgs(argv) {
     throw new Error(`Unknown argument: ${arg}`);
   }
 
+  if (options.remoteTarget && options.s3Bucket) {
+    throw new Error(
+      '--remote (rclone) and --s3-bucket (native S3/R2) are mutually exclusive; configure only one off-host remote.',
+    );
+  }
+
   return options;
 }
 
@@ -503,6 +564,14 @@ function normalizeRuntime(runtime = {}) {
     now: runtime.now || (() => new Date()),
     randomId: runtime.randomId || (() => `${Date.now()}-${Math.random().toString(16).slice(2)}`),
     commandTimeoutMs,
+    // S3 remote seam: env is where S3 credentials are resolved from (never a
+    // CLI flag — see resolveS3Credentials); fetchImpl is the injectable HTTP
+    // layer tests use to avoid ever touching the network (defaults to the
+    // real, async `fetch` in s3-remote.js — see runBackupJobAsync). The sync
+    // `runBackupJob` never reaches this seam: it refuses an S3 remote outright.
+    env: runtime.env || process.env,
+    fetchImpl: runtime.fetchImpl || null,
+    s3TimeoutMs: runtime.s3TimeoutMs ?? null,
   };
 }
 
@@ -744,6 +813,12 @@ function resolveBackupOptions(options = {}) {
   const stampFile = options.stampFile || null;
   const namePrefix = options.namePrefix || null;
   const remote = options.remote || null;
+  const s3 = options.s3 || null;
+  if (remote && s3) {
+    throw new Error(
+      'remote (rclone) and s3 are mutually exclusive; configure only one off-host remote type.',
+    );
+  }
   const skipRemote = options.skipRemote === true;
   const policy = options.policy || DEFAULT_RETENTION_POLICY;
   const runtime = normalizeRuntime(options.runtime || options._runtime);
@@ -773,6 +848,7 @@ function resolveBackupOptions(options = {}) {
     stampFile,
     namePrefix,
     remote,
+    s3,
     skipRemote,
     policy,
     databaseUrl,
@@ -1917,20 +1993,24 @@ const LOCK_FILENAME = '.db-backup.lock';
 // - In `finally`, only remove the lock file if its token still matches ours —
 //   a run that stole our (stale) lock after us owns it now, and must not have
 //   its lock deleted out from under it.
-function withBackupLock(outputDir, runtime, fn, { staleMs = 30 * 60 * 1000 } = {}) {
+function readLockFile(lockPath) {
+  try {
+    return JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// Shared by withBackupLock (sync) and withBackupLockAsync (async): acquires
+// the lock file and returns { lockPath, token }, or throws. All the file-level
+// mechanics (O_EXCL acquire, stale-lock steal, corrupt-leftover recovery) live
+// here exactly once; the two wrappers differ only in whether `fn` is awaited.
+function acquireBackupLock(outputDir, runtime, { staleMs = 30 * 60 * 1000 } = {}) {
   const lockPath = path.join(outputDir, LOCK_FILENAME);
   const token = runtime.randomId();
 
   const lockedError = () =>
     new Error(`Another db-backup run holds the lock (${lockPath}, pid ${process.pid}).`);
-
-  function readLockFile() {
-    try {
-      return JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-    } catch {
-      return null;
-    }
-  }
 
   let fd;
   try {
@@ -1940,7 +2020,7 @@ function withBackupLock(outputDir, runtime, fn, { staleMs = 30 * 60 * 1000 } = {
       throw error;
     }
 
-    const existing = readLockFile();
+    const existing = readLockFile(lockPath);
     const age = existing ? runtime.now().getTime() - Date.parse(existing.at) : NaN;
 
     if (!(Number.isFinite(age) && age <= staleMs)) {
@@ -1949,7 +2029,7 @@ function withBackupLock(outputDir, runtime, fn, { staleMs = 30 * 60 * 1000 } = {
       // and writeFileSync — otherwise an unparsable lock would deadlock every
       // future run forever. (Best-effort advisory lock on a single host: a rare
       // concurrent run is tolerated by unique filenames + idempotent prune.)
-      const reread = readLockFile();
+      const reread = readLockFile(lockPath);
       const sameStaleOwner = existing && reread && reread.token === existing.token;
       const corruptLeftover = !existing && !reread;
       if (sameStaleOwner || corruptLeftover) {
@@ -1972,13 +2052,35 @@ function withBackupLock(outputDir, runtime, fn, { staleMs = 30 * 60 * 1000 } = {
   fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: runtime.now().toISOString(), token }));
   fs.closeSync(fd);
 
+  return { lockPath, token };
+}
+
+function releaseBackupLock(lockPath, token) {
+  const current = readLockFile(lockPath);
+  if (current && current.token === token) {
+    fs.rmSync(lockPath, { force: true });
+  }
+}
+
+function withBackupLock(outputDir, runtime, fn, options = {}) {
+  const { lockPath, token } = acquireBackupLock(outputDir, runtime, options);
   try {
     return fn();
   } finally {
-    const current = readLockFile();
-    if (current && current.token === token) {
-      fs.rmSync(lockPath, { force: true });
-    }
+    releaseBackupLock(lockPath, token);
+  }
+}
+
+// Async twin of withBackupLock: awaits `fn` (which performs the S3 upload)
+// before releasing the lock in `finally`, so the lock is held for the whole
+// async operation rather than being dropped the instant fn() returns its
+// (still-pending) promise.
+async function withBackupLockAsync(outputDir, runtime, fn, options = {}) {
+  const { lockPath, token } = acquireBackupLock(outputDir, runtime, options);
+  try {
+    return await fn();
+  } finally {
+    releaseBackupLock(lockPath, token);
   }
 }
 
@@ -2274,26 +2376,106 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
   }
 }
 
+// Fail closed on a silent same-disk-only "backup". A backup that lives only
+// on the disk that holds the database is not a backup — one disk failure
+// loses both copies. This must be a DELIBERATE choice, so the caller has to
+// either configure offsite replication or explicitly opt in to the risk.
+// No file is created and nothing is left implying success. See rouge's
+// deploy/backup-rouge-db.sh (ROG-1138): a hand-rolled wrapper already learned
+// this the hard way — "no offsite" produced nine silent nights of local-only
+// backups before anyone noticed.
+// A remote is configured whether it's the rclone target OR the native S3
+// (AWS/R2) config — either satisfies the "not local-only" requirement. Shared
+// by runBackupJob and runBackupJobAsync so the guard can't drift between them.
+function assertOffsiteRemoteConfigured(resolved) {
+  const hasRemote = Boolean(resolved.remote) || Boolean(resolved.s3);
+  const localOnly = resolved.skipRemote === true && !hasRemote;
+  if (!hasRemote && !resolved.skipRemote) {
+    throw new Error(
+      'Refusing to create a local-only backup: no --remote/--s3-bucket is configured and ' +
+      '--skip-remote was not passed. A backup on the same disk as the database is not a ' +
+      'backup — a single disk failure destroys both. Configure --remote <dest> (offsite ' +
+      'replication via rclone) or --s3-bucket <bucket> (native AWS S3 / Cloudflare R2), or ' +
+      'pass --skip-remote (skipRemote: true) to explicitly accept the same-disk risk.',
+    );
+  }
+  return { hasRemote, localOnly };
+}
+
+// Shared bottom half of a backup run, once the (already-uploaded-and-verified,
+// or intentionally skipped) remote copy is known: local retention, manifest,
+// and the success stamp. Entirely synchronous — no network I/O here — so both
+// runBackupJob and runBackupJobAsync call it the same way.
+function finalizeBackupResult(resolved, created, now, uploaded, removedRemote, localOnly) {
+  const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
+  const plan = planRetention(backups, resolved.policy, now);
+
+  // NEVER prune the backup we just created and verified, whatever the plan
+  // says. A host whose clock jumped backward at boot gives the new file an
+  // older timestamp than existing ones, and a retention policy that trusts the
+  // ordering would then delete the only known-good backup.
+  const doomed = plan.remove.filter((entry) => entry.fileName !== created.fileName);
+  const removed = pruneBackups(doomed);
+
+  // Best-effort: a manifest write failure must never fail the backup itself.
+  // Safety/pre-restore backups (created via createBackup outside this job)
+  // are intentionally NOT manifested — they're transient.
+  try {
+    appendBackupManifestEntry(resolved.outputDir, {
+      name: created.fileName,
+      path: created.fullPath,
+      createdAt: created.createdAt,
+      sizeBytes: created.sizeBytes,
+      engine: created.engine,
+      compressed: created.compressed,
+      sha256: created.sha256,
+    });
+  } catch (error) {
+    console.warn(`[db-backup] Failed to append manifest entry: ${error.message}`);
+  }
+
+  // Stamped only after the backup exists, passed its integrity check, cleared
+  // the size floor, was encrypted if configured, and retention completed. A
+  // failure anywhere above leaves the previous stamp untouched, so a freshness
+  // monitor reads the run as stale rather than silently "successful".
+  if (resolved.stampFile) {
+    writeSuccessStamp(resolved.stampFile, now);
+  }
+
+  return {
+    created,
+    removed,
+    removedRemote,
+    uploaded,
+    kept: plan.keep,
+    mode: resolved.mode,
+    outputDir: resolved.outputDir,
+    policy: resolved.policy,
+    localOnly,
+  };
+}
+
+const S3_SYNC_REFUSAL_MESSAGE =
+  'runBackupJob (the synchronous API) cannot use an S3 remote: uploading it would block the ' +
+  'Node event loop for the entire upload, which is fine for a one-shot CLI process but freezes ' +
+  'an in-process/library host (e.g. every request an app server is handling) for as long as the ' +
+  'upload takes. Use runBackupJobAsync(options) (await it — its S3 upload runs on the normal ' +
+  'async `fetch`, not the event loop) or the `db-backup` CLI, which already awaits it. ' +
+  'runBackupJob remains fully supported for --remote (rclone) and local-only (skipRemote) backups.';
+
+// Synchronous backup job. Supports the rclone remote and local-only
+// (skipRemote) backups exactly as before. Deliberately REFUSES an S3 remote —
+// see S3_SYNC_REFUSAL_MESSAGE — rather than silently blocking the event loop
+// or silently falling back to some other behavior. Use runBackupJobAsync for
+// S3.
 function runBackupJob(options = {}) {
   const resolved = resolveBackupOptions(options);
 
-  // Fail closed on a silent same-disk-only "backup". A backup that lives only
-  // on the disk that holds the database is not a backup — one disk failure
-  // loses both copies. This must be a DELIBERATE choice, so the caller has to
-  // either configure offsite replication or explicitly opt in to the risk.
-  // No file is created and nothing is left implying success. See rouge's
-  // deploy/backup-rouge-db.sh (ROG-1138): a hand-rolled wrapper already learned
-  // this the hard way — "no offsite" produced nine silent nights of local-only
-  // backups before anyone noticed.
-  const localOnly = resolved.skipRemote === true && !resolved.remote;
-  if (!resolved.remote && !resolved.skipRemote) {
-    throw new Error(
-      'Refusing to create a local-only backup: no --remote is configured and --skip-remote ' +
-      'was not passed. A backup on the same disk as the database is not a backup — a single ' +
-      'disk failure destroys both. Configure --remote <dest> (offsite replication via rclone), ' +
-      'or pass --skip-remote (skipRemote: true) to explicitly accept the same-disk risk.',
-    );
+  if (resolved.s3) {
+    throw new Error(S3_SYNC_REFUSAL_MESSAGE);
   }
+
+  const { localOnly } = assertOffsiteRemoteConfigured(resolved);
 
   ensureBackupDir(resolved.outputDir);
 
@@ -2303,8 +2485,8 @@ function runBackupJob(options = {}) {
 
     // Replicate off-host BEFORE anything is pruned or stamped. A local-only
     // backup dies with the disk it sits on; an unverified remote copy is not a
-    // backup. If either the upload or its verification fails we throw here, so
-    // the previous good backups and the previous stamp both survive untouched.
+    // backup. If the upload or its verification fails we throw here, so the
+    // previous good backups and the previous stamp both survive untouched.
     let uploaded = null;
     if (resolved.remote && !resolved.skipRemote) {
       uploaded = uploadBackupToRemote(created, resolved.remote, resolved.runtime);
@@ -2315,16 +2497,6 @@ function runBackupJob(options = {}) {
       );
     }
 
-    const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
-    const plan = planRetention(backups, resolved.policy, now);
-
-    // NEVER prune the backup we just created and verified, whatever the plan
-    // says. A host whose clock jumped backward at boot gives the new file an
-    // older timestamp than existing ones, and a retention policy that trusts the
-    // ordering would then delete the only known-good backup.
-    const doomed = plan.remove.filter((entry) => entry.fileName !== created.fileName);
-    const removed = pruneBackups(doomed);
-
     // Remote retention is best-effort: the new object is verified on both ends,
     // so a stray old copy is a cleanup miss, not a data-safety issue.
     const removedRemote =
@@ -2332,42 +2504,54 @@ function runBackupJob(options = {}) {
         ? pruneRemoteBackups(resolved.remote, created.fileName, resolved.runtime, resolved.namePrefix)
         : [];
 
-    // Best-effort: a manifest write failure must never fail the backup itself.
-    // Safety/pre-restore backups (created via createBackup outside this job)
-    // are intentionally NOT manifested — they're transient.
-    try {
-      appendBackupManifestEntry(resolved.outputDir, {
-        name: created.fileName,
-        path: created.fullPath,
-        createdAt: created.createdAt,
-        sizeBytes: created.sizeBytes,
-        engine: created.engine,
-        compressed: created.compressed,
-        sha256: created.sha256,
-      });
-    } catch (error) {
-      console.warn(`[db-backup] Failed to append manifest entry: ${error.message}`);
+    return finalizeBackupResult(resolved, created, now, uploaded, removedRemote, localOnly);
+  });
+}
+
+// Async backup job — the correct entry point for any in-process/library
+// caller whose S3 remote must not block its event loop (e.g. a Next.js API
+// route). Supports everything runBackupJob supports (rclone, local-only)
+// PLUS a native S3/R2 remote, uploaded via the real async `fetch` (see
+// s3-remote.js) with no worker thread and no Atomics.wait anywhere in the
+// call chain. The CLI awaits this for every `backup` invocation.
+async function runBackupJobAsync(options = {}) {
+  const resolved = resolveBackupOptions(options);
+
+  const { localOnly } = assertOffsiteRemoteConfigured(resolved);
+
+  ensureBackupDir(resolved.outputDir);
+
+  return withBackupLockAsync(resolved.outputDir, resolved.runtime, async () => {
+    const created = createBackup(resolved);
+    const now = resolved.runtime.now();
+
+    // Replicate off-host BEFORE anything is pruned or stamped. A local-only
+    // backup dies with the disk it sits on; an unverified remote copy is not a
+    // backup. If the upload or its verification fails we throw (reject) here,
+    // so the previous good backups and the previous stamp both survive
+    // untouched.
+    let uploaded = null;
+    if (resolved.remote && !resolved.skipRemote) {
+      uploaded = uploadBackupToRemote(created, resolved.remote, resolved.runtime);
+    } else if (resolved.s3 && !resolved.skipRemote) {
+      uploaded = await uploadBackupToS3(created, resolved.s3, resolved.runtime);
+    } else if (localOnly) {
+      console.warn(
+        '[db-backup] WARNING: local-only backup (skipRemote explicitly set, no remote ' +
+        'configured). This backup exists only on the same disk as the database.',
+      );
     }
 
-    // Stamped only after the backup exists, passed its integrity check, cleared
-    // the size floor, was encrypted if configured, and retention completed. A
-    // failure anywhere above leaves the previous stamp untouched, so a freshness
-    // monitor reads the run as stale rather than silently "successful".
-    if (resolved.stampFile) {
-      writeSuccessStamp(resolved.stampFile, now);
-    }
+    // Remote retention is best-effort: the new object is verified on both ends,
+    // so a stray old copy is a cleanup miss, not a data-safety issue.
+    const removedRemote =
+      uploaded && resolved.remote
+        ? pruneRemoteBackups(resolved.remote, created.fileName, resolved.runtime, resolved.namePrefix)
+        : uploaded && resolved.s3
+          ? await pruneS3Backups(resolved.s3, created.fileName, resolved.runtime, resolved.namePrefix, parseBackupFileName)
+          : [];
 
-    return {
-      created,
-      removed,
-      removedRemote,
-      uploaded,
-      kept: plan.keep,
-      mode: resolved.mode,
-      outputDir: resolved.outputDir,
-      policy: resolved.policy,
-      localOnly,
-    };
+    return finalizeBackupResult(resolved, created, now, uploaded, removedRemote, localOnly);
   });
 }
 
@@ -2433,8 +2617,17 @@ Options:
   --stamp-file <path>     Write .last-success only after a fully successful run
   --max-age-hours <n>     Freshness threshold (command: freshness, default 36)
   --remote <dest>         Upload off-host via rclone and verify (e.g. remote:path)
-  --remote-keep <n>       Remote backups to retain (default 30)
+  --remote-keep <n>       Remote backups to retain (default 30; applies to --remote or --s3-bucket)
   --rclone-config <path>  RCLONE_CONFIG for the upload (and remote freshness check)
+  --s3-bucket <name>      Upload off-host to S3/R2 natively (SigV4, no rclone) and verify.
+                          Mutually exclusive with --remote. Credentials come from the
+                          environment ONLY: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or
+                          S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY) — never a flag.
+  --s3-prefix <path>      Key prefix under the bucket (default: none)
+  --s3-endpoint <url>     S3-compatible endpoint, e.g. Cloudflare R2:
+                          https://<account>.r2.cloudflarestorage.com (default: AWS S3)
+  --s3-region <region>    Signing region (default: auto for R2/--s3-endpoint, us-east-1 for AWS)
+  --s3-timeout <s>        Bound every S3 HTTP request (env: DB_BACKUP_S3_TIMEOUT_MS, default 300)
   --skip-remote           Local-only run: no upload, no remote prune
   --notify-discord <url>  freshness: POST an alert to a Discord webhook on failure
   --notify-webhook <url>  freshness: POST {"text":...} to a webhook on failure
@@ -2461,7 +2654,11 @@ Options:
 `);
 }
 
-function runCli(argv = process.argv.slice(2)) {
+// Async: a CLI is a batch process, so it can freely await the S3-capable
+// runBackupJobAsync at the top level. cli.js (the bin entry) awaits this
+// promise and reports a rejection the same way it used to report a thrown
+// error.
+async function runCli(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
 
   if (options.command === 'help') {
@@ -2587,8 +2784,17 @@ function runCli(argv = process.argv.slice(2)) {
           ...(options.rcloneConfig ? { configFile: options.rcloneConfig } : {}),
         }
       : null,
+    s3: options.s3Bucket
+      ? {
+          bucket: options.s3Bucket,
+          ...(options.s3Prefix ? { prefix: options.s3Prefix } : {}),
+          ...(options.s3Endpoint ? { endpoint: options.s3Endpoint } : {}),
+          ...(options.s3Region ? { region: options.s3Region } : {}),
+          ...(options.remoteKeep ? { keep: options.remoteKeep } : {}),
+        }
+      : null,
     skipRemote: options.skipRemote,
-    runtime: { commandTimeoutMs: options.commandTimeoutMs },
+    runtime: { commandTimeoutMs: options.commandTimeoutMs, s3TimeoutMs: options.s3TimeoutMs },
     policy: resolveRetentionPolicy({
       maxBackups: options.maxBackups,
       dailySlots: options.dailySlots,
@@ -2666,7 +2872,7 @@ function runCli(argv = process.argv.slice(2)) {
 
   let result;
   try {
-    result = runBackupJob(baseOptions);
+    result = await runBackupJobAsync(baseOptions);
   } catch (error) {
     // On a fresh install the database file may not exist yet; --allow-missing
     // lets a scheduled/deploy backup no-op instead of failing the whole run.
@@ -2715,6 +2921,7 @@ module.exports = {
   planRetention,
   restoreBackup,
   runBackupJob,
+  runBackupJobAsync,
   runCli,
   // SQLite engine primitives. The job API above owns env resolution,
   // filenames, the manifest and retention; a consumer that needs its own naming,
@@ -2740,6 +2947,16 @@ module.exports = {
   uploadBackupToRemote,
   pruneRemoteBackups,
   DEFAULT_CIPHER_ALGO,
+  // Native S3-compatible remote (AWS S3 + Cloudflare R2). rclone-free: AWS
+  // SigV4 signed with node:crypto, sent over fetch. See s3-remote.js.
+  resolveS3Credentials,
+  signS3Request,
+  uploadBackupToS3,
+  verifyS3Object,
+  pruneS3Backups,
+  S3_SINGLE_PART_LIMIT_BYTES,
+  DEFAULT_S3_KEEP,
+  DEFAULT_S3_TIMEOUT_MS,
   // Backup-storage helpers:
   MANIFEST_FILENAME,
   expandHome,

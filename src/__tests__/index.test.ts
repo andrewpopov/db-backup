@@ -16,6 +16,7 @@ const {
   planRetention,
   restoreBackup,
   runBackupJob,
+  runBackupJobAsync,
   runCli,
   readBackupManifest,
   appendBackupManifestEntry,
@@ -30,6 +31,9 @@ const {
   DEFAULT_COMMAND_TIMEOUT_MS,
   restoreSqliteBackup,
   detectSqliteQuiescence,
+  signS3Request,
+  uploadBackupToS3,
+  pruneS3Backups,
 } = require('../index.js') as typeof import('../index');
 
 const fixedNow = new Date('2026-07-05T15:00:00.000Z');
@@ -211,7 +215,7 @@ describe('@andrewpopov/db-backup', () => {
     expect(fs.existsSync(outputDir) ? fs.readdirSync(outputDir) : []).toEqual([]);
   });
 
-  it('skips the backup when the database is missing and --allow-missing is set', () => {
+  it('skips the backup when the database is missing and --allow-missing is set', async () => {
     const outputDir = makeTempDir();
     const logs: string[] = [];
     const originalLog = console.log;
@@ -223,7 +227,7 @@ describe('@andrewpopov/db-backup', () => {
     try {
       process.env.DATABASE_URL = 'file:./does-not-exist-δ.db';
       process.env.NODE_ENV = 'development';
-      expect(() => runCli(['backup', '--allow-missing', '--skip-remote', '--output-dir', outputDir])).not.toThrow();
+      await runCli(['backup', '--allow-missing', '--skip-remote', '--output-dir', outputDir]);
       expect(logs.some((line) => /skipping backup/.test(line))).toBe(true);
       // Nothing should have been written.
       expect(fs.readdirSync(outputDir)).toEqual([]);
@@ -1188,7 +1192,7 @@ describe('@andrewpopov/db-backup', () => {
     expect(fs.existsSync(outputDir)).toBe(false);
   });
 
-  it('CLI backup with neither --remote nor --skip-remote aborts', () => {
+  it('CLI backup with neither --remote nor --skip-remote aborts', async () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');
     fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
@@ -1199,9 +1203,9 @@ describe('@andrewpopov/db-backup', () => {
       process.chdir(cwd);
       process.env.DATABASE_URL = 'file:./app.db';
       process.env.NODE_ENV = 'development';
-      expect(() =>
+      await expect(
         runCli(['backup', '--output-dir', outputDir, '--allow-unsafe-copy']),
-      ).toThrow(/Refusing to create a local-only backup/);
+      ).rejects.toThrow(/Refusing to create a local-only backup/);
       expect(fs.existsSync(outputDir)).toBe(false);
     } finally {
       process.chdir(originalCwd);
@@ -1261,7 +1265,7 @@ describe('@andrewpopov/db-backup', () => {
     expect(warnings.some((w) => /local-only backup/i.test(w))).toBe(true);
   });
 
-  it('CLI --skip-remote with no --remote succeeds', () => {
+  it('CLI --skip-remote with no --remote succeeds', async () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');
     // A real (if minimal) SQLite file — this exercises the actual sqlite3
@@ -1274,9 +1278,7 @@ describe('@andrewpopov/db-backup', () => {
       process.chdir(cwd);
       process.env.DATABASE_URL = 'file:./app.db';
       process.env.NODE_ENV = 'development';
-      expect(() =>
-        runCli(['backup', '--output-dir', outputDir, '--allow-unsafe-copy', '--skip-remote']),
-      ).not.toThrow();
+      await runCli(['backup', '--output-dir', outputDir, '--allow-unsafe-copy', '--skip-remote']);
       expect(fs.readdirSync(outputDir).some((f) => f.startsWith('sqlite-backup-'))).toBe(true);
     } finally {
       process.chdir(originalCwd);
@@ -1457,6 +1459,354 @@ describe('@andrewpopov/db-backup', () => {
     expect(deleted.some((d) => d.includes('smarthome-2026010'))).toBe(true);
   });
 
+  // ---------------------------------------------------------------------------
+  // Native S3-compatible remote (AWS S3 + Cloudflare R2). No test here ever
+  // touches the network: `runtime.fetchImpl` is always a synchronous mock —
+  // see makeFakeS3. The S3 call chain (s3Request and everything built on it)
+  // is async, so these tests await it; `await` on a synchronous mock's return
+  // value resolves immediately, so the mock itself needn't change shape.
+  // ---------------------------------------------------------------------------
+  function makeFakeS3(options: { objects?: Map<string, Buffer>; onRequest?: (url: string, opts: any) => void } = {}) {
+    const objects = options.objects || new Map<string, Buffer>();
+    const fetchImpl = (url: string, opts: { method: string; headers: Record<string, string>; body?: Buffer }) => {
+      options.onRequest?.(url, opts);
+      const parsed = new URL(url);
+      const key = decodeURIComponent(parsed.pathname.replace(/^\/[^/]+\//, ''));
+
+      if (opts.method === 'PUT') {
+        const body = Buffer.from(opts.body || Buffer.alloc(0));
+        objects.set(key, body);
+        const md5 = crypto.createHash('md5').update(body).digest('hex');
+        return { status: 200, headers: { etag: `"${md5}"` }, body: Buffer.alloc(0) };
+      }
+      if (opts.method === 'HEAD') {
+        const obj = objects.get(key);
+        if (!obj) return { status: 404, headers: {}, body: Buffer.alloc(0) };
+        const md5 = crypto.createHash('md5').update(obj).digest('hex');
+        return { status: 200, headers: { 'content-length': String(obj.length), etag: `"${md5}"` }, body: Buffer.alloc(0) };
+      }
+      if (opts.method === 'DELETE') {
+        objects.delete(key);
+        return { status: 204, headers: {}, body: Buffer.alloc(0) };
+      }
+      if (opts.method === 'GET') {
+        const prefix = parsed.searchParams.get('prefix') || '';
+        const contents = [...objects.keys()]
+          .filter((k) => k.startsWith(prefix))
+          .map((k) => `<Contents><Key>${k}</Key></Contents>`)
+          .join('');
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/xml' },
+          body: Buffer.from(`<?xml version="1.0"?><ListBucketResult><IsTruncated>false</IsTruncated>${contents}</ListBucketResult>`),
+        };
+      }
+      return { status: 400, headers: {}, body: Buffer.from('unhandled method') };
+    };
+    return { objects, fetchImpl };
+  }
+
+  const S3_CREDS_ENV = { AWS_ACCESS_KEY_ID: 'AKIDEXAMPLE', AWS_SECRET_ACCESS_KEY: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' };
+
+  it('SigV4 signing matches an independently-verified known vector', () => {
+    // Fixed key/date/region/payload from AWS's published SigV4 "get-vanilla"
+    // test suite (https://docs.aws.amazon.com/general/latest/gr/sigv4_signing.html):
+    // GET / against host example.amazonaws.com, region us-east-1, date
+    // 2015-08-30T12:36:00Z, empty payload, access key AKIDEXAMPLE / secret
+    // wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY. `service` is left as the
+    // AWS test suite's generic "service" (a parameter that exists on
+    // signS3Request only so this vector can be exercised — every production
+    // caller in this package signs with "s3"). Because this package always
+    // signs `x-amz-content-sha256` (required for S3, absent from the generic
+    // AWS vector), the expected signature below is not the published one
+    // verbatim — it is the same inputs run through the published algorithm
+    // with that one additional signed header, independently re-derived via
+    // `openssl dgst -sha256 -mac HMAC` outside this test (both the canonical
+    // request's SHA-256 and the final HMAC chain) before being pinned here.
+    const emptyPayloadHash = crypto.createHash('sha256').update('').digest('hex');
+    const result = signS3Request({
+      method: 'GET',
+      host: 'example.amazonaws.com',
+      canonicalPath: '/',
+      query: {},
+      payloadHash: emptyPayloadHash,
+      region: 'us-east-1',
+      service: 'service',
+      accessKeyId: 'AKIDEXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+      date: new Date('2015-08-30T12:36:00Z'),
+    });
+
+    expect(result.canonicalRequest).toBe(
+      [
+        'GET',
+        '/',
+        '',
+        'host:example.amazonaws.com',
+        `x-amz-content-sha256:${emptyPayloadHash}`,
+        'x-amz-date:20150830T123600Z',
+        '',
+        'host;x-amz-content-sha256;x-amz-date',
+        emptyPayloadHash,
+      ].join('\n'),
+    );
+    expect(result.stringToSign).toBe(
+      [
+        'AWS4-HMAC-SHA256',
+        '20150830T123600Z',
+        '20150830/us-east-1/service/aws4_request',
+        'bd2af82b09d2569ab8594ef6bcc1638c8675cb753915d0f401b2f40ecde6f823',
+      ].join('\n'),
+    );
+    expect(result.authorization).toBe(
+      'AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, ' +
+        'SignedHeaders=host;x-amz-content-sha256;x-amz-date, ' +
+        'Signature=b0e9826b8e27230263689c913533611258ba50a1cf46f2c0ae5eea5c777359c2',
+    );
+  });
+
+  it('uploads to S3 and verifies (size + ETag) before returning', async () => {
+    const cwd = makeTempDir();
+    const filePath = path.join(cwd, 'sqlite-backup-20260705-150000Z.db.gz');
+    fs.writeFileSync(filePath, 'sqlite backup payload bytes');
+    const { fetchImpl } = makeFakeS3();
+
+    const result = await uploadBackupToS3(
+      { fileName: path.basename(filePath), fullPath: filePath } as never,
+      { bucket: 'mybucket', prefix: 'app', endpoint: 'https://abc123.r2.cloudflarestorage.com' } as never,
+      normalizeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+    );
+
+    expect(result.target).toBe(`s3://mybucket/app/${path.basename(filePath)}`);
+    expect(result.sizeBytes).toBe(fs.statSync(filePath).size);
+    expect(result.etag).toBe(crypto.createHash('md5').update(fs.readFileSync(filePath)).digest('hex'));
+  });
+
+  it('a HEAD size mismatch after upload THROWS — never reports success (fail-closed)', async () => {
+    const cwd = makeTempDir();
+    const filePath = path.join(cwd, 'sqlite-backup-20260705-150000Z.db.gz');
+    fs.writeFileSync(filePath, 'sqlite backup payload bytes');
+
+    // A HEAD that lies about the object's size — simulates a corrupted or
+    // partial upload the provider nonetheless reports as present.
+    const fetchImpl = (_url: string, opts: { method: string }) => {
+      if (opts.method === 'PUT') return { status: 200, headers: {}, body: Buffer.alloc(0) };
+      if (opts.method === 'HEAD') return { status: 200, headers: { 'content-length': '3' }, body: Buffer.alloc(0) };
+      return { status: 400, headers: {}, body: Buffer.alloc(0) };
+    };
+
+    await expect(
+      uploadBackupToS3(
+        { fileName: path.basename(filePath), fullPath: filePath } as never,
+        { bucket: 'mybucket' } as never,
+        normalizeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+      ),
+    ).rejects.toThrow(/Remote size mismatch/);
+  });
+
+  it('a non-2xx PUT throws, and the error contains no credentials', async () => {
+    const cwd = makeTempDir();
+    const filePath = path.join(cwd, 'sqlite-backup-20260705-150000Z.db.gz');
+    fs.writeFileSync(filePath, 'payload');
+    const fetchImpl = () => ({ status: 403, headers: {}, body: Buffer.from('AccessDenied') });
+
+    let caught: Error | null = null;
+    try {
+      await uploadBackupToS3(
+        { fileName: path.basename(filePath), fullPath: filePath } as never,
+        { bucket: 'mybucket' } as never,
+        normalizeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+      );
+    } catch (err) {
+      caught = err as Error;
+    }
+
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toMatch(/PUT returned 403/);
+    expect(caught!.message).not.toContain(S3_CREDS_ENV.AWS_SECRET_ACCESS_KEY);
+    expect(caught!.message).not.toContain(S3_CREDS_ENV.AWS_ACCESS_KEY_ID);
+  });
+
+  it('resolves the R2 endpoint override and the AWS default endpoint to the correct hosts', async () => {
+    const cwd = makeTempDir();
+    const filePath = path.join(cwd, 'sqlite-backup-20260705-150000Z.db.gz');
+    fs.writeFileSync(filePath, 'payload');
+
+    const seenHosts: string[] = [];
+    const { fetchImpl } = makeFakeS3({ onRequest: (url) => seenHosts.push(new URL(url).host) });
+
+    await uploadBackupToS3(
+      { fileName: path.basename(filePath), fullPath: filePath } as never,
+      { bucket: 'b', endpoint: 'https://abc123.r2.cloudflarestorage.com' } as never,
+      normalizeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+    );
+    expect(seenHosts.every((h) => h === 'abc123.r2.cloudflarestorage.com')).toBe(true);
+
+    seenHosts.length = 0;
+    await uploadBackupToS3(
+      { fileName: path.basename(filePath), fullPath: filePath } as never,
+      { bucket: 'b' } as never,
+      normalizeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+    );
+    expect(seenHosts.every((h) => h === 's3.us-east-1.amazonaws.com')).toBe(true);
+  });
+
+  it('refuses with a clear error naming the env vars when S3 credentials are absent', async () => {
+    const cwd = makeTempDir();
+    const filePath = path.join(cwd, 'sqlite-backup-20260705-150000Z.db.gz');
+    fs.writeFileSync(filePath, 'payload');
+
+    await expect(
+      uploadBackupToS3(
+        { fileName: path.basename(filePath), fullPath: filePath } as never,
+        { bucket: 'mybucket' } as never,
+        normalizeRuntime({ fetchImpl: makeFakeS3().fetchImpl, env: {} } as never),
+      ),
+    ).rejects.toThrow(/AWS_ACCESS_KEY_ID.*AWS_SECRET_ACCESS_KEY/s);
+  });
+
+  it('the SYNC runBackupJob THROWS when an S3 remote is configured, naming runBackupJobAsync and the CLI, and never attempts an upload', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+    let fetchCalled = false;
+    const fetchImpl = (...args: unknown[]) => {
+      fetchCalled = true;
+      return makeFakeS3().fetchImpl(...(args as [string, never]));
+    };
+
+    expect(() =>
+      runBackupJob({
+        allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+        s3: { bucket: 'mybucket' } as never,
+        runtime: makeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+      }),
+    ).toThrow(/runBackupJobAsync/);
+
+    expect(() =>
+      runBackupJob({
+        allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+        s3: { bucket: 'mybucket' } as never,
+        runtime: makeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+      }),
+    ).toThrow(/db-backup.*CLI|CLI.*db-backup/i);
+
+    // No upload attempt and no output directory created — refused before any
+    // side effect, not a partial/blocked attempt.
+    expect(fetchCalled).toBe(false);
+    expect(fs.existsSync(outputDir)).toBe(false);
+  });
+
+  it('runBackupJobAsync uploads to S3, verifies, and a size mismatch still throws (fail-closed survives the refactor)', async () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+    const { fetchImpl } = makeFakeS3();
+
+    const result = await runBackupJobAsync({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+      s3: { bucket: 'mybucket' } as never,
+      runtime: makeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+    });
+
+    expect(result.localOnly).toBe(false);
+    expect(result.uploaded).not.toBeNull();
+    expect((result.uploaded as any).target).toContain('mybucket');
+
+    // Fail-closed: a HEAD that lies about size must still fail the whole job.
+    const cwd2 = makeTempDir();
+    const outputDir2 = path.join(cwd2, 'backups');
+    fs.writeFileSync(path.join(cwd2, 'app.db'), 'db');
+    const lyingFetch = (_url: string, opts: { method: string }) => {
+      if (opts.method === 'PUT') return { status: 200, headers: {}, body: Buffer.alloc(0) };
+      if (opts.method === 'HEAD') return { status: 200, headers: { 'content-length': '3' }, body: Buffer.alloc(0) };
+      return { status: 400, headers: {}, body: Buffer.alloc(0) };
+    };
+    await expect(
+      runBackupJobAsync({
+        allowUnsafeCopy: true, cwd: cwd2, databaseUrl: 'file:./app.db', outputDir: outputDir2, compressSqlite: false,
+        s3: { bucket: 'mybucket' } as never,
+        runtime: makeRuntime({ fetchImpl: lyingFetch, env: S3_CREDS_ENV } as never),
+      }),
+    ).rejects.toThrow(/Remote size mismatch/);
+  });
+
+  it('--remote and --s3-bucket are mutually exclusive', async () => {
+    await expect(
+      runCli(['backup', '--remote', 'offsite:x', '--s3-bucket', 'mybucket']),
+    ).rejects.toThrow(/mutually exclusive/);
+
+    expect(() =>
+      runBackupJob({ remote: { target: 'offsite:x' }, s3: { bucket: 'mybucket' } as never }),
+    ).toThrow(/mutually exclusive/);
+  });
+
+  it('S3 retention keeps the newest N objects and never deletes the object just uploaded', async () => {
+    const { objects, fetchImpl } = makeFakeS3();
+    const runtime = makeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never);
+    const s3 = { bucket: 'mybucket', keep: 1 } as never;
+
+    const dir = makeTempDir();
+    for (const name of [
+      'sqlite-backup-20260101-000000Z.db',
+      'sqlite-backup-20260102-000000Z.db',
+      'sqlite-backup-20260103-000000Z.db',
+    ]) {
+      const filePath = path.join(dir, name);
+      fs.writeFileSync(filePath, name);
+      await uploadBackupToS3({ fileName: name, fullPath: filePath } as never, s3, runtime as never);
+    }
+
+    const deleted = await pruneS3Backups(s3, 'sqlite-backup-20260103-000000Z.db', runtime as never, null, parseBackupFileName);
+
+    expect(deleted.sort()).toEqual(['sqlite-backup-20260101-000000Z.db', 'sqlite-backup-20260102-000000Z.db']);
+    expect(objects.has('sqlite-backup-20260103-000000Z.db')).toBe(true);
+  });
+
+  it('no event-loop block: an in-flight S3 upload lets a concurrent timer/microtask run', async () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+
+    let uploadInFlight = false;
+    let timerFiredWhileUploadWasInFlight = false;
+
+    // A "slow" fetchImpl: an async function that doesn't resolve until a
+    // macrotask (setTimeout) elsewhere has had a chance to run. If this
+    // package blocked the event loop for the upload (the old Atomics.wait
+    // design), the concurrent timer below could not fire until AFTER this
+    // resolves — observing it fire while the upload is still in flight is
+    // exactly what would be impossible under the old design.
+    const { fetchImpl: fakeFetch } = makeFakeS3();
+    const delayedFetch = async (url: string, opts: never, timeoutMs: number) => {
+      uploadInFlight = true;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      uploadInFlight = false;
+      return fakeFetch(url, opts as never);
+    };
+
+    const jobPromise = runBackupJobAsync({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+      s3: { bucket: 'mybucket' } as never,
+      runtime: makeRuntime({ fetchImpl: delayedFetch, env: S3_CREDS_ENV } as never),
+    });
+
+    // Scheduled AFTER the job starts. If the event loop were blocked for the
+    // ~20ms the upload is in flight, this timer could not fire until the
+    // block released — so observing it fire while uploadInFlight is still
+    // true proves the loop kept running concurrently with the "network" call.
+    const timerPromise = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        timerFiredWhileUploadWasInFlight = uploadInFlight;
+        resolve();
+      }, 5);
+    });
+
+    await Promise.all([jobPromise, timerPromise]);
+
+    expect(timerFiredWhileUploadWasInFlight).toBe(true);
+  });
+
   it('lists only supported backup filenames and annotates retention decisions', () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');
@@ -1531,9 +1881,9 @@ describe('@andrewpopov/db-backup', () => {
     );
   });
 
-  it('rejects fractional/suffixed --max-backups on the CLI instead of truncating', () => {
+  it('rejects fractional/suffixed --max-backups on the CLI instead of truncating', async () => {
     const outputDir = makeTempDir();
-    expect(() => runCli(['list', '--output-dir', outputDir, '--max-backups', '2x'])).toThrow(
+    await expect(runCli(['list', '--output-dir', outputDir, '--max-backups', '2x'])).rejects.toThrow(
       /--max-backups/,
     );
   });
@@ -1583,25 +1933,25 @@ describe('@andrewpopov/db-backup', () => {
     }
   });
 
-  it('cron output reflects --output-dir/--prod/--allow-missing and honors --command', () => {
+  it('cron output reflects --output-dir/--prod/--allow-missing and honors --command', async () => {
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (message?: unknown) => {
       logs.push(String(message));
     };
     try {
-      runCli(['cron', '--hour', '4', '--minute', '30', '--prod', '--output-dir', '/var/backups/app', '--allow-missing']);
+      await runCli(['cron', '--hour', '4', '--minute', '30', '--prod', '--output-dir', '/var/backups/app', '--allow-missing']);
       expect(logs[0]).toMatch(/^30 4 \* \* \* /);
       expect(logs[0]).toContain('npx db-backup backup --prod --output-dir "/var/backups/app" --allow-missing');
       expect(logs[0]).toContain('/var/backups/app/backup.log');
 
       logs.length = 0;
-      runCli(['cron', '--command', 'pnpm exec db-backup backup', '--log-path', '/tmp/b.log']);
+      await runCli(['cron', '--command', 'pnpm exec db-backup backup', '--log-path', '/tmp/b.log']);
       expect(logs[0]).toContain("bash -lc 'pnpm exec db-backup backup >> \"/tmp/b.log\" 2>&1'");
 
       // A single quote in the command must be escaped, not break the entry.
       logs.length = 0;
-      runCli(['cron', '--command', "echo 'hi'", '--log-path', '/tmp/b.log']);
+      await runCli(['cron', '--command', "echo 'hi'", '--log-path', '/tmp/b.log']);
       expect(logs[0]).toContain("bash -lc 'echo '\\''hi'\\'' >> \"/tmp/b.log\" 2>&1'");
     } finally {
       console.log = originalLog;
@@ -2417,11 +2767,11 @@ describe('notifyAlert', () => {
 });
 
 describe('runCli freshness wiring', () => {
-  it('requires --stamp-file or --remote', () => {
-    expect(() => runCli(['freshness'])).toThrow(/--stamp-file .* or --remote/);
+  it('requires --stamp-file or --remote', async () => {
+    await expect(runCli(['freshness'])).rejects.toThrow(/--stamp-file .* or --remote/);
   });
 
-  it('fires --notify-command and exits non-zero on a stale stamp (end-to-end)', () => {
+  it('fires --notify-command and exits non-zero on a stale stamp (end-to-end)', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-notify-'));
     tempDirs.push(dir);
     const stamp = path.join(dir, '.last-success');
@@ -2429,7 +2779,7 @@ describe('runCli freshness wiring', () => {
     fs.writeFileSync(stamp, '2020-01-01T00:00:00.000Z\n'); // ancient → stale
     const prevExit = process.exitCode;
     process.exitCode = 0;
-    runCli([
+    await runCli([
       'freshness',
       '--stamp-file',
       stamp,

@@ -2,9 +2,10 @@
 
 Backs up SQLite and PostgreSQL databases from a CLI or a Node API: timestamped
 compressed dumps, retention policies, optional GPG encryption at rest, verified
-off-host replication via rclone, and a freshness check that catches a cron job
-which has silently stopped producing backups. Built for self-hosted apps where
-the backup job has to be trustworthy without a human watching it.
+off-host replication via rclone **or native S3/R2** (no rclone binary
+required), and a freshness check that catches a cron job which has silently
+stopped producing backups. Built for self-hosted apps where the backup job has
+to be trustworthy without a human watching it.
 
 ## Install
 
@@ -87,8 +88,9 @@ prefix set, only the canonical names are recognised — the default is not widen
 
 A backup on the same disk as the database is not a backup — one disk failure
 loses both. **`backup` refuses to run unless this is a deliberate choice:** it
-aborts if neither `--remote` (offsite replication) nor `--skip-remote` (an
-explicit opt-out) is given. There is no silent local-only default.
+aborts if none of `--remote` (rclone), `--s3-bucket` (native S3/R2, see
+below), or `--skip-remote` (an explicit opt-out) is given. There is no silent
+local-only default.
 
 ```bash
 db-backup backup --prod \
@@ -121,11 +123,12 @@ replicated backup. Omitting **both** `--remote` and `--skip-remote` is the one
 thing that's no longer allowed — that combination now throws:
 
 ```
-Refusing to create a local-only backup: no --remote is configured and
---skip-remote was not passed. A backup on the same disk as the database is
-not a backup — a single disk failure destroys both. Configure --remote
-<dest> (offsite replication via rclone), or pass --skip-remote
-(skipRemote: true) to explicitly accept the same-disk risk.
+Refusing to create a local-only backup: no --remote/--s3-bucket is configured
+and --skip-remote was not passed. A backup on the same disk as the database
+is not a backup — a single disk failure destroys both. Configure --remote
+<dest> (offsite replication via rclone) or --s3-bucket <bucket> (native AWS
+S3 / Cloudflare R2), or pass --skip-remote (skipRemote: true) to explicitly
+accept the same-disk risk.
 ```
 
 ### Cloudflare R2 (and other S3-compatible targets)
@@ -155,6 +158,76 @@ db-backup backup --prod \
 
 The upload, byte-verification, and remote retention described above apply
 unchanged — the remote is opaque to `db-backup`.
+
+### Native S3 remote (no rclone) — AWS S3 or Cloudflare R2
+
+If you'd rather not install and configure `rclone` at all, `--s3-bucket`
+uploads directly to S3 or R2 using AWS Signature V4, implemented with
+`node:crypto` and the global `fetch` — **zero new runtime dependencies**, and
+this is a **second, independent remote type**: `--remote` (rclone) and
+`--s3-bucket` are mutually exclusive (configuring both is an error), but
+`--remote` continues to work exactly as before if you're already using it.
+
+**Credentials are read from the environment only — never a CLI flag**, which
+would leak into `ps` output and shell history:
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+# or, if you prefer S3_*-named vars: S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY
+```
+
+**AWS S3** (no `--s3-endpoint`; region defaults to `us-east-1`):
+
+```bash
+db-backup backup --prod \
+  --s3-bucket my-bucket --s3-prefix my-app --s3-region us-east-1 \
+  --remote-keep 30 \
+  --stamp-file /var/lib/app/backups/.last-success
+```
+
+**Cloudflare R2** (set `--s3-endpoint` to your account's R2 endpoint; region
+defaults to `auto`, R2's own convention, when an endpoint is set). Credentials
+here are R2's S3 API token pair (**Manage R2 API Tokens** → an *S3
+credential*, not a general Cloudflare API token):
+
+```bash
+db-backup backup --prod \
+  --s3-bucket my-bucket --s3-prefix my-app \
+  --s3-endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
+  --remote-keep 30 \
+  --stamp-file /var/lib/app/backups/.last-success
+```
+
+Same fail-closed contract as the rclone remote: the backup is `PUT`, then
+**re-read with a `HEAD`** and its size (and, for the single-part upload this
+package always does, its ETag against the file's MD5) compared to the local
+artifact. **Nothing is pruned and no success is stamped until that
+verification passes.** Missing credentials, a non-2xx response, or a
+verification mismatch all throw — the error never contains the access key or
+secret key.
+
+**Design notes:**
+- **Signing:** the payload hash is a real SHA-256 of the file body (not
+  `UNSIGNED-PAYLOAD`) — the file is already being read into memory for the
+  upload, so a real hash costs nothing extra and lets S3 itself catch
+  transport corruption.
+- **Upload is a buffered single-part PUT** — the whole file is read into
+  memory and sent in one request. Fine for SQLite/`pg_dump`-sized backups;
+  **S3 caps a single-part PUT at 5 GiB**, and a backup above that size fails
+  with a clear error *before* any upload is attempted, rather than being
+  silently truncated. Multipart upload is not implemented.
+- **Transport:** the S3 remote uses the real, `await`ed `fetch` — no worker
+  thread, no event-loop block. That is why S3 has its own async job function,
+  `runBackupJobAsync` (see [Programmatic API](#programmatic-api) below);
+  `runBackupJob` (the synchronous API) throws if `s3` is configured rather
+  than either blocking the caller's event loop or silently doing nothing.
+  Every request is bounded by `--s3-timeout <seconds>` (env
+  `DB_BACKUP_S3_TIMEOUT_MS`, default 300s).
+- **Remote retention:** `--remote-keep <n>` (default 30) works the same way
+  it does for rclone — the bucket/prefix is listed and the oldest objects
+  beyond `n` are deleted, never including the object just uploaded and
+  verified.
 
 ## Backup liveness
 
@@ -352,20 +425,67 @@ accept an explicitly-inconsistent copy.
 
 ## Programmatic API
 
+This package has **two backup-job entry points**, and which one you use
+depends on whether you might configure an S3 remote:
+
+- **`runBackupJobAsync(options)`** — the entry point for any in-process/library
+  caller: an app server, a Next.js/Express API route, a background worker
+  running inside your app. `await` it. It supports `remote` (rclone),
+  `s3` (native AWS S3/R2, uploaded over the real async `fetch`), and
+  local-only (`skipRemote`) backups.
+- **`runBackupJob(options)`** — synchronous, for scripts and tooling that
+  genuinely need a synchronous call and never configure an S3 remote. It
+  supports `remote` (rclone) and local-only (`skipRemote`) backups exactly as
+  before. **It throws if `s3` is configured** — see below.
+
+**Why two.** `fetch` is inherently asynchronous, and Node ships no synchronous
+HTTP client. An S3 upload that *looks* synchronous (return a value, no
+`await`) can only be built by blocking the underlying thread until the
+network call finishes. Blocking the CLI's thread is harmless — it's a
+one-shot batch process. Blocking the thread of a library caller **freezes
+whatever else that process is doing** for the duration of the upload — for a
+Node app server, that means every other request, including health checks,
+stalls until the backup finishes uploading. So there is exactly one S3 code
+path, it is fully async, and the synchronous API refuses to reach it:
+
+```js
+const { runBackupJob } = require('@andrewpopov/db-backup');
+
+runBackupJob({ mode: 'prod', outputDir: '/var/backups/myapp', s3: { bucket: 'my-bucket' } });
+// Throws: "runBackupJob (the synchronous API) cannot use an S3 remote: ...
+// Use runBackupJobAsync(options) ... or the `db-backup` CLI ..."
+```
+
+The CLI already does the right thing for you — every `db-backup backup`
+invocation awaits `runBackupJobAsync` internally, whether or not `--s3-bucket`
+is set, so `--s3-bucket` at the CLI just works.
+
 ```js
 const {
+  runBackupJobAsync,
   runBackupJob,
   listBackupsWithPlan,
   restoreBackup,
   DEFAULT_RETENTION_POLICY,
 } = require('@andrewpopov/db-backup');
 
-const result = runBackupJob({
+// In-process caller (e.g. an admin API route) — always use the async API,
+// whether or not S3 is configured this run, so a later switch to --s3-bucket
+// never turns into a silent event-loop freeze.
+const result = await runBackupJobAsync({
   mode: 'prod',
   outputDir: '/var/backups/myapp',
+  s3: { bucket: 'my-bucket', prefix: 'myapp' }, // omit for rclone/local-only, same as runBackupJob
 });
 
 console.log(result.created.fileName);
+
+// A script/tool with no S3 remote can still use the synchronous API.
+const localResult = runBackupJob({
+  mode: 'prod',
+  outputDir: '/var/backups/myapp',
+  remote: { target: 'offsite:myapp' }, // rclone, or omit + skipRemote for local-only
+});
 
 const restored = restoreBackup({
   mode: 'prod',
@@ -397,7 +517,11 @@ runBackupJob({
 
 The default runtime uses Node's `child_process.execFileSync`, checks commands via
 `command -v`, sleeps between locked-SQLite retries, and reads the current time
-from `new Date()`.
+from `new Date()`. For the native S3 remote specifically, `runtime.env`
+(default `process.env`) is where credentials and `DB_BACKUP_S3_TIMEOUT_MS` are
+read from, and `runtime.fetchImpl` is the injectable HTTP layer — tests pass a
+mock here so nothing ever touches the network; production leaves it unset and
+gets the real, async global `fetch`.
 
 ## Restore behavior
 
