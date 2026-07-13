@@ -3076,6 +3076,49 @@ describe('@andrewpopov/db-backup', () => {
       }
     }
 
+    // A config declaring "mode": "prod" was silently IGNORED: db-backup fell back to
+    // NODE_ENV and resolved DEV env files while the operator believed they were
+    // running prod. Caught on the Pi -- cairn's config said prod, the CLI printed
+    // "Mode: dev". A config key that is accepted and does nothing is worse than one
+    // that errors.
+    it('honors "mode" from the config file (CLI prints prod, not dev)', async () => {
+      const cwd = makeTempDir();
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+      const backupDir = path.join(cwd, 'cfg-backups');
+      writeConfig(cwd, {
+        mode: 'prod',
+        destinations: [{ type: 'local', path: backupDir }],
+      });
+
+      const lines: string[] = [];
+      const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => {
+        lines.push(a.join(' '));
+      });
+      try {
+        await withCliCwd(cwd, 'file:./app.db', async () => {
+          await runCli(['list']);
+        });
+      } finally {
+        spy.mockRestore();
+      }
+
+      const modeLine = lines.find((l) => l.includes('Mode:'));
+      expect(modeLine).toContain('prod');
+      expect(modeLine).not.toContain('dev');
+    });
+
+    it('rejects an invalid config "mode" rather than silently ignoring it', async () => {
+      const cwd = makeTempDir();
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+      writeConfig(cwd, {
+        mode: 'production',
+        destinations: [{ type: 'local', path: path.join(cwd, 'b') }],
+      });
+      await withCliCwd(cwd, 'file:./app.db', async () => {
+        await expect(runCli(['list'])).rejects.toThrow(/mode/);
+      });
+    });
+
     it('a config file is parsed and applied (destinations + retention)', async () => {
       const cwd = makeTempDir();
       fs.writeFileSync(path.join(cwd, 'app.db'), 'db');

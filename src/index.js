@@ -117,6 +117,7 @@ function parseArgs(argv) {
   const options = {
     command: 'backup',
     mode: process.env.NODE_ENV === 'production' ? 'prod' : 'dev',
+    modeExplicit: false,
     outputDir: DEFAULT_OUTPUT_DIR,
     outputDirProvided: false,
     compressSqlite: true,
@@ -185,11 +186,13 @@ function parseArgs(argv) {
 
     if (arg === '--prod') {
       options.mode = 'prod';
+      options.modeExplicit = true;
       continue;
     }
 
     if (arg === '--dev') {
       options.mode = 'dev';
+      options.modeExplicit = true;
       continue;
     }
 
@@ -3426,6 +3429,19 @@ async function runCli(argv = process.argv.slice(2)) {
       keepLast: options.keepLast,
       keepDays: options.keepDays,
     });
+  }
+
+  // `mode` from the config file. Without this, a config declaring "mode": "prod"
+  // was silently IGNORED — db-backup fell back to NODE_ENV and resolved DEV env
+  // files while the operator believed they were running prod. A config key that is
+  // accepted and does nothing is worse than one that errors.
+  // Precedence stays CLI > config > default: options.mode is only non-default when
+  // --prod/--dev was passed, so we only consult the config when it wasn't.
+  if (!options.modeExplicit && config && config.mode) {
+    if (config.mode !== 'prod' && config.mode !== 'dev') {
+      throw new Error(`config "mode" must be "prod" or "dev" (got ${JSON.stringify(config.mode)})`);
+    }
+    options.mode = config.mode;
   }
 
   const passphraseFile = options.passphraseFile || (config && config.encryptPassphraseFile) || null;

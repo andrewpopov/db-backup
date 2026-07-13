@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.1
+
+Fix — a config file declaring `"mode": "prod"` was **silently ignored**. db-backup
+fell back to `NODE_ENV` and resolved DEV env files while the operator believed they
+were running prod. Caught on the Pi: cairn's config said `prod`, the CLI printed
+`Mode: dev`.
+
+A config key that is accepted and does nothing is worse than one that errors, so an
+invalid `mode` now throws rather than being quietly dropped. Precedence is unchanged:
+an explicit `--prod`/`--dev` flag still beats the config.
+
 ## 0.17.0
 
 **Configurable grandfather-father-son (GFS) retention, applied identically to
