@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.2
+
+- Add public contribution, support, and private vulnerability-reporting policies.
+- Add `npm run verify` as the authoritative local package-release gate.
+- Correct the GitHub install example to the latest released tag.
+
 ## 0.17.1
 
 Fix — a config file declaring `"mode": "prod"` was **silently ignored**. db-backup
