@@ -492,6 +492,39 @@ db-backup restore --prod --output-dir /var/backups/myapp --latest \
   --stop-writers-cmd "pm2 stop myapp" --start-writers-cmd "pm2 start myapp"
 ```
 
+## Machine-readable output
+
+`db-backup backup --json` (and the programmatic `runBackupJob`/`runBackupJobAsync`
+result) always includes a top-level `backupId` field once a backup is created:
+
+```bash
+db-backup backup --prod --output-dir /var/backups/myapp --json
+```
+
+```json
+{
+  "created": { "fileName": "sqlite-backup-20260716-030000Z.db.gz", "..." : "..." },
+  "backupId": "sqlite-backup-20260716-030000Z.db.gz",
+  "...": "..."
+}
+```
+
+`backupId` is the stable identifier that `restoreBackup`/`db-backup restore --file`
+accepts (it is exactly `created.fileName`). Downstream tooling — e.g. a deploy
+pipeline correlating a backup hook's output with the artifact it produced — should
+read this top-level key rather than reaching into `created.fileName` or
+`created.fullPath`, both of which stay in place for back-compat but are not the
+contract: a rename of the `created` shape would not be considered a breaking
+change to `backupId`.
+
+`backupId` is only present once a backup has actually been created. The CLI's
+`--allow-missing` skip path (used when the source database file does not exist
+yet, e.g. a fresh install) prints a distinct shape with no `backupId`:
+
+```json
+{ "skipped": true, "reason": "SQLite database file not found: ...", "mode": "prod" }
+```
+
 ## Adoption recipes
 
 ### SQLite app

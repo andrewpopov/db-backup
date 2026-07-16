@@ -300,6 +300,15 @@ export interface BackupDestinationResult {
 
 export interface BackupJobResult {
   created: BackupEntry;
+  /** Stable machine-readable identifier for this run's backup — equal to
+   * `created.fileName`. Always present at the top level (both in the
+   * programmatic result and the CLI's `--json` output) since a backup is
+   * always created by the time this result exists; downstream tooling (e.g.
+   * deploy-kit's hook-output correlation) should key off this field rather
+   * than reaching into `created.fileName` or `created.fullPath`. Not present
+   * on the CLI's `--allow-missing` skipped-run JSON shape (`{ skipped: true,
+   * reason, mode }`), which is a distinct, backup-less result. */
+  backupId: string;
   /** Back-compat: the first non-local destination's upload result (present
    * when at least one remote/S3 destination was configured and uploaded to). */
   uploaded?: BackupUploadResult | null;

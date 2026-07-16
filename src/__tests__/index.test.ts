@@ -107,6 +107,10 @@ describe('@andrewpopov/db-backup', () => {
     });
     expect(fs.readFileSync(result.created.fullPath, 'utf8')).toBe('sqlite bytes');
     expect(result.kept.map((entry) => entry.fileName)).toContain(result.created.fileName);
+    // Machine-readable contract: backupId is the stable identifier downstream
+    // tooling (e.g. deploy-kit) may key off, top-level and equal to
+    // created.fileName.
+    expect(result.backupId).toBe(result.created.fileName);
   });
 
   it('does not overwrite a same-second SQLite backup', () => {
@@ -234,6 +238,62 @@ describe('@andrewpopov/db-backup', () => {
       expect(logs.some((line) => /skipping backup/.test(line))).toBe(true);
       // Nothing should have been written.
       expect(fs.readdirSync(outputDir)).toEqual([]);
+    } finally {
+      console.log = originalLog;
+      if (originalUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalUrl;
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+    }
+  });
+
+  it('includes a top-level backupId equal to created.fileName in `backup --json` output', async () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    // A real (if minimal) SQLite file — this exercises the actual sqlite3
+    // binary via runCli (no injected runtime), which rejects non-database bytes.
+    execFileSync('sqlite3', [path.join(cwd, 'app.db'), 'CREATE TABLE t (a INTEGER);']);
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (message?: unknown) => {
+      logs.push(String(message));
+    };
+    const originalUrl = process.env.DATABASE_URL;
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(cwd);
+      process.env.DATABASE_URL = 'file:./app.db';
+      process.env.NODE_ENV = 'development';
+      await runCli(['backup', '--output-dir', outputDir, '--allow-unsafe-copy', '--skip-remote', '--json']);
+      const result = JSON.parse(logs[logs.length - 1]);
+      expect(result.backupId).toBe(result.created.fileName);
+    } finally {
+      console.log = originalLog;
+      process.chdir(originalCwd);
+      if (originalUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = originalUrl;
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+    }
+  });
+
+  it('omits backupId from the CLI --allow-missing skipped-run JSON shape', async () => {
+    const outputDir = makeTempDir();
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (message?: unknown) => {
+      logs.push(String(message));
+    };
+    const originalUrl = process.env.DATABASE_URL;
+    const originalNodeEnv = process.env.NODE_ENV;
+    try {
+      process.env.DATABASE_URL = 'file:./does-not-exist-δ.db';
+      process.env.NODE_ENV = 'development';
+      await runCli(['backup', '--allow-missing', '--skip-remote', '--output-dir', outputDir, '--json']);
+      const skipped = JSON.parse(logs[logs.length - 1]);
+      expect(skipped).toMatchObject({ skipped: true });
+      expect(skipped.backupId).toBeUndefined();
     } finally {
       console.log = originalLog;
       if (originalUrl === undefined) delete process.env.DATABASE_URL;

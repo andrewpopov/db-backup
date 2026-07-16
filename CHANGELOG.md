@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.18.0
+
+Add a top-level `backupId` field to the backup job result (`runBackupJob` /
+`runBackupJobAsync`) and to the CLI's `backup --json` output, equal to the
+created backup's `fileName`. Downstream tooling that correlates a backup run
+with its artifact — e.g. deploy-kit scraping the backup hook's stdout — was
+matching only via `created.fileName`, so a rename of that nested shape would
+silently break restore correlation. `backupId` is the documented, stable
+contract for that use case; see the new "Machine-readable output" README
+section. Additive only — all existing fields are unchanged.
+
 ## 0.17.2
 
 - Add public contribution, support, and private vulnerability-reporting policies.

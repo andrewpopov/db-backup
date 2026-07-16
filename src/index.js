@@ -614,7 +614,7 @@ function parseTimestampKey(timestampKey) {
 
 function commandExists(command, runner = execFileSync) {
   try {
-    runner('sh', ['-lc', `command -v ${command}`], { stdio: 'ignore' });
+    runner('sh', ['-c', `command -v ${command}`], { stdio: 'ignore' });
     return true;
   } catch {
     return false;
@@ -2969,6 +2969,11 @@ function finalizeBackupResult(resolved, created, now, distributions) {
   const remoteDistributions = distributions.filter((d) => d.destination.type !== 'local');
   return {
     created,
+    // Stable machine-readable identifier for downstream tooling (e.g.
+    // deploy-kit) to correlate this run's backup — always the created
+    // backup's fileName, and always present at the top level alongside
+    // `created` (which callers relying only on `backupId` need not parse).
+    backupId: created.fileName,
     removed,
     // Back-compat singular fields: the (only) remote's upload/prune result,
     // exactly as before this package supported more than one remote.
