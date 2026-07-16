@@ -318,8 +318,8 @@ describe('getOperationalStatus (tone matrix)', () => {
     // ...but the newest attempt, just now, failed.
     const outputDir = dir;
     fs.writeFileSync(
-      path.join(outputDir, 'sqlite-backup-20260705-160000Z.db.failed'),
-      JSON.stringify({ startedAt: fixedNow.toISOString(), error: 'disk full' }),
+      path.join(outputDir, 'sqlite-backup-20260705-160000Z-abc123.failed'),
+      JSON.stringify({ startedAt: fixedNow.toISOString(), failedAt: fixedNow.toISOString(), error: 'disk full' }),
     );
 
     const status = getOperationalStatus({
@@ -331,5 +331,60 @@ describe('getOperationalStatus (tone matrix)', () => {
 
     expect(status.tone).toBe('critical');
     expect(status.detail).toMatch(/disk full/);
+  });
+
+  it('a run that failed AFTER producing its artifact is still critical (failedAt beats artifact recency)', () => {
+    const dir = makeTempDir();
+    const stampFile = path.join(dir, '.last-success');
+    writeSuccessStamp(stampFile, fixedNow);
+
+    // The failed run's snapshot artifact exists and is NEWER (by createdAt)
+    // than the failure's startedAt — replication failed after the snapshot
+    // was written. Ranking rows by createdAt alone would pick the artifact
+    // and report healthy; the failedAt comparison must not.
+    const startedAt = new Date(fixedNow.getTime() - 10 * 60 * 1000); // job started 10 min ago
+    const artifactAt = '20260705-145500Z'; // snapshot written 14:55 (after start 14:50)
+    fs.writeFileSync(path.join(dir, `sqlite-backup-${artifactAt}.db`), 'snapshot from the failed run');
+    fs.writeFileSync(
+      path.join(dir, 'sqlite-backup-20260705-145000Z-job001.failed'),
+      JSON.stringify({
+        startedAt: startedAt.toISOString(),
+        failedAt: fixedNow.toISOString(), // replication failed just now — newest event
+        error: 'remote size mismatch',
+      }),
+    );
+
+    const status = getOperationalStatus({
+      stampFile,
+      outputDir: dir,
+      maxAgeHours: 36,
+      now: fixedNow,
+    });
+
+    expect(status.tone).toBe('critical');
+    expect(status.detail).toMatch(/remote size mismatch/);
+  });
+
+  it('a failure older than a subsequent completed backup does NOT override health', () => {
+    const dir = makeTempDir();
+    const stampFile = path.join(dir, '.last-success');
+    writeSuccessStamp(stampFile, fixedNow);
+
+    // An old failure, then a newer successful backup: the success supersedes.
+    const failedAt = new Date(fixedNow.getTime() - 2 * 24 * 60 * 60 * 1000);
+    fs.writeFileSync(
+      path.join(dir, 'sqlite-backup-20260703-150000Z-job001.failed'),
+      JSON.stringify({ startedAt: failedAt.toISOString(), failedAt: failedAt.toISOString(), error: 'old news' }),
+    );
+    fs.writeFileSync(path.join(dir, 'sqlite-backup-20260705-150000Z.db'), 'the recovery backup');
+
+    const status = getOperationalStatus({
+      stampFile,
+      outputDir: dir,
+      maxAgeHours: 36,
+      now: fixedNow,
+    });
+
+    expect(status.tone).toBe('healthy');
   });
 });

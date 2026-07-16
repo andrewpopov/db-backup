@@ -426,16 +426,30 @@ Every `BackupEntry` (from `listBackupsWithPlan`, `listBackups`, etc.) carries a 
 | state | meaning |
 |---|---|
 | `completed` | Backed by a real, verified artifact on disk — every entry that existed before this field was added. |
-| `running` | A job is currently working on this backup. Represented by a `<fileName>.inprogress` marker written the instant the job starts, removed the instant it finishes successfully. |
-| `failed` | The job that would have produced this backup threw. Represented by a `<fileName>.failed` marker — the `.inprogress` marker renamed in place, holding a small JSON body `{ startedAt, error }` (the error message truncated so a huge stack trace can't bloat the backup directory). |
+| `running` | A job started and is not known to have finished — it may be in flight, or the process may have died without ever reaching its failure handler. Represented by a `<prefix>-<startedAt>-<jobId>.inprogress` marker written the instant the job starts and removed the instant it finishes successfully. |
+| `failed` | A backup job threw. Represented by a `.failed` marker (the `.inprogress` marker renamed in place), holding a small JSON body `{ startedAt, failedAt, error }` (the error message truncated so a huge stack trace can't bloat the backup directory). `failedAt` — not `startedAt` — is what freshness logic compares against: a run can fail long after it started. |
+
+Markers are named by **job identity** (`<prefix>-<startedAt timestamp>-<jobId>`, e.g.
+`sqlite-backup-20260705-150000Z-a1b2c3.inprogress`), never by the artifact the job might
+have produced — the eventual artifact filename is unknowable up front (a lock wait can
+cross the timestamp second, encryption appends `.gpg`, the collision allocator bumps
+the sequence).
 
 Markers are not backups: they carry no size requirement and are always excluded from
 retention **selection** — `planRetention` never sees them, so a stuck or failed run
 can never occupy a keep slot or influence which real backups rotate out. A `.failed`
-marker is still swept for cleanup once it's older than the oldest backup the policy is
-still keeping (`listBackupsWithPlan`/`pruneBackupsJob` fold it into the removal plan
-with `retentionReason: 'stale_marker'`); a `.running` marker is never swept this way — a
-stuck job is an operational fact worth keeping visible, not tidying away.
+marker is swept for cleanup once it's older than the oldest backup the policy is still
+keeping (`listBackupsWithPlan`/`pruneBackupsJob` fold it into the removal plan with
+`retentionReason: 'stale_marker'`) — with two evidence-preservation exemptions:
+
+- **When the plan keeps no backups at all** (nothing has ever succeeded), no failed
+  marker is ever stale — it may be the only evidence the system has ever attempted a
+  backup.
+- **The newest failed marker is always retained**, regardless of age — evidence of the
+  most recent failure survives until a newer outcome supersedes it.
+
+A `.inprogress` marker is never swept: it means a run started and is not known to have
+finished — an operational fact worth keeping visible, not tidying away.
 
 ```js
 const { listBackupsWithPlan } = require('@andrewpopov/db-backup');
@@ -446,8 +460,8 @@ backups.forEach((b) => console.log(b.fileName, b.state, b.error || ''));
 
 ### Operational status (admin surfaces)
 
-`getOperationalStatus` combines `checkBackupFreshness` with the newest known entry's
-lifecycle state into a single `{ tone, detail, stampedAt? }` — the natural feed for an
+`getOperationalStatus` combines `checkBackupFreshness` with the lifecycle markers in
+`outputDir` into a single `{ tone, detail, stampedAt? }` — the natural feed for an
 admin dashboard's status widget (e.g. admin-kit's `AdminOperationalStatus`):
 
 ```js
@@ -464,10 +478,14 @@ const status = getOperationalStatus({
 Tone precedence, most to least urgent (documented here because it is the one place the
 ordering is decided):
 
-1. **The newest entry is a `failed` marker → `critical`.** A failed run beats a fresh
-   stamp: the stamp only proves a *past* success, and an operator needs to know the
-   *most recent* attempt didn't work even while an older backup is still inside the
-   freshness window.
+1. **Any failed marker whose `failedAt` is newer than the newest completed backup's
+   `createdAt` (or any failed marker at all when no completed backup exists) →
+   `critical`.** A failed run beats a fresh stamp: the stamp only proves a *past*
+   success, and an operator needs to know the *most recent* attempt didn't work even
+   while an older backup is still inside the freshness window. The comparison is
+   failedAt-vs-artifact, not "is the newest row a failure" — a run that fails *after*
+   creating its artifact (during replication or finalization) must not be masked by
+   that artifact's newer-looking `createdAt`.
 2. **The stamp is dated in the future (clock skew) → `warning`.** The data may well be
    fine; the clock is not, and that's a different problem than a stale backup.
 3. **The stamp is stale (not fresh, no clock skew) → `critical`.**

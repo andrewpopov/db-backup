@@ -156,9 +156,12 @@ export interface BackupFreshness {
 
 /** Lifecycle state of a `BackupEntry`. `'completed'` is any entry backed by a
  * real on-disk artifact (the only state that existed before this field was
- * added). `'running'`/`'failed'` back an in-flight or crashed job instead —
- * see the `<fileName>.inprogress`/`<fileName>.failed` markers documented on
- * {@link listBackupMarkers}. Markers carry no size requirement and are always
+ * added). `'running'`/`'failed'` back a job's lifecycle marker instead —
+ * `<prefix>-<startedAt>-<jobId>.inprogress` / `.failed`, named by JOB
+ * IDENTITY, never by the artifact the job might have produced (see
+ * {@link listBackupMarkers}). `'running'` means a job started and is not
+ * known to have finished — in flight, or the process died without reaching
+ * its failure handler. Markers carry no size requirement and are always
  * excluded from retention SELECTION (planRetention never sees them); a stale
  * `'failed'` marker can still appear in a `BackupPlan.remove` for cleanup —
  * see `listBackupsWithPlan`. */
@@ -181,6 +184,13 @@ export interface BackupEntry {
   /** `'failed'` marker rows only: the truncated error message from the run
    * that failed (see `MARKER_ERROR_TRUNCATE_LENGTH` in the implementation). */
   error?: string;
+  /** Marker rows only: ISO time the job started. */
+  startedAt?: string;
+  /** `'failed'` marker rows only: ISO time the job failed — a job can fail
+   * long after it started, and the failure's recency (not the start's) is
+   * what freshness/eviction logic compares against. Doubles as the row's
+   * `createdAt`. */
+  failedAt?: string;
   createdAt: string;
   sizeBytes: number;
   ageDays?: number;
@@ -673,12 +683,15 @@ export function checkRemoteFreshness(options: {
   namePrefix?: string | null;
 }): BackupFreshness;
 
-/** Surfaces every `<fileName>.inprogress`/`<fileName>.failed` marker in
- * `outputDir` as a `BackupEntry`-shaped row (`state: 'running' | 'failed'`),
- * newest first. `sizeBytes` is always 0 — markers are not backups and carry
- * no size requirement. `'failed'` rows carry the truncated `error` message.
+/** Surfaces every `<prefix>-<startedAt>-<jobId>.inprogress` / `.failed`
+ * lifecycle marker in `outputDir` as a `BackupEntry`-shaped row
+ * (`state: 'running' | 'failed'`), newest first — a `'failed'` row is ranked
+ * by its `failedAt`, a `'running'` row by its `startedAt`. `sizeBytes` is
+ * always 0 — markers are not backups and carry no size requirement.
+ * `'failed'` rows carry the truncated `error` message and `failedAt`.
  * See the implementation's lifecycle-marker doc comment for the on-disk
- * marker format and the stale-marker cleanup rule. */
+ * marker format and the stale-marker cleanup rules (including the two
+ * evidence-preservation exemptions). */
 export function listBackupMarkers(
   outputDir: string,
   now?: Date,
@@ -692,24 +705,27 @@ export interface OperationalStatus {
   stampedAt?: string;
 }
 
-/** Admin-surface feed: combines {@link checkBackupFreshness} with the newest
- * known entry's lifecycle state (a completed backup, or a running/failed
- * marker — see {@link listBackupMarkers}) into one `OperationalStatus`, the
- * natural input for admin-kit's `AdminOperationalStatus`.
+/** Admin-surface feed: combines {@link checkBackupFreshness} with the
+ * lifecycle markers in `outputDir` (see {@link listBackupMarkers}) into one
+ * `OperationalStatus`, the natural input for admin-kit's
+ * `AdminOperationalStatus`.
  *
  * Precedence, most to least urgent:
- *   1. The newest entry in `outputDir` is a `'failed'` marker -> `'critical'`.
- *      A failed run beats a fresh stamp — the stamp only proves a PAST
- *      success, and an operator needs to know the MOST RECENT attempt didn't
- *      work even while an older backup is still inside the freshness window.
+ *   1. Any `'failed'` marker whose `failedAt` is newer than the newest
+ *      COMPLETED backup's `createdAt` (or any failed marker at all when no
+ *      completed backup exists) -> `'critical'`. A failed run beats a fresh
+ *      stamp — the stamp only proves a PAST success. The comparison is
+ *      failedAt-vs-artifact, not "is the newest row a failure": a run that
+ *      fails AFTER creating its artifact (replication/finalize) must not be
+ *      masked by that artifact's newer-looking createdAt.
  *   2. The stamp is dated in the future (clock skew) -> `'warning'`.
  *   3. The stamp is stale (not fresh, no clock skew) -> `'critical'`.
  *   4. Otherwise -> `'healthy'`.
  */
 export function getOperationalStatus(options: {
   stampFile: string;
-  /** When provided, the newest entry (completed backup or marker) in this
-   * directory is consulted for the failed-marker precedence rule above. */
+  /** When provided, failed markers in this directory are compared against
+   * the newest completed backup for the precedence rule above. */
   outputDir?: string;
   maxAgeHours?: number;
   now?: Date;

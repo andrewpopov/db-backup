@@ -16,27 +16,38 @@ section. Additive only — all existing fields are unchanged.
 artifact (unchanged behavior), plus two new states backed by lightweight
 markers so an in-flight or crashed job is representable at all:
 
-- `'running'` — a `<fileName>.inprogress` marker, written the instant a job
-  starts and removed the instant it finishes successfully.
-- `'failed'` — a `<fileName>.failed` marker (the `.inprogress` marker
-  renamed in place), holding `{ startedAt, error }` with the error message
+- `'running'` — a `.inprogress` marker, written the instant a job starts and
+  removed the instant it finishes successfully. Means "started and not known
+  to have finished" (in flight, or the process died before its failure
+  handler ran).
+- `'failed'` — a `.failed` marker (the `.inprogress` marker renamed in
+  place), holding `{ startedAt, failedAt, error }` with the error message
   truncated so a huge stack trace can't bloat the backup directory.
 
-Markers carry no size requirement and are always excluded from retention
-**selection** (`planRetention` never sees them). A stale `.failed` marker —
-older than the oldest backup the policy is still keeping — is folded into
-the removal plan by `listBackupsWithPlan`/`pruneBackupsJob` for cleanup
-(`retentionReason: 'stale_marker'`); a `.running` marker is never swept this
-way. New export `listBackupMarkers(outputDir, now?, namePrefix?)` surfaces
-markers directly as `BackupEntry`-shaped rows.
+Markers are named by job identity — `<prefix>-<startedAt>-<jobId>` — never by
+a predicted artifact filename (the artifact's name is unknowable up front:
+lock waits cross timestamp seconds, encryption appends `.gpg`, the collision
+allocator bumps sequences). Markers carry no size requirement and are always
+excluded from retention **selection** (`planRetention` never sees them). A
+stale `.failed` marker — older than the oldest backup the policy is still
+keeping — is folded into the removal plan by
+`listBackupsWithPlan`/`pruneBackupsJob` for cleanup (`retentionReason:
+'stale_marker'`), with two evidence-preservation exemptions: when the plan
+keeps no backups at all, no failed marker is ever stale, and the newest
+failed marker is always retained regardless of age. A `.inprogress` marker is
+never swept. New export `listBackupMarkers(outputDir, now?, namePrefix?)`
+surfaces markers directly as `BackupEntry`-shaped rows (failed rows ranked by
+`failedAt`).
 
 New export `getOperationalStatus({ stampFile, outputDir?, maxAgeHours?, now?,
-namePrefix? })` combines `checkBackupFreshness` with the newest known entry's
-lifecycle state into `{ tone: 'healthy' | 'warning' | 'critical', detail,
-stampedAt? }` — the natural feed for admin-kit's `AdminOperationalStatus`.
-Precedence: a failed marker beats a fresh stamp (critical) > clock skew
-(warning) > stale (critical) > healthy. See the new README "Backup lifecycle
-states and markers" / "Operational status (admin surfaces)" sections.
+namePrefix? })` combines `checkBackupFreshness` with the lifecycle markers
+into `{ tone: 'healthy' | 'warning' | 'critical', detail, stampedAt? }` — the
+natural feed for admin-kit's `AdminOperationalStatus`. Precedence: any failed
+marker whose `failedAt` is newer than the newest completed backup (critical —
+so a run that fails after creating its artifact is never masked by that
+artifact) > clock skew (warning) > stale (critical) > healthy. See the new
+README "Backup lifecycle states and markers" / "Operational status (admin
+surfaces)" sections.
 
 Additive only — every existing `BackupEntry` consumer is unaffected; `state`
 and `error` are new optional fields.

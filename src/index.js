@@ -2206,35 +2206,79 @@ function listBackups({ outputDir = DEFAULT_OUTPUT_DIR, now = new Date(), namePre
 // A backup job that is in flight, or one that died mid-run, leaves no on-disk
 // artifact for listBackups to find — an admin surface has no way to tell
 // "nothing has run yet" from "a run is stuck" or "the last run crashed".
-// Markers close that gap without touching the backup-file format itself:
+// Markers close that gap without touching the backup-file format itself.
 //
-//   <fileName>.inprogress  written the instant a job picks its filename and
-//                          starts working; removed the instant that job
-//                          finishes successfully.
-//   <fileName>.failed      the inprogress marker's replacement when the job
-//                          throws — a small JSON body { startedAt, error }
-//                          (error truncated to MARKER_ERROR_TRUNCATE_LENGTH so
-//                          a huge stack trace can't bloat the backup
-//                          directory).
+// Markers are named by JOB IDENTITY, never by the artifact they might have
+// produced: `<prefix>-<startedAt timestamp>-<jobId>.inprogress` / `.failed`
+// (e.g. `sqlite-backup-20260705-150000Z-a1b2c3.inprogress`). An earlier
+// design predicted the eventual artifact filename up front, which was
+// unreliable in three separate ways — a lock wait can cross the timestamp
+// second, encryption appends `.gpg`, and the collision allocator can bump the
+// sequence — so the prediction machinery is gone entirely; the state surfaces
+// never needed the artifact name in the first place.
+//
+//   .inprogress  written the instant a job starts; removed the instant that
+//                job finishes successfully. JSON body: { startedAt }.
+//   .failed      the inprogress marker's replacement when the job throws.
+//                JSON body: { startedAt, failedAt, error } (error truncated
+//                to MARKER_ERROR_TRUNCATE_LENGTH so a huge stack trace can't
+//                bloat the backup directory). `failedAt` is what freshness
+//                logic compares against — a job can fail long after it
+//                started (replication after a slow snapshot), and the
+//                failure's recency is the operationally relevant time.
 //
 // Markers are never counted as backups: no size requirement, and excluded
 // from every retention SELECTION (planRetention never sees them — see
 // listBackupsWithPlan). listBackupsWithPlan surfaces them purely for
 // observability, as entries with state 'running'/'failed'.
 //
-// Stale-marker cleanup rule (documented here because it is the one place the
-// rule is decided): a `.failed` marker whose age exceeds the oldest backup
-// the retention policy is still keeping is no longer useful information —
-// the policy has already moved past what it describes — so listBackupsWithPlan
-// folds it into `plan.remove` (retentionReason 'stale_marker'), which
-// pruneBackupsJob/finalizeBackupResult then delete exactly like a
-// rotated-out backup. A `.running` marker is never swept this way; a stuck
-// job is an operational fact worth keeping visible, not tidying away.
+// Stale-marker cleanup rules (documented here because this is the one place
+// they are decided):
+//   - A `.failed` marker whose age exceeds the oldest backup the retention
+//     policy is still keeping is no longer useful information — the policy
+//     has already moved past what it describes — so listBackupsWithPlan folds
+//     it into `plan.remove` (retentionReason 'stale_marker') and
+//     pruneBackupsJob deletes it exactly like a rotated-out backup.
+//   - EXCEPT: when the plan keeps NO backups at all (nothing has ever
+//     succeeded), no failed marker is ever stale — the marker may be the only
+//     evidence the system has ever attempted a backup.
+//   - EXCEPT: the NEWEST failed marker is always retained regardless of age —
+//     evidence of the most recent failure must survive until a newer outcome
+//     (a success, or a newer failure) supersedes it.
+//   - A `.inprogress` marker is never swept: it means a run started and is
+//     not known to have finished (in flight, or the process died without
+//     reaching its failure handler) — an operational fact worth keeping
+//     visible, not tidying away.
 const MARKER_SUFFIXES = { inProgress: '.inprogress', failed: '.failed' };
 const MARKER_ERROR_TRUNCATE_LENGTH = 500;
 
-function backupMarkerPath(outputDir, fileName, suffix) {
-  return path.join(outputDir, `${fileName}${suffix}`);
+// `<prefix>-<timestamp>-<jobId>` — same prefix/timestamp vocabulary as a
+// backup filename, but with a job id where a backup carries its extension, so
+// a marker can never be mistaken for (or collide with) a backup artifact.
+const MARKER_BASENAME_PATTERN = /^(.+)-(\d{8}-\d{6}Z)-([A-Za-z0-9]+)$/;
+
+function newMarkerBaseName(prefix, startedAt, runtime) {
+  const jobId = String(runtime.randomId()).replace(/[^A-Za-z0-9]/g, '').slice(-6) || 'job';
+  return `${prefix}-${formatTimestamp(startedAt)}-${jobId}`;
+}
+
+function parseMarkerBaseName(baseName, namePrefix = null) {
+  const match = baseName.match(MARKER_BASENAME_PATTERN);
+  if (!match) {
+    return null;
+  }
+  const [, prefix, timestampKey] = match;
+  if (namePrefix) {
+    if (prefix !== namePrefix) return null;
+    return { prefix, timestampKey, engine: 'unknown' };
+  }
+  if (prefix === CANONICAL_PREFIXES.sqlite) return { prefix, timestampKey, engine: 'sqlite' };
+  if (prefix === CANONICAL_PREFIXES.postgres) return { prefix, timestampKey, engine: 'postgres' };
+  return null;
+}
+
+function backupMarkerPath(outputDir, baseName, suffix) {
+  return path.join(outputDir, `${baseName}${suffix}`);
 }
 
 function readMarkerBody(fullPath) {
@@ -2245,31 +2289,44 @@ function readMarkerBody(fullPath) {
   }
 }
 
-function writeInProgressMarker(outputDir, fileName, startedAt) {
-  const markerPath = backupMarkerPath(outputDir, fileName, MARKER_SUFFIXES.inProgress);
+function writeInProgressMarker(outputDir, baseName, startedAt) {
+  const markerPath = backupMarkerPath(outputDir, baseName, MARKER_SUFFIXES.inProgress);
   fs.writeFileSync(markerPath, JSON.stringify({ startedAt: startedAt.toISOString() }));
   return markerPath;
 }
 
-function clearInProgressMarker(outputDir, fileName) {
-  fs.rmSync(backupMarkerPath(outputDir, fileName, MARKER_SUFFIXES.inProgress), { force: true });
+function clearInProgressMarker(outputDir, baseName) {
+  fs.rmSync(backupMarkerPath(outputDir, baseName, MARKER_SUFFIXES.inProgress), { force: true });
 }
 
 // Replaces the `.inprogress` marker with a `.failed` one holding the
 // truncated error message. Writes the failed marker FIRST, then removes the
 // in-progress one, so a crash between the two steps still leaves a marker
 // (the failed one) rather than silently reverting to "no marker at all".
-function failInProgressMarker(outputDir, fileName, startedAt, error) {
-  const inProgressPath = backupMarkerPath(outputDir, fileName, MARKER_SUFFIXES.inProgress);
-  const failedPath = backupMarkerPath(outputDir, fileName, MARKER_SUFFIXES.failed);
+function failInProgressMarker(outputDir, baseName, startedAt, failedAt, error) {
+  const inProgressPath = backupMarkerPath(outputDir, baseName, MARKER_SUFFIXES.inProgress);
+  const failedPath = backupMarkerPath(outputDir, baseName, MARKER_SUFFIXES.failed);
   const message = String(error && error.message ? error.message : error).slice(0, MARKER_ERROR_TRUNCATE_LENGTH);
-  fs.writeFileSync(failedPath, JSON.stringify({ startedAt: startedAt.toISOString(), error: message }));
+  fs.writeFileSync(
+    failedPath,
+    JSON.stringify({ startedAt: startedAt.toISOString(), failedAt: failedAt.toISOString(), error: message }),
+  );
   fs.rmSync(inProgressPath, { force: true });
+}
+
+function readMarkerTime(body, key, fallback) {
+  const parsed = body && body[key] ? new Date(body[key]) : null;
+  return parsed && !Number.isNaN(parsed.getTime()) ? parsed : fallback;
 }
 
 // Surfaces every marker in outputDir as a BackupEntry-shaped row (state
 // 'running' | 'failed'), newest first. `sizeBytes` is always 0 — markers are
-// not backups and carry no size requirement.
+// not backups and carry no size requirement. A failed row's `createdAt` is
+// its failedAt (falling back to startedAt): the failure is the event the row
+// represents, and recency comparisons (getOperationalStatus, stale-marker
+// eviction) must rank it by when it FAILED, not when it started — otherwise a
+// run that failed after producing an artifact would sort behind that artifact
+// and its failure would be invisible.
 function listBackupMarkers(outputDir, now = new Date(), namePrefix = null) {
   const absoluteOutputDir = path.resolve(outputDir);
   if (!fs.existsSync(absoluteOutputDir)) {
@@ -2290,33 +2347,29 @@ function listBackupMarkers(outputDir, now = new Date(), namePrefix = null) {
       continue;
     }
 
-    const parsed = parseBackupFileName(baseName, namePrefix);
+    const parsed = parseMarkerBaseName(baseName, namePrefix);
     if (!parsed) {
       continue;
     }
 
     const fullPath = path.join(absoluteOutputDir, file);
-    let startedAt = parseTimestampKey(parsed.timestampKey) || fs.statSync(fullPath).mtime;
-    let error;
+    const fallbackTime = parseTimestampKey(parsed.timestampKey) || fs.statSync(fullPath).mtime;
     const body = readMarkerBody(fullPath);
-    if (body) {
-      const parsedStartedAt = body.startedAt ? new Date(body.startedAt) : null;
-      if (parsedStartedAt && !Number.isNaN(parsedStartedAt.getTime())) {
-        startedAt = parsedStartedAt;
-      }
-      if (body.error) {
-        error = body.error;
-      }
-    }
+    const startedAt = readMarkerTime(body, 'startedAt', fallbackTime);
+    const failedAt = state === 'failed' ? readMarkerTime(body, 'failedAt', startedAt) : null;
+    const error = body && body.error ? body.error : undefined;
 
-    const ageDays = Math.max(0, (now.getTime() - startedAt.getTime()) / DAY_MS);
+    const eventAt = failedAt || startedAt;
+    const ageDays = Math.max(0, (now.getTime() - eventAt.getTime()) / DAY_MS);
     results.push({
       fileName: baseName,
       fullPath,
       engine: parsed.engine,
-      compressed: parsed.compressed,
+      compressed: false,
       state,
-      createdAt: startedAt.toISOString(),
+      createdAt: eventAt.toISOString(),
+      startedAt: startedAt.toISOString(),
+      ...(failedAt ? { failedAt: failedAt.toISOString() } : {}),
       sizeBytes: 0,
       ageDays,
       keep: state === 'running',
@@ -2578,15 +2631,28 @@ function listBackupsWithPlan(options = {}) {
   };
 }
 
-// Shared by listBackupsWithPlan and pruneBackupsJob: marks every `.failed`
-// marker older than the oldest backup the plan is still keeping as stale
-// (retentionReason 'stale_marker'), leaving `.running` markers and recent
-// failures untouched.
+// Shared by listBackupsWithPlan and pruneBackupsJob: marks a `.failed` marker
+// older than the oldest backup the plan is still keeping as stale
+// (retentionReason 'stale_marker'), leaving `.inprogress` markers and recent
+// failures untouched. Two evidence-preservation exemptions (see the lifecycle
+// marker doc block for the rationale):
+//   - when plan.keep is EMPTY (no backup has ever succeeded), no failed
+//     marker is stale — it may be the only evidence of any attempt at all;
+//   - the NEWEST failed marker is never stale, regardless of age.
 function partitionStaleFailedMarkers(markers, plan) {
   const oldestKeptAgeDays = plan.keep.reduce((max, entry) => Math.max(max, entry.ageDays || 0), 0);
+  const nothingKept = plan.keep.length === 0;
+  // markers arrive newest-first (listBackupMarkers sorts by createdAt desc),
+  // so the first failed marker is the newest failure — always exempt.
+  const newestFailed = markers.find((marker) => marker.state === 'failed');
   const staleMarkers = [];
   const markerRows = markers.map((marker) => {
-    if (marker.state === 'failed' && marker.ageDays > oldestKeptAgeDays) {
+    const isStale =
+      marker.state === 'failed' &&
+      !nothingKept &&
+      marker !== newestFailed &&
+      marker.ageDays > oldestKeptAgeDays;
+    if (isStale) {
       const stale = { ...marker, keep: false, retentionReason: 'stale_marker', retentionLabel: 'Stale failure marker' };
       staleMarkers.push(stale);
       return stale;
@@ -3013,17 +3079,22 @@ function checkRemoteFreshness({ remote, runtime = normalizeRuntime(), maxAgeHour
   return { fresh: ageHours <= maxAgeHours, clockSkew: false, stampedAt, ageHours, maxAgeHours };
 }
 
-// Admin-surface feed: combines checkBackupFreshness with the newest known
-// entry's lifecycle state (a completed backup, or a running/failed marker —
-// see listBackupMarkers) into one { tone, detail, stampedAt? }, the natural
-// input for admin-kit's AdminOperationalStatus.
+// Admin-surface feed: combines checkBackupFreshness with the lifecycle
+// markers in outputDir (see listBackupMarkers) into one { tone, detail,
+// stampedAt? }, the natural input for admin-kit's AdminOperationalStatus.
 //
 // Precedence, most to least urgent (documented here because it is the one
 // place the ordering is decided):
-//   1. The newest entry in outputDir is a FAILED marker -> 'critical'. A
-//      failed run beats a fresh stamp: the stamp only proves a PAST success,
-//      and an operator needs to know the MOST RECENT attempt didn't work even
-//      while an older backup is still inside the freshness window.
+//   1. Any FAILED marker whose failedAt is newer than the newest COMPLETED
+//      backup's createdAt (or any failed marker at all, when no completed
+//      backup exists) -> 'critical'. A failed run beats a fresh stamp: the
+//      stamp only proves a PAST success, and an operator needs to know the
+//      MOST RECENT attempt didn't work even while an older backup is still
+//      inside the freshness window. The comparison is failedAt-vs-artifact,
+//      NOT "is the newest row a failure": a run that fails AFTER creating
+//      its artifact (replication, finalize) leaves an artifact whose
+//      createdAt precedes the failure, and ranking by row recency alone
+//      would let that artifact mask the failure.
 //   2. The stamp is dated in the future (clock skew) -> 'warning'. The data
 //      may well be fine; the clock is not, and that is a different problem
 //      than a stale backup.
@@ -3038,20 +3109,22 @@ function getOperationalStatus({
 } = {}) {
   const freshness = checkBackupFreshness({ stampFile, maxAgeHours, now });
 
-  let newestEntry = null;
+  let freshestFailure = null;
   if (outputDir) {
-    const entries = [
-      ...listBackups({ outputDir, now, namePrefix }),
-      ...listBackupMarkers(outputDir, now, namePrefix),
-    ];
-    entries.sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
-    newestEntry = entries[0] || null;
+    const newestCompleted = listBackups({ outputDir, now, namePrefix })[0] || null;
+    const newestCompletedMs = newestCompleted ? new Date(newestCompleted.createdAt).getTime() : -Infinity;
+    // Markers are newest-first by failedAt/startedAt, so the first failed
+    // marker newer than the newest completed artifact is the freshest failure.
+    freshestFailure = listBackupMarkers(outputDir, now, namePrefix).find(
+      (marker) =>
+        marker.state === 'failed' && new Date(marker.failedAt || marker.createdAt).getTime() > newestCompletedMs,
+    ) || null;
   }
 
-  if (newestEntry && newestEntry.state === 'failed') {
+  if (freshestFailure) {
     return {
       tone: 'critical',
-      detail: `Last backup attempt failed${newestEntry.error ? `: ${newestEntry.error}` : ''}`,
+      detail: `Last backup attempt failed${freshestFailure.error ? `: ${freshestFailure.error}` : ''}`,
       ...(freshness.stampedAt ? { stampedAt: freshness.stampedAt.toISOString() } : {}),
     };
   }
@@ -3257,21 +3330,21 @@ function runBackupJob(options = {}) {
 
   ensureBackupDir(resolved.outputDir);
 
-  // Lifecycle marker: written before any work starts (see listBackupMarkers'
-  // doc comment), using the SAME filename-prediction logic createBackup uses
-  // internally (timestamp + buildUniqueBackupPath) so the marker's name
-  // matches the artifact it stands in for. Cleared on success, converted to
-  // a `.failed` marker (with the truncated error) if the job throws anywhere
-  // below — including inside withBackupLock, replication, or finalize.
+  // Lifecycle marker: written before any work starts, named by JOB IDENTITY
+  // (prefix + start time + job id — see the lifecycle-marker doc block), NOT
+  // by the artifact this run might produce; the eventual artifact name is
+  // unknowable up front (lock waits cross the timestamp second, encryption
+  // appends .gpg, the collision allocator bumps the sequence). Cleared on
+  // success, converted to a `.failed` marker (with failedAt + the truncated
+  // error) if the job throws anywhere below — including inside
+  // withBackupLock, replication, or finalize.
   const startedAt = resolved.runtime.now();
-  const predicted = buildUniqueBackupPath({
-    engine: detectDatabaseEngine(resolved.databaseUrl),
-    timestamp: formatTimestamp(startedAt),
-    outputDir: resolved.outputDir,
-    compressSqlite: resolved.compressSqlite,
-    namePrefix: resolved.namePrefix,
-  });
-  writeInProgressMarker(resolved.outputDir, predicted.fileName, startedAt);
+  const markerName = newMarkerBaseName(
+    resolveNamePrefix(detectDatabaseEngine(resolved.databaseUrl), resolved.namePrefix),
+    startedAt,
+    resolved.runtime,
+  );
+  writeInProgressMarker(resolved.outputDir, markerName, startedAt);
 
   try {
     const result = withBackupLock(resolved.outputDir, resolved.runtime, () => {
@@ -3312,14 +3385,14 @@ function runBackupJob(options = {}) {
 
       return finalizeBackupResult(resolved, created, now, distributions);
     });
-    clearInProgressMarker(resolved.outputDir, predicted.fileName);
+    clearInProgressMarker(resolved.outputDir, markerName);
     return result;
   } catch (error) {
-    failInProgressMarker(resolved.outputDir, predicted.fileName, startedAt, error);
+    failInProgressMarker(resolved.outputDir, markerName, startedAt, resolved.runtime.now(), error);
     // Exposed so a caller that treats this particular failure as a deliberate
     // no-op (runCli's --allow-missing skip on a fresh install) can remove the
     // marker it didn't want written — see runCli below.
-    error.markerPath = backupMarkerPath(resolved.outputDir, predicted.fileName, MARKER_SUFFIXES.failed);
+    error.markerPath = backupMarkerPath(resolved.outputDir, markerName, MARKER_SUFFIXES.failed);
     throw error;
   }
 }
@@ -3336,16 +3409,14 @@ async function runBackupJobAsync(options = {}) {
   ensureBackupDir(resolved.outputDir);
 
   // Lifecycle marker — see runBackupJob for the full rationale; identical
-  // predict/write/clear/fail sequence, just awaited.
+  // job-identity write/clear/fail sequence, just awaited.
   const startedAt = resolved.runtime.now();
-  const predicted = buildUniqueBackupPath({
-    engine: detectDatabaseEngine(resolved.databaseUrl),
-    timestamp: formatTimestamp(startedAt),
-    outputDir: resolved.outputDir,
-    compressSqlite: resolved.compressSqlite,
-    namePrefix: resolved.namePrefix,
-  });
-  writeInProgressMarker(resolved.outputDir, predicted.fileName, startedAt);
+  const markerName = newMarkerBaseName(
+    resolveNamePrefix(detectDatabaseEngine(resolved.databaseUrl), resolved.namePrefix),
+    startedAt,
+    resolved.runtime,
+  );
+  writeInProgressMarker(resolved.outputDir, markerName, startedAt);
 
   try {
     const result = await withBackupLockAsync(resolved.outputDir, resolved.runtime, async () => {
@@ -3399,14 +3470,14 @@ async function runBackupJobAsync(options = {}) {
 
       return finalizeBackupResult(resolved, created, now, distributions);
     });
-    clearInProgressMarker(resolved.outputDir, predicted.fileName);
+    clearInProgressMarker(resolved.outputDir, markerName);
     return result;
   } catch (error) {
-    failInProgressMarker(resolved.outputDir, predicted.fileName, startedAt, error);
+    failInProgressMarker(resolved.outputDir, markerName, startedAt, resolved.runtime.now(), error);
     // Exposed so a caller that treats this particular failure as a deliberate
     // no-op (runCli's --allow-missing skip on a fresh install) can remove the
     // marker it didn't want written — see runCli below.
-    error.markerPath = backupMarkerPath(resolved.outputDir, predicted.fileName, MARKER_SUFFIXES.failed);
+    error.markerPath = backupMarkerPath(resolved.outputDir, markerName, MARKER_SUFFIXES.failed);
     throw error;
   }
 }

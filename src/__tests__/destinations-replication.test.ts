@@ -39,7 +39,7 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
         calls.push([cmd, ...args]);
         if (args[0] === 'lsjson') {
           // Report the real local size so verification passes.
-          const local = fs.statSync(path.join(outputDir, fs.readdirSync(outputDir).find((f) => f.startsWith('sqlite-backup-'))!)).size;
+          const local = fs.statSync(path.join(outputDir, fs.readdirSync(outputDir).find((f) => f.startsWith('sqlite-backup-') && f.endsWith('.db'))!)).size;
           return Buffer.from(JSON.stringify({ Size: local }));
         }
         if (args[0] === 'lsf') return Buffer.from('');
@@ -192,7 +192,7 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
       commandExists: (c: string) => c === 'rclone',
       execFileSync: ((_c: string, args: string[]) => {
         if (args[0] === 'lsjson') {
-          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-'))!;
+          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-') && n.endsWith('.db'))!;
           return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
         }
         return Buffer.from('');
@@ -266,7 +266,7 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
       commandExists: (c: string) => c === 'rclone',
       execFileSync: ((_c: string, args: string[]) => {
         if (args[0] === 'lsjson') {
-          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-'))!;
+          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-') && n.endsWith('.db'))!;
           return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
         }
         if (args[0] === 'lsf') {
@@ -358,7 +358,7 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
       commandExists: (c: string) => c === 'rclone',
       execFileSync: ((_c: string, args: string[]) => {
         if (args[0] === 'lsjson') {
-          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('smarthome-'))!;
+          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('smarthome-') && n.endsWith('.db'))!;
           return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
         }
         if (args[0] === 'lsf') {

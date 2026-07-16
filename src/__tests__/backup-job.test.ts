@@ -1068,9 +1068,10 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
   });
 
   // ---------------------------------------------------------------------------
-  // Lifecycle markers (PKG-28): `<fileName>.inprogress`/`<fileName>.failed`
-  // stand in for a backup that has no on-disk artifact yet (or ever). See
-  // listBackupMarkers's doc comment in src/index.js for the full design.
+  // Lifecycle markers (PKG-28): `<prefix>-<startedAt>-<jobId>.inprogress` /
+  // `.failed` stand in for a job that has no completed artifact (yet, or
+  // ever). Named by JOB IDENTITY — never by a predicted artifact filename.
+  // See listBackupMarkers's doc comment in src/index.js for the full design.
   // ---------------------------------------------------------------------------
   describe('lifecycle markers', () => {
     it('an .inprogress marker exists while the job is running and is gone on success', () => {
@@ -1113,6 +1114,46 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
       expect(fs.existsSync(result.created.fullPath)).toBe(true);
     });
 
+    it('marker names carry job identity (prefix-startedAt-jobId), independent of the artifact filename', () => {
+      const cwd = makeTempDir();
+      const sourcePath = path.join(cwd, 'dev.db');
+      const outputDir = path.join(cwd, 'backups');
+      fs.writeFileSync(sourcePath, 'source');
+
+      let markerNameDuringBackup: string | null = null;
+      const runtime = makeRuntime({
+        commandExists: (command) => command === 'sqlite3',
+        execFileSync: (command, args) => {
+          if (command === 'sqlite3' && args[1] === 'PRAGMA integrity_check;') {
+            return Buffer.from('ok\n');
+          }
+          if (command === 'sqlite3') {
+            markerNameDuringBackup =
+              fs.readdirSync(outputDir).find((f) => f.endsWith('.inprogress')) || null;
+            const match = String(args[3]).match(/^\.backup "(.+)"$/);
+            fs.writeFileSync(match![1].replace(/''/g, "'"), 'backup bytes');
+          }
+          return undefined;
+        },
+      });
+
+      const result = runBackupJob({
+        skipRemote: true,
+        allowUnsafeCopy: true,
+        cwd,
+        databaseUrl: 'file:./dev.db',
+        outputDir,
+        compressSqlite: false,
+        runtime,
+      });
+
+      // Job-identity shape: prefix, start timestamp, job id — and explicitly
+      // NOT the artifact's filename (no artifact-extension prediction).
+      expect(markerNameDuringBackup).toMatch(/^sqlite-backup-\d{8}-\d{6}Z-[A-Za-z0-9]+\.inprogress$/);
+      expect(markerNameDuringBackup).not.toContain('.db');
+      expect(markerNameDuringBackup!.replace(/\.inprogress$/, '')).not.toBe(result.created.fileName);
+    });
+
     it('a failed job leaves a .failed marker with a truncated error, and no .inprogress marker', () => {
       const cwd = makeTempDir();
       const sourcePath = path.join(cwd, 'dev.db');
@@ -1149,9 +1190,20 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
 
       const body = JSON.parse(fs.readFileSync(path.join(outputDir, failedMarker!), 'utf8'));
       expect(body.startedAt).toBe(fixedNow.toISOString());
+      expect(body.failedAt).toBe(fixedNow.toISOString());
       expect(body.error.length).toBeLessThanOrEqual(500);
       expect(hugeMessage.length).toBeGreaterThan(500);
     });
+
+    // Fixture helper: write a marker in the job-identity naming scheme.
+    function writeMarker(
+      outputDir: string,
+      opts: { ts: string; jobId: string; suffix: '.inprogress' | '.failed'; body: Record<string, unknown> },
+    ) {
+      const name = `sqlite-backup-${opts.ts}-${opts.jobId}${opts.suffix}`;
+      fs.writeFileSync(path.join(outputDir, name), JSON.stringify(opts.body));
+      return name;
+    }
 
     it('markers are excluded from retention selection: listBackupsWithPlan surfaces them with state, never as keep/rotate candidates', () => {
       const cwd = makeTempDir();
@@ -1162,17 +1214,35 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
       fs.writeFileSync(path.join(outputDir, 'sqlite-backup-20260705-150000Z.db'), 'a real backup');
 
       // A running marker for a job in flight right now.
-      fs.writeFileSync(
-        path.join(outputDir, 'sqlite-backup-20260705-160000Z.db.inprogress'),
-        JSON.stringify({ startedAt: fixedNow.toISOString() }),
-      );
+      const runningName = writeMarker(outputDir, {
+        ts: '20260705-160000Z',
+        jobId: 'run001',
+        suffix: '.inprogress',
+        body: { startedAt: fixedNow.toISOString() },
+      });
 
-      // A stale failed marker, far older than the backup the plan is keeping.
-      const staleStart = new Date(fixedNow.getTime() - 400 * 24 * 60 * 60 * 1000);
-      fs.writeFileSync(
-        path.join(outputDir, `sqlite-backup-${'20250601-000000Z'}.db.failed`),
-        JSON.stringify({ startedAt: staleStart.toISOString(), error: 'disk full' }),
-      );
+      // The newest failure (recent) — always retained.
+      writeMarker(outputDir, {
+        ts: '20260704-000000Z',
+        jobId: 'new001',
+        suffix: '.failed',
+        body: {
+          startedAt: new Date(fixedNow.getTime() - 86400000).toISOString(),
+          failedAt: new Date(fixedNow.getTime() - 86400000).toISOString(),
+          error: 'network blip',
+        },
+      });
+
+      // A stale failed marker, far older than the backup the plan is keeping
+      // AND not the newest failure — the only sweepable combination.
+      const staleAt = new Date(fixedNow.getTime() - 400 * 24 * 60 * 60 * 1000);
+      const staleName = writeMarker(outputDir, {
+        ts: '20250601-000000Z',
+        jobId: 'old001',
+        suffix: '.failed',
+        body: { startedAt: staleAt.toISOString(), failedAt: staleAt.toISOString(), error: 'disk full' },
+      });
+      const staleBase = staleName.replace(/\.failed$/, '');
 
       const result = listBackupsWithPlan({
         outputDir,
@@ -1182,43 +1252,124 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
       });
 
       const running = result.backups.find((b: any) => b.state === 'running');
-      const failed = result.backups.find((b: any) => b.state === 'failed');
+      const stale = result.backups.find((b: any) => b.fileName === staleBase);
       expect(running).toBeTruthy();
       expect(running.keep).toBe(true);
-      expect(failed).toBeTruthy();
-      expect(failed.error).toBe('disk full');
+      expect(stale).toBeTruthy();
+      expect(stale.error).toBe('disk full');
 
-      // Neither marker is a keep/rotate candidate in plan.keep.
+      // No marker is ever a keep/rotate candidate in plan.keep.
       expect(result.plan.keep.some((e: any) => e.state && e.state !== 'completed')).toBe(false);
-      // The stale failed marker is folded into plan.remove for cleanup.
-      expect(result.plan.remove.some((e: any) => e.fileName === failed.fileName && e.retentionReason === 'stale_marker')).toBe(true);
+      // Only the stale, non-newest failed marker is folded into plan.remove.
+      expect(result.plan.remove.some((e: any) => e.fileName === staleBase && e.retentionReason === 'stale_marker')).toBe(true);
+      expect(result.plan.remove.filter((e: any) => e.state === 'failed')).toHaveLength(1);
 
-      // pruneBackupsJob actually removes the stale marker but leaves the running one.
+      // pruneBackupsJob removes the stale marker but leaves the running one
+      // and the newest failure.
       const pruneResult = pruneBackupsJob({
         outputDir,
         requireDatabaseUrl: false,
         policy: { mode: 'keep-last', keepLast: 5 },
         runtime: makeRuntime(),
       });
-      expect(pruneResult.removed.some((e: any) => e.fileName === failed.fileName)).toBe(true);
-      expect(fs.existsSync(path.join(outputDir, 'sqlite-backup-20260705-160000Z.db.inprogress'))).toBe(true);
+      expect(pruneResult.removed.some((e: any) => e.fileName === staleBase)).toBe(true);
+      expect(fs.existsSync(path.join(outputDir, runningName))).toBe(true);
+      expect(fs.readdirSync(outputDir).filter((f) => f.endsWith('.failed'))).toHaveLength(1);
     });
 
-    it('listBackupMarkers surfaces running/failed rows directly, newest first', () => {
+    it('with no completed backups, a failed marker is never stale: the first failure survives prune (evidence preservation)', () => {
       const cwd = makeTempDir();
       const outputDir = path.join(cwd, 'backups');
       fs.mkdirSync(outputDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(outputDir, 'sqlite-backup-20260705-150000Z.db.inprogress'),
-        JSON.stringify({ startedAt: fixedNow.toISOString() }),
-      );
-      fs.writeFileSync(
-        path.join(outputDir, 'sqlite-backup-20260704-150000Z.db.failed'),
-        JSON.stringify({ startedAt: new Date(fixedNow.getTime() - 86400000).toISOString(), error: 'boom' }),
-      );
+
+      // Nothing has ever succeeded; the only file is an ancient failure.
+      const ancient = new Date(fixedNow.getTime() - 1000 * 24 * 60 * 60 * 1000);
+      const name = writeMarker(outputDir, {
+        ts: '20230101-000000Z',
+        jobId: 'first1',
+        suffix: '.failed',
+        body: { startedAt: ancient.toISOString(), failedAt: ancient.toISOString(), error: 'never worked' },
+      });
+
+      const result = listBackupsWithPlan({
+        outputDir,
+        requireDatabaseUrl: false,
+        policy: { mode: 'keep-last', keepLast: 5 },
+        runtime: makeRuntime(),
+      });
+      expect(result.plan.remove).toEqual([]);
+
+      pruneBackupsJob({
+        outputDir,
+        requireDatabaseUrl: false,
+        policy: { mode: 'keep-last', keepLast: 5 },
+        runtime: makeRuntime(),
+      });
+      expect(fs.existsSync(path.join(outputDir, name))).toBe(true);
+    });
+
+    it('the newest failed marker is always retained, even when older than every kept backup', () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      fs.mkdirSync(outputDir, { recursive: true });
+
+      // A recent completed backup the policy keeps (age 0).
+      fs.writeFileSync(path.join(outputDir, 'sqlite-backup-20260705-150000Z.db'), 'a real backup');
+
+      // A single, ancient failure — far older than the kept backup, but it is
+      // the NEWEST (only) failure, so it must survive.
+      const ancient = new Date(fixedNow.getTime() - 500 * 24 * 60 * 60 * 1000);
+      const name = writeMarker(outputDir, {
+        ts: '20250201-000000Z',
+        jobId: 'only01',
+        suffix: '.failed',
+        body: { startedAt: ancient.toISOString(), failedAt: ancient.toISOString(), error: 'long ago' },
+      });
+
+      const result = listBackupsWithPlan({
+        outputDir,
+        requireDatabaseUrl: false,
+        policy: { mode: 'keep-last', keepLast: 5 },
+        runtime: makeRuntime(),
+      });
+      expect(result.plan.remove.some((e: any) => e.state === 'failed')).toBe(false);
+
+      pruneBackupsJob({
+        outputDir,
+        requireDatabaseUrl: false,
+        policy: { mode: 'keep-last', keepLast: 5 },
+        runtime: makeRuntime(),
+      });
+      expect(fs.existsSync(path.join(outputDir, name))).toBe(true);
+    });
+
+    it('listBackupMarkers surfaces running/failed rows directly, newest first, ranking failures by failedAt', () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      fs.mkdirSync(outputDir, { recursive: true });
+      writeMarker(outputDir, {
+        ts: '20260705-150000Z',
+        jobId: 'run001',
+        suffix: '.inprogress',
+        body: { startedAt: fixedNow.toISOString() },
+      });
+      // Started two days ago, but FAILED only an hour ago — must rank by the
+      // failure time, not the start time.
+      writeMarker(outputDir, {
+        ts: '20260703-150000Z',
+        jobId: 'fail01',
+        suffix: '.failed',
+        body: {
+          startedAt: new Date(fixedNow.getTime() - 2 * 86400000).toISOString(),
+          failedAt: new Date(fixedNow.getTime() + 3600000).toISOString(),
+          error: 'boom',
+        },
+      });
 
       const markers = listBackupMarkers(outputDir, fixedNow, null);
-      expect(markers.map((m: any) => m.state)).toEqual(['running', 'failed']);
+      expect(markers.map((m: any) => m.state)).toEqual(['failed', 'running']);
+      expect(markers[0].failedAt).toBe(new Date(fixedNow.getTime() + 3600000).toISOString());
+      expect(markers[0].createdAt).toBe(markers[0].failedAt);
       expect(markers.every((m: any) => m.sizeBytes === 0)).toBe(true);
     });
   });
