@@ -421,7 +421,7 @@ ever recorded**. Pair it with `--min-bytes` so a truncated database — which pa
 
 ### Backup lifecycle states and markers
 
-Every `BackupEntry` (from `listBackupsWithPlan`, `listBackups`, etc.) carries a `state`:
+Every `BackupEntry` (from `listBackupsWithPlan` and `listBackupMarkers`) carries a `state`:
 
 | state | meaning |
 |---|---|
