@@ -82,6 +82,9 @@ export interface RcloneDestination {
   keep?: number;
   /** RCLONE_CONFIG for the upload. */
   configFile?: string;
+  /** Set false to never attempt remote retention pruning for this destination
+   *  (e.g. an append-only / immutable bucket where DELETE is denied). Default: pruning runs. */
+  prune?: boolean;
 }
 
 export interface S3Destination {
@@ -93,6 +96,9 @@ export interface S3Destination {
   /** Legacy per-destination flat count, used ONLY when no unified (GFS)
    * policy is configured. Default 30, never fewer than 1. */
   keep?: number;
+  /** Set false to never attempt remote retention pruning for this destination
+   *  (e.g. an append-only / immutable bucket where DELETE is denied). Default: pruning runs. */
+  prune?: boolean;
 }
 
 export type BackupDestination = LocalDestination | RcloneDestination | S3Destination;

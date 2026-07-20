@@ -753,6 +753,109 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
     expect(objects.has('sqlite-backup-20260103-000000Z.db')).toBe(true);
   });
 
+  // BWK: append-only / immutable destinations (e.g. an S3 bucket whose IAM
+  // key has an explicit Deny on s3:DeleteObject) can never be client-pruned.
+  // `prune: false` lets such a destination opt out of remote retention
+  // pruning entirely, without affecting uploads or any other destination.
+  it('a destination with prune: false never attempts remote pruning, even though uploads still happen (rclone)', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+    const calls: string[][] = [];
+    const deleted: string[] = [];
+
+    const runtime = makeRuntime({
+      commandExists: (c: string) => c === 'rclone',
+      execFileSync: ((_c: string, args: string[]) => {
+        calls.push(args);
+        if (args[0] === 'lsjson') {
+          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-') && n.endsWith('.db'))!;
+          return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
+        }
+        if (args[0] === 'lsf') {
+          // Plenty of "old" objects that WOULD be pruned under keep:1 if
+          // pruning ran at all — proves the skip, not just an empty listing.
+          return Buffer.from(
+            ['sqlite-backup-20260709-120000Z.db', 'sqlite-backup-20260708-120000Z.db', 'sqlite-backup-20260705-150000Z.db'].join('\n'),
+          );
+        }
+        if (args[0] === 'deletefile') deleted.push(String(args[1]));
+        return Buffer.from('');
+      }) as never,
+    });
+
+    runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+      runtime, remote: { target: 'offsite:immutable', keep: 1, prune: false },
+    });
+
+    expect(calls.some((c) => c[0] === 'copyto'), 'upload must still happen').toBe(true);
+    expect(calls.some((c) => c[0] === 'lsf' || c[0] === 'deletefile'), 'must never even list/delete for pruning').toBe(false);
+    expect(deleted).toEqual([]);
+  });
+
+  it('without prune (default: pruning runs), the destination still prunes exactly as before (regression guard)', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+    const deleted: string[] = [];
+
+    const runtime = makeRuntime({
+      commandExists: (c: string) => c === 'rclone',
+      execFileSync: ((_c: string, args: string[]) => {
+        if (args[0] === 'lsjson') {
+          const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-') && n.endsWith('.db'))!;
+          return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
+        }
+        if (args[0] === 'lsf') {
+          return Buffer.from(
+            ['sqlite-backup-20260709-120000Z.db', 'sqlite-backup-20260708-120000Z.db', 'sqlite-backup-20260705-150000Z.db'].join('\n'),
+          );
+        }
+        if (args[0] === 'deletefile') deleted.push(String(args[1]));
+        return Buffer.from('');
+      }) as never,
+    });
+
+    runBackupJob({
+      allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', outputDir, compressSqlite: false,
+      runtime, remote: { target: 'offsite:normal', keep: 1 },
+    });
+
+    expect(deleted.length).toBeGreaterThan(0);
+  });
+
+  it('a destination with prune: false is honored by runBackupJobAsync (S3) too — upload succeeds, DELETE is never attempted', async () => {
+    const cwd = makeTempDir();
+    fs.writeFileSync(path.join(cwd, 'app.db'), 'db');
+
+    const oldNames = ['sqlite-backup-20260101-000000Z.db', 'sqlite-backup-20260102-000000Z.db'];
+    const objects = new Map<string, Buffer>(oldNames.map((n) => [n, Buffer.from('old backup bytes')]));
+    const deletedKeys: string[] = [];
+    const { fetchImpl } = makeFakeS3({
+      objects,
+      onRequest: (url, opts) => {
+        if (opts.method === 'DELETE') deletedKeys.push(new URL(url).pathname);
+      },
+    });
+
+    const result = await runBackupJobAsync({
+      allowUnsafeCopy: true,
+      cwd,
+      databaseUrl: 'file:./app.db',
+      compressSqlite: false,
+      outputDir: path.join(cwd, 'staging'),
+      destinations: [{ type: 's3', bucket: 'mybucket', keep: 1, prune: false }],
+      runtime: makeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+    });
+
+    expect(result.uploaded).not.toBeNull(); // upload still happened
+    expect(deletedKeys).toEqual([]); // pruning was skipped entirely
+    expect(objects.size).toBe(oldNames.length + 1); // old objects survive, alongside the new upload
+  });
+
   it('no event-loop block: an in-flight S3 upload lets a concurrent timer/microtask run', async () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');

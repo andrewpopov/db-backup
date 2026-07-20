@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.19.0
+
+Add an optional per-destination `prune: false` opt-out for remote destinations
+(`RcloneDestination`, `S3Destination`). When set, the backup job uploads to that
+destination as usual but never attempts remote retention pruning on it. This is
+for **append-only / immutable** remotes — e.g. an S3 bucket whose IAM key has an
+explicit `Deny` on `s3:DeleteObject` — where the prune `DELETE` can only ever
+fail (a harmless-but-noisy `Failed to prune remote backup … DELETE returned 403`
+every run). Retention for such destinations is expected to be handled bucket-side
+(e.g. an S3 lifecycle rule) instead of by the client.
+
+Additive and backward-compatible: `prune` unset (or `true`) preserves the exact
+prior pruning behavior. The skip is applied consistently in both the synchronous
+(`runBackupJob`) and asynchronous (`runBackupJobAsync`) prune loops, and only
+after every destination has a verified replica (pruning never runs ahead of
+replication). Local destinations are unaffected — `prune` is a remote-only field.
+
 ## 0.18.0
 
 Add a top-level `backupId` field to the backup job result (`runBackupJob` /

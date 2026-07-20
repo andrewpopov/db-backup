@@ -989,6 +989,7 @@ function normalizeDestination(dest, cwd) {
       target,
       ...(dest.configFile ? { configFile: dest.configFile } : {}),
       ...(dest.keep ? { keep: dest.keep } : {}),
+      ...(dest.prune === false ? { prune: false } : {}),
       verify: dest.verify !== false,
     };
   }
@@ -1003,6 +1004,7 @@ function normalizeDestination(dest, cwd) {
     ...(dest.endpoint ? { endpoint: dest.endpoint } : {}),
     ...(dest.region ? { region: dest.region } : {}),
     ...(dest.keep ? { keep: dest.keep } : {}),
+    ...(dest.prune === false ? { prune: false } : {}),
   };
 }
 
@@ -3372,6 +3374,7 @@ function runBackupJob(options = {}) {
       // SAME policy drives every destination once a GFS policy is configured
       // (resolveDestinationPolicy); otherwise each keeps its legacy count.
       for (const distribution of distributions) {
+        if (distribution.destination.prune === false) continue; // immutable/append-only destination: never attempt remote pruning
         const policy = resolveDestinationPolicy(distribution.destination, resolved);
         distribution.removed = pruneRemoteBackups(
           distribution.destination,
@@ -3445,6 +3448,7 @@ async function runBackupJobAsync(options = {}) {
       // Retention is applied per destination only after EVERY destination has
       // a verified copy — a prune must never run ahead of replication.
       for (const distribution of distributions) {
+        if (distribution.destination.prune === false) continue; // immutable/append-only destination: never attempt remote pruning
         const policy = resolveDestinationPolicy(distribution.destination, resolved);
         distribution.removed =
           distribution.destination.type === 's3'
