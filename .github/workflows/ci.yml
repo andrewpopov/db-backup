@@ -68,6 +68,23 @@ jobs:
           fi
           echo "all CI jobs green"
 
+  # Advisory only: reports fragment/hygiene status on PRs but never blocks a
+  # merge. Not part of ci-success's `needs` and not a required status check —
+  # continue-on-error means a failing hygiene check shows as a warning icon,
+  # not a red X.
+  release-hygiene:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm run release:hygiene -- --base origin/master
+
   # Tags are the shipped artifact (consumers install github:...#vX.Y.Z), so gate
   # them: the tag must match package.json version and have a CHANGELOG entry.
   release-guard:

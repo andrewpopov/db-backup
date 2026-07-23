@@ -44,12 +44,19 @@
     "test": "vitest run",
     "verify:pack": "node scripts/verify-pack.mjs",
     "verify:types": "tsc --noEmit -p tsconfig.types.json",
-    "verify": "npm run verify:types && npm test && npm run verify:pack && npm audit --omit=dev --audit-level=high"
+    "verify": "npm run verify:types && npm test && npm run verify:pack && npm audit --omit=dev --audit-level=high",
+    "release:note": "release-kit note",
+    "release:notes": "release-kit notes",
+    "release:bump": "release-kit bump",
+    "release:cut": "release-kit cut",
+    "release:check": "release-kit check",
+    "release:hygiene": "release-kit hygiene"
   },
   "dependencies": {
     "dotenv": "^16.5.0"
   },
   "devDependencies": {
+    "@andrewpopov/release-kit": "github:andrewpopov/release-kit#v0.2.0",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
