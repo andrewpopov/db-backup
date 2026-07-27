@@ -1,6 +1,8 @@
+<!-- GENERATED FILE — DO NOT EDIT. Canonical: agent_brain/knowledge/shared-package-standards.md · regenerate: agent_brain/scripts/sync-standards.sh · drift is checked each weekly librarian sweep. -->
+
 # Shared package standards
 
-*Canonical standard for every `andrewpopov/*` package under `~/proj/packages/`. Each package repo carries a `STANDARDS.md` that must match this file — this is the source of truth; the per-repo copies are synchronized from it. Every engineering rule below cites the real defect that motivated it.*
+*Synced copy — do not edit. The canonical source of truth is `agent_brain/knowledge/shared-package-standards.md`; edit that and run `agent_brain/scripts/sync-standards.sh`. Every engineering rule below cites the real defect that motivated it.*
 
 The governing rule: **a shared package must be a superset of the best implementation across all of its consumers.** Consolidation is only a win if the shared version is more feature-rich and more reliable than the hand-rolled copy it replaces. See [`shared-packages-extraction.md`](shared-packages-extraction.md) for where the boundaries go and why.
 
