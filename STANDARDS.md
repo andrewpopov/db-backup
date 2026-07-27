@@ -126,7 +126,7 @@ No `execFileSync` / `execSync` / `spawnSync` without an explicit `timeout`. Expo
 
 > **Why:** `db-backup` and `prisma-tools` bounded *none* of their commands (db-backup's only `timeout` was sqlite's `.timeout 5000` *lock* pragma, not a process bound), so a hung `pg_dump` or `next build` blocked a nightly cron or a deploy forever. Both are fixed (v0.7.0, v0.4.0).
 >
-> `deploy-kit` is the cautionary case: `src/exec.js:51` applies a timeout only `if (config.stepTimeoutSeconds)`, and `src/config.js:53` defaults it to `null`. **None of its five consumers set it**, so every deploy step (`npm ci`, build, migrate, `pm2 restart`) runs unbounded on the Pi — directly under the code comment *"Kill a hung remote command instead of blocking the pipeline forever."* The capability shipped; the bound never did.
+> `deploy-kit` was the cautionary case through v0.13.x: `src/exec.js` applied a timeout only `if (config.stepTimeoutSeconds)`, and `src/config.js` defaulted it to `null`. None of its consumers set it, so every deploy step (`npm ci`, build, migrate, `pm2 restart`) ran unbounded on the Pi — directly under the code comment *"Kill a hung remote command instead of blocking the pipeline forever."* The capability shipped; the bound never did. **Fixed in v0.14.0:** `stepTimeoutSeconds` now defaults to `1800` and is applied unconditionally — an explicit `null` is the only opt-out.
 >
 > `release-kit` is the reference: both of its `execFileSync` calls carry a timeout (10s, 5s).
 
