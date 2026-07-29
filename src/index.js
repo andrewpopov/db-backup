@@ -3156,12 +3156,36 @@ function getOperationalStatus({
   };
 }
 
+// A webhook URL is a CREDENTIAL — anyone holding it can post to the channel. The
+// body is already kept off argv (see `-d @-` below), but the URL itself is an argv
+// element, and execFileSync puts the whole command line into `error.message`. So a
+// failed POST used to print the full webhook into stdout/journald: on pitelite, a
+// DNS blip on 2026-07-28 wrote rouge's live #alerts webhook to the journal in
+// plaintext. Redact before anything derived from an error is logged.
+//
+// Mirrors alert-kit's `redactWebhookUrl`. The duplication is deliberate for now —
+// db-backup carries no runtime deps — and is the concrete argument for routing
+// both packages through one shared alert transport.
+function redactWebhookUrl(text, url) {
+  let out = String(text);
+  if (url && url.length > 0) out = out.split(url).join('<redacted-webhook-url>');
+  out = out.replace(/https?:\/\/\S*?\/webhooks\/\S+/gi, '<redacted-webhook-url>');
+  out = out.replace(/\bdiscord(?:app)?\.com\/api\/webhooks\/\S+/gi, '<redacted-webhook-url>');
+  return out;
+}
+
 // Best-effort alert delivery. NEVER throws and NEVER changes the exit code — a
 // failing webhook must not mask (or manufacture) a stale-backup verdict. Stays
 // synchronous (no fetch) so runCli's contract and every consumer's
 // `try { runCli() } catch` are unaffected. Zero new deps: POSTs via curl (the
 // discord/webhook helpers), or runs an arbitrary command with the message in
 // $DB_BACKUP_ALERT (the fully generic escape hatch).
+//
+// NOTE: this fires on EVERY invocation while the alert condition holds — there is
+// no debounce, cooldown, or recovery notice here (deploy-kit's `monitor` has all
+// three). A 6-hourly freshness timer against a genuinely stale backup therefore
+// produces ~4 identical messages a day. Callers should treat a burst as one
+// incident; see docs for the suppression work that would fix this properly.
 function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, runtime = normalizeRuntime() } = {}) {
   const postJson = (url, body) => {
     if (!runtime.commandExists('curl')) {
@@ -3176,11 +3200,11 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
   };
   if (notifyDiscord) {
     try { postJson(notifyDiscord, { content: message }); }
-    catch (err) { console.warn(`[db-backup] Discord notify failed: ${err && err.message ? err.message : err}`); }
+    catch (err) { console.warn(`[db-backup] Discord notify failed: ${redactWebhookUrl(err && err.message ? err.message : err, notifyDiscord)}`); }
   }
   if (notifyWebhook) {
     try { postJson(notifyWebhook, { text: message }); }
-    catch (err) { console.warn(`[db-backup] webhook notify failed: ${err && err.message ? err.message : err}`); }
+    catch (err) { console.warn(`[db-backup] webhook notify failed: ${redactWebhookUrl(err && err.message ? err.message : err, notifyWebhook)}`); }
   }
   if (notifyCommand) {
     try {
@@ -3188,7 +3212,8 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
         env: { ...process.env, DB_BACKUP_ALERT: message },
         stdio: ['ignore', 'inherit', 'inherit'],
       });
-    } catch (err) { console.warn(`[db-backup] notify-command failed: ${err && err.message ? err.message : err}`); }
+      // The command itself is operator-supplied and may embed a webhook URL.
+    } catch (err) { console.warn(`[db-backup] notify-command failed: ${redactWebhookUrl(err && err.message ? err.message : err)}`); }
   }
 }
 
@@ -4030,6 +4055,7 @@ module.exports = {
   getOperationalStatus,
   listBackupMarkers,
   notifyAlert,
+  redactWebhookUrl,
   uploadBackupToRemote,
   pruneRemoteBackups,
   DEFAULT_CIPHER_ALGO,

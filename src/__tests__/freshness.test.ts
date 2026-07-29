@@ -10,6 +10,7 @@ const {
   checkBackupFreshness,
   checkRemoteFreshness,
   notifyAlert,
+  redactWebhookUrl,
   writeSuccessStamp,
   getOperationalStatus,
 } = dbBackup;
@@ -159,6 +160,89 @@ describe('checkRemoteFreshness (off-host dead-man switch)', () => {
         now: fixedNow,
       }),
     ).toThrow(/Could not list remote backups/i);
+  });
+});
+describe('webhook URL redaction', () => {
+  // The real leak, reproduced: a DNS failure on pitelite made curl fail, and
+  // execFileSync put the ENTIRE command line -- including rouge's live #alerts
+  // webhook -- into error.message, which was then console.warn'd straight into
+  // journald in plaintext.
+  const LIVE_SHAPE =
+    'Command failed: curl -fsS -X POST -H Content-Type: application/json -d @- ' +
+    'https://discord.com/api/webhooks/1525256591954415686/FSoes7Eddk3i8tlqwKXREXdg7U0LD35lZsY4gEAmKyI6Nhiawt57Td09qBtk7fkzZu0c';
+
+  it('redacts the exact string shape that leaked into the journal', () => {
+    const out = redactWebhookUrl(LIVE_SHAPE);
+    expect(out).not.toContain('FSoes7Eddk3i8tlqwKXREXdg7U0LD35lZsY4gEAmKyI6Nhiawt57Td09qBtk7fkzZu0c');
+    expect(out).not.toContain('1525256591954415686');
+    expect(out).toContain('<redacted-webhook-url>');
+    // The useful part of the diagnostic survives.
+    expect(out).toContain('Command failed');
+  });
+
+  it('redacts a known URL by exact match even when it matches no pattern', () => {
+    const odd = 'https://hooks.internal.example/relay/abc123';
+    expect(redactWebhookUrl(`POST to ${odd} failed`, odd)).toBe(
+      'POST to <redacted-webhook-url> failed',
+    );
+  });
+
+  it('redacts any /webhooks/ URL and the discordapp.com alias', () => {
+    expect(redactWebhookUrl('see https://example.com/api/webhooks/1/secret now')).toContain(
+      '<redacted-webhook-url>',
+    );
+    expect(redactWebhookUrl('at discordapp.com/api/webhooks/9/tok')).not.toContain('tok');
+  });
+
+  it('leaves text with no webhook untouched', () => {
+    expect(redactWebhookUrl('newest backup is 83.5h old (threshold 192h)')).toBe(
+      'newest backup is 83.5h old (threshold 192h)',
+    );
+  });
+
+  it('notifyAlert never logs the Discord webhook when the POST fails', () => {
+    const url = 'https://discord.com/api/webhooks/1525256591954415686/FSoes7EddkSECRETtoken';
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...parts: unknown[]) => { warnings.push(parts.join(' ')); };
+    try {
+      notifyAlert('backup stale', {
+        notifyDiscord: url,
+        runtime: makeRuntime({
+          commandExists: () => true,
+          execFileSync: ((command: string, args: string[]) => {
+            // Reproduce execFileSync's behaviour: the command line, URL included.
+            throw new Error(`Command failed: ${command} ${args.join(' ')}`);
+          }) as never,
+        }),
+      });
+    } finally {
+      console.warn = warn;
+    }
+    expect(warnings.join('\n')).not.toContain('FSoes7EddkSECRETtoken');
+    expect(warnings.join('\n')).not.toContain(url);
+    expect(warnings.join('\n')).toContain('<redacted-webhook-url>');
+  });
+
+  it('notifyAlert never logs a generic webhook URL when the POST fails', () => {
+    const url = 'https://hooks.example.com/services/T000/B000/GENERICSECRET';
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...parts: unknown[]) => { warnings.push(parts.join(' ')); };
+    try {
+      notifyAlert('backup stale', {
+        notifyWebhook: url,
+        runtime: makeRuntime({
+          commandExists: () => true,
+          execFileSync: ((command: string, args: string[]) => {
+            throw new Error(`Command failed: ${command} ${args.join(' ')}`);
+          }) as never,
+        }),
+      });
+    } finally {
+      console.warn = warn;
+    }
+    expect(warnings.join('\n')).not.toContain('GENERICSECRET');
   });
 });
 describe('notifyAlert', () => {
