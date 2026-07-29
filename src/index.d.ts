@@ -752,6 +752,13 @@ export function notifyAlert(
   },
 ): void;
 
+/** Strip a webhook URL out of text before it is logged. Exact-matches `url` when
+ * the caller knows it (shape-independent, and safe against regex metacharacters
+ * because it splits rather than matches), plus any `/webhooks/…` or
+ * `discord(app).com/api/webhooks/…` URL. Does NOT recognise every vendor's webhook
+ * shape — pass `url` whenever you have it. */
+export function redactWebhookUrl(text: unknown, url?: string | null): string;
+
 /** Build a bounded runtime. Pass `commandTimeoutMs` (or set
  * `DB_BACKUP_COMMAND_TIMEOUT_MS`) to override the default bound. */
 export function normalizeRuntime(runtime?: BackupRuntime): ResolvedBackupRuntime;

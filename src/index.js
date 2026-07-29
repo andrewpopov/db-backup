@@ -3156,12 +3156,44 @@ function getOperationalStatus({
   };
 }
 
+// A webhook URL is a CREDENTIAL — anyone holding it can post to the channel. The
+// body is already kept off argv (see `-d @-` below), but the URL itself is an argv
+// element, and execFileSync puts the whole command line into `error.message`. So a
+// failed POST used to print the full webhook into stdout/journald: on pitelite, a
+// DNS blip on 2026-07-28 wrote rouge's live #alerts webhook to the journal in
+// plaintext. Redact before anything derived from an error is logged.
+//
+// Mirrors alert-kit's `redactWebhookUrl` (discord.ts). The duplication is FORCED,
+// not merely preferred: alert-kit defines the helper but does not re-export it from
+// its entrypoint, so no consumer can reach it today. (An earlier version of this
+// comment claimed db-backup "carries no runtime deps" as the reason — that is
+// false; `dotenv` is required at the top of this file.) Deleting this copy is a
+// two-step: export it from alert-kit, then depend on it. See PKG-113.
+//
+// Covers the exact-match case plus Discord-shaped URLs. It deliberately does NOT
+// try to recognise every vendor's webhook shape — where the URL is known, callers
+// pass it and exact-match makes shape irrelevant; where it is not known, see the
+// notify-command sink below, which logs nothing derived from operator input.
+function redactWebhookUrl(text, url) {
+  let out = String(text);
+  if (url && url.length > 0) out = out.split(url).join('<redacted-webhook-url>');
+  out = out.replace(/https?:\/\/\S*?\/webhooks\/\S+/gi, '<redacted-webhook-url>');
+  out = out.replace(/\bdiscord(?:app)?\.com\/api\/webhooks\/\S+/gi, '<redacted-webhook-url>');
+  return out;
+}
+
 // Best-effort alert delivery. NEVER throws and NEVER changes the exit code — a
 // failing webhook must not mask (or manufacture) a stale-backup verdict. Stays
 // synchronous (no fetch) so runCli's contract and every consumer's
 // `try { runCli() } catch` are unaffected. Zero new deps: POSTs via curl (the
 // discord/webhook helpers), or runs an arbitrary command with the message in
 // $DB_BACKUP_ALERT (the fully generic escape hatch).
+//
+// NOTE: this fires on EVERY invocation while the alert condition holds — there is
+// no debounce, cooldown, or recovery notice here (deploy-kit's `monitor` has all
+// three). A 6-hourly freshness timer against a genuinely stale backup therefore
+// produces ~4 identical messages a day. Callers should treat a burst as one
+// incident; see docs for the suppression work that would fix this properly.
 function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, runtime = normalizeRuntime() } = {}) {
   const postJson = (url, body) => {
     if (!runtime.commandExists('curl')) {
@@ -3176,11 +3208,11 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
   };
   if (notifyDiscord) {
     try { postJson(notifyDiscord, { content: message }); }
-    catch (err) { console.warn(`[db-backup] Discord notify failed: ${err && err.message ? err.message : err}`); }
+    catch (err) { console.warn(`[db-backup] Discord notify failed: ${redactWebhookUrl(err && err.message ? err.message : err, notifyDiscord)}`); }
   }
   if (notifyWebhook) {
     try { postJson(notifyWebhook, { text: message }); }
-    catch (err) { console.warn(`[db-backup] webhook notify failed: ${err && err.message ? err.message : err}`); }
+    catch (err) { console.warn(`[db-backup] webhook notify failed: ${redactWebhookUrl(err && err.message ? err.message : err, notifyWebhook)}`); }
   }
   if (notifyCommand) {
     try {
@@ -3188,7 +3220,24 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
         env: { ...process.env, DB_BACKUP_ALERT: message },
         stdio: ['ignore', 'inherit', 'inherit'],
       });
-    } catch (err) { console.warn(`[db-backup] notify-command failed: ${err && err.message ? err.message : err}`); }
+      // NEVER log anything derived from this error. `err.message` is the whole
+      // `/bin/sh -c <notifyCommand>` line, and notifyCommand is operator-supplied:
+      // it may embed a webhook URL of ANY shape (Slack `hooks.slack.com/services/…`,
+      // Google Chat `?key=…&token=…`, Teams `…webhook.office.com/…`) or a credential
+      // that isn't a webhook at all. redactWebhookUrl cannot help here — with no
+      // known URL to exact-match it falls back to patterns, and pattern-matching
+      // arbitrary operator input is unwinnable whack-a-mole. Report the failure and
+      // the exit status only; the operator knows what command they configured.
+      //
+      // Note the child's OWN stdout/stderr are inherited (above) and so bypass this
+      // entirely — `curl -v <webhook>` as a notify command will print its URL. That
+      // is left as-is deliberately: it is the operator's command emitting its own
+      // output, and swallowing it would hide legitimate diagnostics. Do not put a
+      // secret in a notify command that prints it.
+    } catch (err) {
+      const status = err && err.status != null ? ` (exit ${err.status})` : '';
+      console.warn(`[db-backup] notify-command failed${status}`);
+    }
   }
 }
 
@@ -4030,6 +4079,7 @@ module.exports = {
   getOperationalStatus,
   listBackupMarkers,
   notifyAlert,
+  redactWebhookUrl,
   uploadBackupToRemote,
   pruneRemoteBackups,
   DEFAULT_CIPHER_ALGO,
