@@ -224,6 +224,53 @@ describe('webhook URL redaction', () => {
     expect(warnings.join('\n')).toContain('<redacted-webhook-url>');
   });
 
+  it('notifyAlert logs NOTHING derived from a failed notify-command', () => {
+    // The command line is operator-supplied and may embed a webhook of any vendor
+    // shape, or a credential that is not a webhook at all. redactWebhookUrl cannot
+    // save this path (no known URL to exact-match), so nothing derived from the
+    // error may be logged -- only the failure and the exit status.
+    const secrets = [
+      'https://hooks.slack.com/services/T0/B0/SLACKSECRET',
+      'https://chat.googleapis.com/v1/spaces/A/messages?key=K&token=GCHATSECRET',
+      'https://acme.webhook.office.com/webhookb2/a/IncomingWebhook/b/TEAMSSECRET',
+      'PGPASSWORD=notawebhookatall',
+    ];
+    for (const secret of secrets) {
+      const warnings: string[] = [];
+      const warn = console.warn;
+      console.warn = (...parts: unknown[]) => { warnings.push(parts.join(' ')); };
+      try {
+        notifyAlert('backup stale', {
+          notifyCommand: `curl -X POST '${secret}'`,
+          runtime: makeRuntime({
+            commandExists: () => true,
+            execFileSync: ((command: string, args: string[]) => {
+              const error: any = new Error(`Command failed: ${command} ${args.join(' ')}`);
+              error.status = 7;
+              throw error;
+            }) as never,
+          }),
+        });
+      } finally {
+        console.warn = warn;
+      }
+      const logged = warnings.join('\n');
+      expect(logged).not.toContain(secret);
+      expect(logged).not.toMatch(/SLACKSECRET|GCHATSECRET|TEAMSSECRET|notawebhookatall/);
+      expect(logged).toContain('notify-command failed');
+      expect(logged).toContain('exit 7');
+    }
+  });
+
+  it('redactWebhookUrl exact-match makes vendor shape irrelevant', () => {
+    // Pattern-matching cannot cover every vendor, which is WHY callers pass the URL.
+    const slack = 'https://hooks.slack.com/services/T0/B0/SLACKSECRET';
+    expect(redactWebhookUrl(`POST ${slack} failed`, slack)).not.toContain('SLACKSECRET');
+    // Documented limitation, asserted so it is a known gap rather than a surprise:
+    // with NO url passed, a non-Discord shape is not recognised.
+    expect(redactWebhookUrl(`POST ${slack} failed`)).toContain('SLACKSECRET');
+  });
+
   it('notifyAlert never logs a generic webhook URL when the POST fails', () => {
     const url = 'https://hooks.example.com/services/T000/B000/GENERICSECRET';
     const warnings: string[] = [];

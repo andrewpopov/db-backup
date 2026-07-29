@@ -17,6 +17,7 @@ import {
   createSqliteSnapshot,
   verifySqliteBackupIntegrity,
   checkBackupFreshness,
+  redactWebhookUrl,
   writeSuccessStamp,
   uploadBackupToRemote,
   pruneRemoteBackups,
@@ -265,3 +266,12 @@ const _parsedCustom = parseBackupFileName('smarthome-20260705-150000Z.db.gz.gpg'
 const _engine: 'sqlite' | 'postgres' | undefined = _parsedCustom?.engine;
 const _foreign: null = parseBackupFileName('otherapp-20260705-150000Z.db') as null;
 export const _prefixContract = { _engine, _foreign };
+
+// Webhook redaction is part of the public surface (a security helper is useless if
+// TypeScript consumers cannot import it). This line is the gate: `verify:types`
+// only typechecks index.d.ts and THIS file, so an export without a declaration is
+// invisible unless it is exercised here.
+const _redactedKnown: string = redactWebhookUrl('POST to https://x/webhooks/1/t failed', 'https://x/webhooks/1/t');
+const _redactedUnknown: string = redactWebhookUrl('curl: (6) could not resolve host');
+const _redactedNonString: string = redactWebhookUrl(new Error('boom'), null);
+export const _redactionContract = { _redactedKnown, _redactedUnknown, _redactedNonString };
