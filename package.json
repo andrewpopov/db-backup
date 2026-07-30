@@ -1,6 +1,6 @@
 {
   "name": "@andrewpopov/db-backup",
-  "version": "0.19.1",
+  "version": "0.20.0",
   "description": "Reusable database backup manager with age-tier retention (SQLite raw/gzip + Postgres pg_dump)",
   "author": "Andrew Popov",
   "main": "src/index.js",
@@ -54,6 +54,7 @@
     "verify:bins": "release-kit verify-bins"
   },
   "dependencies": {
+    "@andrewpopov/alert-kit": "github:andrewpopov/alert-kit#v0.6.1",
     "dotenv": "^16.5.0"
   },
   "devDependencies": {

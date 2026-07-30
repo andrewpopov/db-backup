@@ -4,6 +4,17 @@ const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const zlib = require('zlib');
 const { config: loadDotenv, parse: parseDotenv } = require('dotenv');
+// Suppression ONLY — never alert-kit's transport. notifyAlert below stays synchronous
+// curl on purpose (see its contract), and stepCheck is pure, so taking the decision
+// logic costs nothing at runtime. redactWebhookUrl comes from here too now that it is
+// reachable from the entrypoint (PKG-113); destructured into locals so module.exports
+// can re-export it with a shorthand key, which is what keeps it visible to
+// cjs-module-lexer for ESM consumers.
+const {
+  stepCheck,
+  unsentAlertState,
+  redactWebhookUrl,
+} = require('@andrewpopov/alert-kit');
 // Destructure into locals so module.exports can use shorthand keys — Node's
 // cjs-module-lexer only detects named exports for identifier/shorthand forms, so
 // `key: storage.fn` would be invisible to ESM `import { fn }` consumers.
@@ -152,6 +163,10 @@ function parseArgs(argv) {
     stampFile: null,
     namePrefix: null,
     maxAgeHours: 36,
+    stateFile: null,
+    failAfterRuns: 1,
+    recoverAfterRuns: 1,
+    reAlertAfterHours: 24,
     remoteTarget: null,
     remoteKeep: null,
     rcloneConfig: null,
@@ -490,6 +505,43 @@ function parseArgs(argv) {
       const value = strictNonNegativeInt(argv[index + 1]);
       if (value === null || value < 1) throw new Error('--max-age-hours must be an integer >= 1');
       options.maxAgeHours = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--state-file') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --state-file');
+      options.stateFile = value;
+      index += 1;
+      continue;
+    }
+
+    // Thresholds default to 1/1: alert on the first bad run and recover on the first
+    // good one, i.e. no behaviour change for anyone who does not opt in. Only the
+    // re-alert interval suppresses by default, because repeating an unchanged alert
+    // every run is the actual reported bug.
+    if (arg === '--fail-after-runs') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null || value < 1) throw new Error('--fail-after-runs must be an integer >= 1');
+      options.failAfterRuns = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--recover-after-runs') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null || value < 1) throw new Error('--recover-after-runs must be an integer >= 1');
+      options.recoverAfterRuns = value;
+      index += 1;
+      continue;
+    }
+
+    // 0 disables reminders: alert once per incident and stay quiet until recovery.
+    if (arg === '--realert-after-hours') {
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null) throw new Error('--realert-after-hours must be an integer >= 0 (0 disables reminders)');
+      options.reAlertAfterHours = value;
       index += 1;
       continue;
     }
@@ -3163,23 +3215,63 @@ function getOperationalStatus({
 // DNS blip on 2026-07-28 wrote rouge's live #alerts webhook to the journal in
 // plaintext. Redact before anything derived from an error is logged.
 //
-// Mirrors alert-kit's `redactWebhookUrl` (discord.ts). The duplication is FORCED,
-// not merely preferred: alert-kit defines the helper but does not re-export it from
-// its entrypoint, so no consumer can reach it today. (An earlier version of this
-// comment claimed db-backup "carries no runtime deps" as the reason — that is
-// false; `dotenv` is required at the top of this file.) Deleting this copy is a
-// two-step: export it from alert-kit, then depend on it. See PKG-113.
+// `redactWebhookUrl` now comes from alert-kit (imported at the top of this file).
+// The local copy existed only because alert-kit did not re-export it; PKG-113 fixed
+// that. Before deleting the copy the two were diffed on real inputs, and alert-kit
+// 0.6.0 threw a TypeError on every non-string — which is exactly what the call sites
+// below pass (`err.message ? err.message : err`). That coercion was folded back into
+// the kit as 0.6.1 rather than kept as a shim here, so this package depends on a
+// version that is not worse than the code it replaced.
 //
-// Covers the exact-match case plus Discord-shaped URLs. It deliberately does NOT
+// It covers the exact-match case plus Discord-shaped URLs, and deliberately does NOT
 // try to recognise every vendor's webhook shape — where the URL is known, callers
 // pass it and exact-match makes shape irrelevant; where it is not known, see the
 // notify-command sink below, which logs nothing derived from operator input.
-function redactWebhookUrl(text, url) {
-  let out = String(text);
-  if (url && url.length > 0) out = out.split(url).join('<redacted-webhook-url>');
-  out = out.replace(/https?:\/\/\S*?\/webhooks\/\S+/gi, '<redacted-webhook-url>');
-  out = out.replace(/\bdiscord(?:app)?\.com\/api\/webhooks\/\S+/gi, '<redacted-webhook-url>');
-  return out;
+
+// ---------------------------------------------------------------------------
+// Alert suppression (PKG-113). The state machine itself is alert-kit's `stepCheck`;
+// everything here is the persistence and mapping this CLI owns.
+// ---------------------------------------------------------------------------
+
+// Read the per-check alert state. A missing file is a first run, not an error. A
+// CORRUPT file is also treated as a first run — deliberately: the failure mode of
+// bailing out would be no alert at all about a possibly-stale backup, and being
+// noisy once beats being silent about a dead backup.
+function readAlertState(stateFile, { warn = console.warn } = {}) {
+  if (!stateFile) return undefined;
+  let raw;
+  try {
+    raw = fs.readFileSync(stateFile, 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return undefined;
+    warn(`[db-backup] alert state unreadable (${err && err.code ? err.code : err}); treating as first run`);
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && parsed.check ? parsed.check : undefined;
+  } catch {
+    warn('[db-backup] alert state is not valid JSON; treating as first run');
+    return undefined;
+  }
+}
+
+// Persist atomically (temp file + rename) so a crash mid-write cannot leave a
+// truncated state that reads as "first run" forever. A write failure is reported
+// and swallowed: it must not change the freshness verdict or the exit code.
+function writeAlertState(stateFile, state, { warn = console.warn } = {}) {
+  if (!stateFile) return false;
+  const tmp = `${stateFile}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, check: state }, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(tmp, stateFile);
+    return true;
+  } catch (err) {
+    warn(`[db-backup] could not persist alert state to ${stateFile}: ${err && err.message ? err.message : err}`);
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    return false;
+  }
 }
 
 // Best-effort alert delivery. NEVER throws and NEVER changes the exit code — a
@@ -3189,12 +3281,18 @@ function redactWebhookUrl(text, url) {
 // discord/webhook helpers), or runs an arbitrary command with the message in
 // $DB_BACKUP_ALERT (the fully generic escape hatch).
 //
-// NOTE: this fires on EVERY invocation while the alert condition holds — there is
-// no debounce, cooldown, or recovery notice here (deploy-kit's `monitor` has all
-// three). A 6-hourly freshness timer against a genuinely stale backup therefore
-// produces ~4 identical messages a day. Callers should treat a burst as one
-// incident; see docs for the suppression work that would fix this properly.
+// This function still fires every time it is CALLED — it holds no state. Debounce,
+// recovery and reminders now live one level up in the `freshness` command, which
+// runs alert-kit's `stepCheck` and only calls this when the state machine says to
+// (PKG-113). Anything else calling notifyAlert directly gets the old behaviour: one
+// message per call.
+//
+// Returns { attempted, delivered } so the caller can tell a real delivery from a
+// silent failure. It still NEVER throws and NEVER sets an exit code — the return
+// value is advisory, and callers that ignore it behave exactly as before.
 function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, runtime = normalizeRuntime() } = {}) {
+  let attempted = false;
+  let delivered = false;
   const postJson = (url, body) => {
     if (!runtime.commandExists('curl')) {
       console.warn('[db-backup] notify skipped: curl is unavailable');
@@ -3207,14 +3305,17 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
     });
   };
   if (notifyDiscord) {
-    try { postJson(notifyDiscord, { content: message }); }
+    attempted = true;
+    try { postJson(notifyDiscord, { content: message }); delivered = true; }
     catch (err) { console.warn(`[db-backup] Discord notify failed: ${redactWebhookUrl(err && err.message ? err.message : err, notifyDiscord)}`); }
   }
   if (notifyWebhook) {
-    try { postJson(notifyWebhook, { text: message }); }
+    attempted = true;
+    try { postJson(notifyWebhook, { text: message }); delivered = true; }
     catch (err) { console.warn(`[db-backup] webhook notify failed: ${redactWebhookUrl(err && err.message ? err.message : err, notifyWebhook)}`); }
   }
   if (notifyCommand) {
+    attempted = true;
     try {
       runtime.execFileSync('/bin/sh', ['-c', notifyCommand], {
         env: { ...process.env, DB_BACKUP_ALERT: message },
@@ -3234,11 +3335,13 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
       // is left as-is deliberately: it is the operator's command emitting its own
       // output, and swallowing it would hide legitimate diagnostics. Do not put a
       // secret in a notify command that prints it.
+      delivered = true;
     } catch (err) {
       const status = err && err.status != null ? ` (exit ${err.status})` : '';
       console.warn(`[db-backup] notify-command failed${status}`);
     }
   }
+  return { attempted, delivered };
 }
 
 // The retention policy applied AT a given destination. Local always uses
@@ -3633,6 +3736,18 @@ Options:
   --notify-discord <url>  freshness: POST an alert to a Discord webhook on failure
   --notify-webhook <url>  freshness: POST {"text":...} to a webhook on failure
   --notify-command <cmd>  freshness: run cmd on failure ($DB_BACKUP_ALERT = message)
+  --state-file <path>     freshness: alert-suppression state (default:
+                          <stamp-file>.alerts.json). Required to suppress in --remote
+                          mode, which has no stamp file to derive one from; without it
+                          every run notifies, as before.
+  --fail-after-runs <n>   freshness: consecutive bad runs before the FIRST alert
+                          (default 1 — alert immediately)
+  --recover-after-runs <n> freshness: consecutive good runs before the recovery
+                          notice (default 1)
+  --realert-after-hours <n> freshness: remind about an unchanged problem this often
+                          (default 24, 0 = alert once per incident, never remind).
+                          Suppression NEVER affects the exit code: a stale backup
+                          always exits 1, alert or no alert.
   --no-compress           Disable gzip for SQLite backups
   --allow-missing         Skip (don't fail) when the SQLite database is absent
   --json                  Print JSON output
@@ -3671,17 +3786,55 @@ async function runCli(argv = process.argv.slice(2)) {
     if (!options.stampFile && !options.remoteTarget) {
       throw new Error('freshness requires --stamp-file <path> or --remote <dest>');
     }
+    // Remote check wins when --remote is given: an off-host monitor verifies the
+    // off-site copy directly (the dead-man's switch the local stamp can't be).
+    const source = options.remoteTarget
+      ? `remote ${options.remoteTarget}`
+      : `stamp ${options.stampFile}`;
     const notifyOpts = {
       notifyDiscord: options.notifyDiscord,
       notifyWebhook: options.notifyWebhook,
       notifyCommand: options.notifyCommand,
       runtime: normalizeRuntime({ commandTimeoutMs: options.commandTimeoutMs }),
     };
-    // Remote check wins when --remote is given: an off-host monitor verifies the
-    // off-site copy directly (the dead-man's switch the local stamp can't be).
-    const source = options.remoteTarget
-      ? `remote ${options.remoteTarget}`
-      : `stamp ${options.stampFile}`;
+
+    // Suppression state lives beside the stamp file. In --remote mode there is no
+    // stamp file to derive from, so it must be given explicitly; when it cannot be
+    // determined we say so ONCE and fall back to the old alert-every-run behaviour.
+    // Silently disabling suppression would be the worse failure: the operator would
+    // believe the spam was fixed.
+    const stateFile = options.stateFile || (options.stampFile ? `${options.stampFile}.alerts.json` : null);
+    const suppressionOpts = {
+      failAfterRuns: options.failAfterRuns,
+      recoverAfterRuns: options.recoverAfterRuns,
+      reAlertAfterMinutes: options.reAlertAfterHours * 60,
+      nowMs: Date.now(),
+    };
+    if (!stateFile && (options.notifyDiscord || options.notifyWebhook || options.notifyCommand)) {
+      console.warn('[db-backup] alert suppression disabled: no --state-file and no --stamp-file to derive one from; every run will notify');
+    }
+
+    // Fire an alert only when the state machine says to, then persist. Suppression
+    // gates NOTIFICATION ONLY — never the verdict, never process.exitCode.
+    const gateAlert = (status, message) => {
+      if (!stateFile) {
+        if (message) notifyAlert(message, notifyOpts);
+        return;
+      }
+      const prev = readAlertState(stateFile);
+      const step = stepCheck(prev, { id: 'freshness', status, message }, suppressionOpts);
+      let next = step.next;
+      if (step.alert) {
+        const text = step.alert.kind === 'recovery'
+          ? `✅ ${source}: backup is fresh again`
+          : message;
+        const result = notifyAlert(text, notifyOpts);
+        // A sink was configured but nothing got through: do not record that we
+        // notified, or a live problem goes quiet until the re-alert interval.
+        if (result && result.attempted && !result.delivered) next = unsentAlertState(prev, step.next);
+      }
+      writeAlertState(stateFile, next);
+    };
 
     let status;
     try {
@@ -3701,7 +3854,11 @@ async function runCli(argv = process.argv.slice(2)) {
       // alert condition — the backup's health is UNKNOWN, which we treat as bad.
       const msg = `🔴 ${source}: backup freshness check FAILED (${err && err.message ? err.message : err})`;
       console.error(`[db-backup] ${msg}`);
-      notifyAlert(msg, notifyOpts);
+      // crit, NOT unknown. alert-kit's `unknown` HOLDS — it never confirms a failure —
+      // so mapping "the check could not run" there would silence a permanently dead
+      // rclone forever, which is precisely what this dead-man's switch exists to catch.
+      // A checker that cannot check IS the bad news.
+      gateAlert('crit', msg);
       process.exitCode = 1;
       return;
     }
@@ -3727,9 +3884,11 @@ async function runCli(argv = process.argv.slice(2)) {
       }
     }
 
+    gateAlert(status.fresh ? 'ok' : 'crit', alertMessage);
     if (!status.fresh) {
-      if (alertMessage) notifyAlert(alertMessage, notifyOpts);
-      // Non-zero so a cron wrapper or monitor treats staleness as a failure.
+      // Non-zero so a cron wrapper or monitor treats staleness as a failure. This sits
+      // OUTSIDE the suppression gate on purpose: a suppressed reminder must never turn
+      // a stale backup into a green run.
       process.exitCode = 1;
     }
     return;
@@ -4080,6 +4239,8 @@ module.exports = {
   listBackupMarkers,
   notifyAlert,
   redactWebhookUrl,
+  readAlertState,
+  writeAlertState,
   uploadBackupToRemote,
   pruneRemoteBackups,
   DEFAULT_CIPHER_ALGO,
