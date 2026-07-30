@@ -750,7 +750,7 @@ export function notifyAlert(
     notifyCommand?: string | null;
     runtime?: BackupRuntime;
   },
-): void;
+): { attempted: boolean; delivered: boolean };
 
 /** Strip a webhook URL out of text before it is logged. Exact-matches `url` when
  * the caller knows it (shape-independent, and safe against regex metacharacters
@@ -758,6 +758,21 @@ export function notifyAlert(
  * `discord(app).com/api/webhooks/…` URL. Does NOT recognise every vendor's webhook
  * shape — pass `url` whenever you have it. */
 export function redactWebhookUrl(text: unknown, url?: string | null): string;
+
+/** Per-check alert suppression state persisted between `freshness` runs (alert-kit's SuppressionState). */
+export interface DbBackupAlertState {
+  notif: 'healthy' | 'alerted';
+  failStreak: number;
+  recoverStreak: number;
+  lastAlertAtMs: number;
+  lastAlertedStatus: 'warn' | 'crit' | null;
+}
+
+/** Read suppression state. A missing OR corrupt file reads as a first run — never throws. */
+export function readAlertState(stateFile: string | null | undefined, options?: { warn?: (message: string) => void }): DbBackupAlertState | undefined;
+
+/** Persist suppression state atomically. Returns false (and warns) on failure; never throws. */
+export function writeAlertState(stateFile: string | null | undefined, state: DbBackupAlertState, options?: { warn?: (message: string) => void }): boolean;
 
 /** Build a bounded runtime. Pass `commandTimeoutMs` (or set
  * `DB_BACKUP_COMMAND_TIMEOUT_MS`) to override the default bound. */

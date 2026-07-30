@@ -518,8 +518,41 @@ future timestamp (clock skew), or a check that can't run (rclone missing), it al
 
 Notifications are **best-effort and synchronous** (POST via `curl`, or run the command) —
 a failing webhook never masks or manufactures a verdict, and `freshness` still exits
-non-zero on staleness. No new dependency; no `fetch` (so `runCli` stays synchronous and
-consumers' `try/catch` is unaffected).
+non-zero on staleness. No `fetch`, so `runCli` stays synchronous and consumers'
+`try/catch` is unaffected.
+
+#### Suppression: one alert per incident, not one per run
+
+A 6-hourly timer against a genuinely stale backup used to post an identical message
+every run — on pitelite that was ~25 notifications a week for one unchanged problem,
+which is how a real alert becomes background noise. `freshness` now runs the
+suppression state machine from
+[`@andrewpopov/alert-kit`](https://github.com/andrewpopov/alert-kit) and notifies only
+on a transition:
+
+| flag | default | meaning |
+|---|---|---|
+| `--state-file <path>` | `<stamp-file>.alerts.json` | where the per-check state is persisted |
+| `--fail-after-runs <n>` | `1` | consecutive bad runs before the FIRST alert |
+| `--recover-after-runs <n>` | `1` | consecutive good runs before the recovery notice |
+| `--realert-after-hours <n>` | `24` | remind about an unchanged problem this often (`0` = never remind) |
+
+So a backup that stays stale for a week produces one alert plus one reminder a day —
+not 28 — and one `✅ … backup is fresh again` when it recovers.
+
+Two things suppression deliberately does **not** do:
+
+- **It never touches the exit code.** A stale backup exits `1` on every run, alert or
+  no alert. A quiet run is still a failing run, so a cron wrapper or monitor watching
+  the exit status sees no change.
+- **It never holds on a check that could not run.** A missing `rclone` or an
+  unparseable listing is treated as `crit`, not `unknown` — an indeterminate result
+  would suppress forever, and a checker that cannot check is exactly the failure this
+  dead-man's switch exists to catch.
+
+In `--remote` mode there is no stamp file to derive a state path from, so pass
+`--state-file` explicitly. Without one, `freshness` prints a warning and falls back to
+notifying on every run rather than silently disabling suppression.
 
 ## Supported databases
 

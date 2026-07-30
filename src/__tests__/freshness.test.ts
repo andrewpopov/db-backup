@@ -519,3 +519,145 @@ describe('getOperationalStatus (tone matrix)', () => {
     expect(status.tone).toBe('healthy');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Alert suppression (PKG-113). The state machine is alert-kit's `stepCheck`; what
+// is tested here is db-backup's wiring of it — the mapping, the persistence, and
+// above all the two invariants that must not regress.
+// ---------------------------------------------------------------------------
+describe('freshness alert suppression', () => {
+  const staleStamp = (dir: string, hoursAgo = 100) => {
+    const stampFile = path.join(dir, '.last-success');
+    writeSuccessStamp(stampFile, new Date(Date.now() - hoursAgo * 60 * 60 * 1000));
+    return stampFile;
+  };
+  const sink = (dir: string) => {
+    const log = path.join(dir, 'notifications.log');
+    return { log, command: `printf 'x\\n' >> ${log}`, count: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').length : 0) };
+  };
+  const readState = (stampFile: string) => JSON.parse(fs.readFileSync(`${stampFile}.alerts.json`, 'utf8')).check;
+
+  const runFreshness = async (args: string[]) => {
+    const previous = process.exitCode;
+    process.exitCode = undefined;
+    await runCli(args);
+    const code = process.exitCode;
+    process.exitCode = previous;
+    return code;
+  };
+
+  it('THE BUG: 12 consecutive stale runs notify ONCE, not 12 times', async () => {
+    const dir = makeTempDir();
+    const stampFile = staleStamp(dir);
+    const s = sink(dir);
+    for (let i = 0; i < 12; i += 1) {
+      await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', s.command]);
+    }
+    expect(s.count()).toBe(1);
+    expect(readState(stampFile)).toMatchObject({ notif: 'alerted', failStreak: 12 });
+  });
+
+  it('INVARIANT: a suppressed alert still exits 1 on every stale run', async () => {
+    const dir = makeTempDir();
+    const stampFile = staleStamp(dir);
+    const s = sink(dir);
+    const codes: (number | undefined)[] = [];
+    for (let i = 0; i < 4; i += 1) {
+      codes.push(await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', s.command]));
+    }
+    // Suppression gates NOTIFICATION only. A quiet run is still a failing run.
+    expect(codes).toEqual([1, 1, 1, 1]);
+    expect(s.count()).toBe(1);
+  });
+
+  it('reminds once the re-alert interval has elapsed', async () => {
+    const dir = makeTempDir();
+    const stampFile = staleStamp(dir);
+    const s = sink(dir);
+    await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', s.command]);
+    const state = JSON.parse(fs.readFileSync(`${stampFile}.alerts.json`, 'utf8'));
+    state.check.lastAlertAtMs = Date.now() - 25 * 60 * 60 * 1000;
+    fs.writeFileSync(`${stampFile}.alerts.json`, JSON.stringify(state));
+    await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', s.command]);
+    expect(s.count()).toBe(2);
+  });
+
+  it('--realert-after-hours 0 alerts once per incident and never reminds', async () => {
+    const dir = makeTempDir();
+    const stampFile = staleStamp(dir);
+    const s = sink(dir);
+    await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--realert-after-hours', '0', '--notify-command', s.command]);
+    const state = JSON.parse(fs.readFileSync(`${stampFile}.alerts.json`, 'utf8'));
+    state.check.lastAlertAtMs = Date.now() - 1000 * 60 * 60 * 1000;
+    fs.writeFileSync(`${stampFile}.alerts.json`, JSON.stringify(state));
+    expect(await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--realert-after-hours', '0', '--notify-command', s.command])).toBe(1);
+    expect(s.count()).toBe(1);
+  });
+
+  it('sends exactly one recovery notice when the backup comes back, then stays quiet', async () => {
+    const dir = makeTempDir();
+    const stampFile = staleStamp(dir);
+    const s = sink(dir);
+    await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', s.command]);
+    writeSuccessStamp(stampFile, new Date());
+    expect(await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', s.command])).toBeUndefined();
+    expect(s.count()).toBe(2); // the alert, then the recovery
+    for (let i = 0; i < 3; i += 1) {
+      await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', s.command]);
+    }
+    expect(s.count()).toBe(2); // healthy runs say nothing
+    expect(readState(stampFile)).toMatchObject({ notif: 'healthy' });
+  });
+
+  it('a check that CANNOT RUN is crit, not unknown — a permanently dead checker keeps alerting', async () => {
+    const dir = makeTempDir();
+    const stateFile = path.join(dir, 'remote.alerts.json');
+    const s = sink(dir);
+    // No rclone binary in this runtime: the remote check throws, which is the
+    // dead-man's-switch case. Mapped to `unknown` it would HOLD forever and stay
+    // silent; mapped to crit it alerts and reminds like any other failure.
+    await runFreshness(['freshness', '--remote', 'r2:bucket/path', '--state-file', stateFile, '--realert-after-hours', '0', '--notify-command', s.command]);
+    const state = JSON.parse(fs.readFileSync(stateFile, 'utf8')).check;
+    expect(state.notif).toBe('alerted');
+    expect(state.lastAlertedStatus).toBe('crit');
+    expect(s.count()).toBe(1);
+  });
+
+  it('a corrupt state file reads as a first run rather than crashing or going silent', async () => {
+    const dir = makeTempDir();
+    const stampFile = staleStamp(dir);
+    const s = sink(dir);
+    fs.writeFileSync(`${stampFile}.alerts.json`, '{not json at all');
+    expect(await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', s.command])).toBe(1);
+    expect(s.count()).toBe(1);
+  });
+
+  it('with no state file to derive, it warns and keeps the old alert-every-run behaviour', async () => {
+    const dir = makeTempDir();
+    const s = sink(dir);
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (msg?: unknown) => { warnings.push(String(msg)); };
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        await runFreshness(['freshness', '--remote', 'r2:bucket/path', '--notify-command', s.command]);
+      }
+    } finally {
+      console.warn = warn;
+    }
+    expect(warnings.join('\n')).toMatch(/suppression disabled/);
+    expect(s.count()).toBe(3); // unsuppressed, exactly as before this feature
+  });
+
+  it('an undelivered alert is retried next run instead of being recorded as sent', async () => {
+    const dir = makeTempDir();
+    const stampFile = staleStamp(dir);
+    const failing = 'exit 7'; // notify-command that always fails
+    await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', failing]);
+    // Nothing got through, so the state must NOT claim we alerted.
+    expect(readState(stampFile).notif).toBe('healthy');
+    const s = sink(dir);
+    await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', s.command]);
+    expect(s.count()).toBe(1); // re-fired rather than waiting out the interval
+  });
+});
