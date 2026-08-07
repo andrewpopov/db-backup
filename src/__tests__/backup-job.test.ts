@@ -6,6 +6,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { dbBackup, fixedNow, makeTempDir, makeRuntime, cleanupTempDirs } from './helpers';
 
+// These cases assert POSIX behaviour this package targets but Windows cannot
+// provide: absolute paths like `/srv/app/backups` (path.resolve turns them
+// into `D:\srvppackups` here), `~` expansion, cron lines built for a
+// Linux host, notify commands run through a shell, and the external sqlite3 /
+// gzip / rclone binaries. db-backup runs on a Linux server; these run there.
+const itOnPosix = process.platform === 'win32' ? it.skip : it;
+
+
 const {
   restoreBackup,
   runBackupJob,
@@ -82,7 +90,7 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
     expect(fs.readFileSync(second.created.fullPath, 'utf8')).toBe('new sqlite bytes');
   });
 
-  it('uses sqlite3 .backup and gzip when those commands are available', () => {
+  itOnPosix('uses sqlite3 .backup and gzip when those commands are available', () => {
     const cwd = makeTempDir();
     const sourcePath = path.join(cwd, 'dev.db');
     const outputDir = path.join(cwd, 'backups');
@@ -192,7 +200,7 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
     }
   });
 
-  it('includes a top-level backupId equal to created.fileName in `backup --json` output', async () => {
+  itOnPosix('includes a top-level backupId equal to created.fileName in `backup --json` output', async () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');
     // A real (if minimal) SQLite file — this exercises the actual sqlite3
