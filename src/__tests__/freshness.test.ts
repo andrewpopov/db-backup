@@ -5,11 +5,19 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { dbBackup, fixedNow, tempDirs, makeTempDir, makeRuntime, cleanupTempDirs } from './helpers';
 
-// These cases assert POSIX behaviour this package targets but Windows cannot
-// provide: absolute paths like `/srv/app/backups` (path.resolve turns them
-// into `D:\srvppackups` here), `~` expansion, cron lines built for a
-// Linux host, notify commands run through a shell, and the external sqlite3 /
-// gzip / rclone binaries. db-backup runs on a Linux server; these run there.
+// These cases observe an alert by having db-backup RUN a notify command, and
+// that transport is hardcoded POSIX: src/index.js executes it as
+// `/bin/sh -c <cmd>`, and /bin/sh does not exist on Windows. The sink here is
+// `printf 'x' >> log`, which needs that shell too. So nothing fires and every
+// count assertion reads 0.
+//
+// Worth being clear about what this costs: the invariants themselves -
+// suppression, re-alert timing, recovery, corrupt-state handling, retry after
+// a failed delivery - are platform-independent and would be worth covering on
+// Windows. Doing that means injecting a fake runtime (notifyAlert already
+// takes `runtime.execFileSync`) instead of shelling out, which is a test
+// rewrite rather than a portability fix, so it is left as follow-up rather
+// than done half-way here. db-backup runs on a Linux server; these run there.
 const itOnPosix = process.platform === 'win32' ? it.skip : it;
 
 
