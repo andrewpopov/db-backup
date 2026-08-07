@@ -6,6 +6,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { dbBackup, fixedNow, makeTempDir, makeRuntime, cleanupTempDirs } from './helpers';
 
+// These cases assert POSIX behaviour this package targets but Windows cannot
+// provide: absolute paths like `/srv/app/backups` (path.resolve turns them
+// into `a Windows path with the separators flipped` here), `~` expansion, cron lines built for a
+// Linux host, notify commands run through a shell, and the external sqlite3 /
+// gzip / rclone binaries. db-backup runs on a Linux server; these run there.
+const itOnPosix = process.platform === 'win32' ? it.skip : it;
+
+
 const {
   listBackupsWithPlan,
   resolveDestinations,
@@ -231,7 +239,7 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
     expect(warnings.some((w) => /local-only backup/i.test(w))).toBe(true);
   });
 
-  it('CLI --skip-remote with no --remote succeeds', async () => {
+  itOnPosix('CLI --skip-remote with no --remote succeeds', async () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');
     // A real (if minimal) SQLite file — this exercises the actual sqlite3
@@ -908,7 +916,7 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
       expect(() => resolveDestinations({ cwd: '/tmp', destinations: [] })).toThrow(/zero destinations/i);
     });
 
-    it('normalizeDestination validates each destination shape', () => {
+    itOnPosix('normalizeDestination validates each destination shape', () => {
       expect(() => normalizeDestination({ type: 'bogus' }, '/tmp')).toThrow(/type/);
       expect(() => normalizeDestination({ type: 'local' }, '/tmp')).toThrow(/path/);
       expect(() => normalizeDestination({ type: 's3' }, '/tmp')).toThrow(/bucket/);
@@ -932,7 +940,7 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
       ).toThrow(/cannot be combined/);
     });
 
-    it('legacy remote/s3/skipRemote map onto the same destinations shape (local always included, back-compat)', () => {
+    itOnPosix('legacy remote/s3/skipRemote map onto the same destinations shape (local always included, back-compat)', () => {
       const legacy = resolveDestinations({ cwd: '/tmp', outputDir: 'backups', remote: { target: 'r2:x' } });
       expect(legacy.destinations).toEqual([
         { type: 'local', path: '/tmp/backups' },

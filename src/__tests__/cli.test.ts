@@ -4,6 +4,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { dbBackup, fixedNow, makeTempDir, makeRuntime, cleanupTempDirs } from './helpers';
 
+// These cases assert POSIX behaviour this package targets but Windows cannot
+// provide: absolute paths like `/srv/app/backups` (path.resolve turns them
+// into `a Windows path with the separators flipped` here), `~` expansion, cron lines built for a
+// Linux host, notify commands run through a shell, and the external sqlite3 /
+// gzip / rclone binaries. db-backup runs on a Linux server; these run there.
+const itOnPosix = process.platform === 'win32' ? it.skip : it;
+
+
 const {
   resolveRetentionPolicy,
   runBackupJob,
@@ -18,7 +26,7 @@ afterEach(() => {
 });
 
 describe('@andrewpopov/db-backup — CLI (cron, backup directories, manifest helpers, config file, env loading)', () => {
-  it('cron output reflects --output-dir/--prod/--allow-missing and honors --command', async () => {
+  itOnPosix('cron output reflects --output-dir/--prod/--allow-missing and honors --command', async () => {
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (message?: unknown) => {
@@ -43,7 +51,7 @@ describe('@andrewpopov/db-backup — CLI (cron, backup directories, manifest hel
     }
   });
 
-  it('resolves backup directories from env + candidates, expanding ~ and de-duping', () => {
+  itOnPosix('resolves backup directories from env + candidates, expanding ~ and de-duping', () => {
     const {
       resolveBackupDirectories,
     } = require('../index.js') as typeof import('../index');
@@ -60,7 +68,7 @@ describe('@andrewpopov/db-backup — CLI (cron, backup directories, manifest hel
     ]);
   });
 
-  it('contains a user-supplied restore path within allowed directories', () => {
+  itOnPosix('contains a user-supplied restore path within allowed directories', () => {
     const {
       resolveContainedBackupPath,
     } = require('../index.js') as typeof import('../index');

@@ -5,6 +5,22 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { dbBackup, fixedNow, tempDirs, makeTempDir, makeRuntime, cleanupTempDirs } from './helpers';
 
+// These cases observe an alert by having db-backup RUN a notify command, and
+// that transport is hardcoded POSIX: src/index.js executes it as
+// `/bin/sh -c <cmd>`, and /bin/sh does not exist on Windows. The sink here is
+// `printf 'x' >> log`, which needs that shell too. So nothing fires and every
+// count assertion reads 0.
+//
+// Worth being clear about what this costs: the invariants themselves -
+// suppression, re-alert timing, recovery, corrupt-state handling, retry after
+// a failed delivery - are platform-independent and would be worth covering on
+// Windows. Doing that means injecting a fake runtime (notifyAlert already
+// takes `runtime.execFileSync`) instead of shelling out, which is a test
+// rewrite rather than a portability fix, so it is left as follow-up rather
+// than done half-way here. db-backup runs on a Linux server; these run there.
+const itOnPosix = process.platform === 'win32' ? it.skip : it;
+
+
 const {
   runCli,
   checkBackupFreshness,
@@ -348,7 +364,7 @@ describe('runCli freshness wiring', () => {
     await expect(runCli(['freshness'])).rejects.toThrow(/--stamp-file .* or --remote/);
   });
 
-  it('fires --notify-command and exits non-zero on a stale stamp (end-to-end)', async () => {
+  itOnPosix('fires --notify-command and exits non-zero on a stale stamp (end-to-end)', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-notify-'));
     tempDirs.push(dir);
     const stamp = path.join(dir, '.last-success');
@@ -546,7 +562,7 @@ describe('freshness alert suppression', () => {
     return code;
   };
 
-  it('THE BUG: 12 consecutive stale runs notify ONCE, not 12 times', async () => {
+  itOnPosix('THE BUG: 12 consecutive stale runs notify ONCE, not 12 times', async () => {
     const dir = makeTempDir();
     const stampFile = staleStamp(dir);
     const s = sink(dir);
@@ -557,7 +573,7 @@ describe('freshness alert suppression', () => {
     expect(readState(stampFile)).toMatchObject({ notif: 'alerted', failStreak: 12 });
   });
 
-  it('INVARIANT: a suppressed alert still exits 1 on every stale run', async () => {
+  itOnPosix('INVARIANT: a suppressed alert still exits 1 on every stale run', async () => {
     const dir = makeTempDir();
     const stampFile = staleStamp(dir);
     const s = sink(dir);
@@ -570,7 +586,7 @@ describe('freshness alert suppression', () => {
     expect(s.count()).toBe(1);
   });
 
-  it('reminds once the re-alert interval has elapsed', async () => {
+  itOnPosix('reminds once the re-alert interval has elapsed', async () => {
     const dir = makeTempDir();
     const stampFile = staleStamp(dir);
     const s = sink(dir);
@@ -582,7 +598,7 @@ describe('freshness alert suppression', () => {
     expect(s.count()).toBe(2);
   });
 
-  it('--realert-after-hours 0 alerts once per incident and never reminds', async () => {
+  itOnPosix('--realert-after-hours 0 alerts once per incident and never reminds', async () => {
     const dir = makeTempDir();
     const stampFile = staleStamp(dir);
     const s = sink(dir);
@@ -594,7 +610,7 @@ describe('freshness alert suppression', () => {
     expect(s.count()).toBe(1);
   });
 
-  it('sends exactly one recovery notice when the backup comes back, then stays quiet', async () => {
+  itOnPosix('sends exactly one recovery notice when the backup comes back, then stays quiet', async () => {
     const dir = makeTempDir();
     const stampFile = staleStamp(dir);
     const s = sink(dir);
@@ -609,7 +625,7 @@ describe('freshness alert suppression', () => {
     expect(readState(stampFile)).toMatchObject({ notif: 'healthy' });
   });
 
-  it('a check that CANNOT RUN is crit, not unknown — a permanently dead checker keeps alerting', async () => {
+  itOnPosix('a check that CANNOT RUN is crit, not unknown — a permanently dead checker keeps alerting', async () => {
     const dir = makeTempDir();
     const stateFile = path.join(dir, 'remote.alerts.json');
     const s = sink(dir);
@@ -623,7 +639,7 @@ describe('freshness alert suppression', () => {
     expect(s.count()).toBe(1);
   });
 
-  it('a corrupt state file reads as a first run rather than crashing or going silent', async () => {
+  itOnPosix('a corrupt state file reads as a first run rather than crashing or going silent', async () => {
     const dir = makeTempDir();
     const stampFile = staleStamp(dir);
     const s = sink(dir);
@@ -632,7 +648,7 @@ describe('freshness alert suppression', () => {
     expect(s.count()).toBe(1);
   });
 
-  it('with no state file to derive, it warns and keeps the old alert-every-run behaviour', async () => {
+  itOnPosix('with no state file to derive, it warns and keeps the old alert-every-run behaviour', async () => {
     const dir = makeTempDir();
     const s = sink(dir);
     const warnings: string[] = [];
@@ -649,7 +665,7 @@ describe('freshness alert suppression', () => {
     expect(s.count()).toBe(3); // unsuppressed, exactly as before this feature
   });
 
-  it('an undelivered alert is retried next run instead of being recorded as sent', async () => {
+  itOnPosix('an undelivered alert is retried next run instead of being recorded as sent', async () => {
     const dir = makeTempDir();
     const stampFile = staleStamp(dir);
     const failing = 'exit 7'; // notify-command that always fails
