@@ -65,7 +65,14 @@ export type RetentionPolicy =
 /** WHERE a backup is written/replicated to — orthogonal to `RetentionPolicy`
  * (HOW MANY/WHICH survive). A `local` destination is not privileged: a
  * caller may configure `destinations: [{ type: 's3', ... }]` alone for an
- * S3-only backup. See `resolveDestinations` / `BackupOptions.destinations`. */
+ * S3-only backup. See `resolveDestinations` / `BackupOptions.destinations`.
+ *
+ * Every `local` destination is a REAL, independently-validated replication
+ * target, not a label: the FIRST one is the staging directory the artifact
+ * is created in; every `local` destination after that is copied to and
+ * sha256-verified, gets its own retention plan applied, and its own manifest
+ * — exactly like a remote destination. A config listing two or more `local`
+ * destinations backs up to all of them. */
 export interface LocalDestination {
   type: 'local';
   path: string;
@@ -207,6 +214,15 @@ export interface BackupEntry {
    * createPostgresBackup; absent on entries derived from disk scans alone
    * (e.g. via getBackupEntryFromPath/listBackups) until re-hashed. */
   sha256?: string;
+  /** Postgres backups only: `false` when the dump was kept WITHOUT
+   * `pg_restore --list` validation, because `pg_restore` was unavailable and
+   * `allowUnverifiedPostgresBackup` opted in to keeping it anyway. Absent
+   * (implicitly verified) on every normal backup — this is the visible trace
+   * of that opt-out in the result, mirroring `encrypted` (present only when
+   * it applies). SQLite entries never carry this field: taking a SQLite
+   * snapshot at all already requires `sqlite3`, the same binary that verifies
+   * it — see `allowUnsafeCopy` for that engine's analogous escape hatch. */
+  verified?: boolean;
 }
 
 export interface BackupOptions {
@@ -218,6 +234,14 @@ export interface BackupOptions {
   policy?: RetentionPolicy;
   /** Permit a plain byte copy when `sqlite3` is unavailable (default false). */
   allowUnsafeCopy?: boolean;
+  /** Postgres only: permit keeping a `pg_dump` archive that could not be
+   * validated with `pg_restore --list` because `pg_restore` is unavailable
+   * (default false — the backup is refused instead). The analogous escape
+   * hatch to `allowUnsafeCopy`, one layer over: `pg_dump` can still produce a
+   * dump without `pg_restore` present, so this is opted into per run rather
+   * than failing closed. Sets `BackupEntry.verified: false` on the result so
+   * the opt-out is visible without re-reading config. */
+  allowUnverifiedPostgresBackup?: boolean;
   /** Encrypt the backup at rest with gpg symmetric AES256. Required to restore
    * an encrypted backup. */
   encryption?: BackupEncryption | null;
@@ -321,10 +345,15 @@ export interface BackupPlan {
   policy: RetentionPolicy;
 }
 
-/** Per-destination upload/prune result — one entry per non-local destination
- * in `BackupOptions.destinations` (or the legacy `remote`/`s3` mapped onto
- * it). `uploaded`/`removedRemote` on `BackupJobResult` mirror the FIRST
- * entry here, for back-compat with the single-remote era. */
+/** Per-destination upload/prune result — one entry per destination in
+ * `BackupOptions.destinations` OTHER than the primary (the first `local`
+ * destination, which stages the artifact directly rather than being copied
+ * to — see `BackupJobResult.outputDir`). Covers every remote (rclone/S3) *and*
+ * every additional `local` destination beyond the first: an additional local
+ * destination is replicated to (copied + sha256-verified) and pruned
+ * independently, exactly like a remote. `uploaded`/`removedRemote` on
+ * `BackupJobResult` mirror the FIRST non-local entry here, for back-compat
+ * with the single-remote era. */
 export interface BackupDestinationResult {
   destination: BackupDestination;
   uploaded: BackupUploadResult;
@@ -659,7 +688,10 @@ export function verifyS3Object(
 /** Best-effort S3 retention: keep the newest `s3.keep` objects under the
  * bucket/prefix, protecting `protectFileName` (the object just uploaded and
  * verified). Async. A listing or delete failure is a cleanup miss (warns),
- * never a data-safety issue — mirrors `pruneRemoteBackups`. */
+ * never a data-safety issue — mirrors `pruneRemoteBackups`. `namePrefix` and
+ * `parseBackupFileNameFn` are both genuinely optional: the 3-arg call
+ * `pruneS3Backups(s3, protectFileName, runtime)` is fully supported and uses
+ * this package's own `parseBackupFileName` and no name prefix. */
 export function pruneS3Backups(
   s3: BackupS3Remote,
   protectFileName: string,

@@ -171,6 +171,14 @@ await runBackupJobAsync({
   then the local staging copy is removed, exactly like today's `skipRemote`
   never leaving a phantom local file, but without requiring a local
   destination to exist at all.
+- **Every `local` destination is a real replication target, not just the
+  first.** The first `local` destination is where the artifact is created
+  (staging). Any `local` destination configured after that is copied to and
+  verified by sha256 before anything is pruned or stamped — a copy that
+  can't be written, or that doesn't checksum-match, fails the whole run
+  exactly like a failed remote upload does. Retention and the manifest are
+  then applied independently at every local destination, so two configured
+  local paths really do both end up with the backup, not just the first one.
 - **Zero destinations aborts** — "you must choose where backups go" — the
   same fail-closed spirit as the local-only guard below, generalized to any
   number of destinations.
@@ -660,9 +668,17 @@ DATABASE_URL=postgresql://user:password@db.example.com:5432/myapp
 db-backup backup --prod --output-dir /var/backups/myapp
 ```
 
-PostgreSQL backups require `pg_dump`. Restores require `pg_restore`.
-Same-second PostgreSQL backups use the same numeric suffix pattern, such as
-`postgres-backup-20260705-150000Z-2.dump`.
+PostgreSQL backups require `pg_dump` to create the dump, **and `pg_restore`
+to validate it** before it is kept — `pg_restore --list` reads the archive's
+table of contents without touching any database, mirroring the SQLite
+`PRAGMA integrity_check`. If `pg_restore` is unavailable, the backup is
+refused (the dump is deleted and the run fails) rather than silently kept
+unverified. Pass `allowUnverifiedPostgresBackup` (CLI:
+`--allow-unverified-postgres-backup`) to accept an unverified dump anyway —
+this marks the returned `BackupEntry` with `verified: false`, so the opt-out
+is visible in the result, not only in config. Restores require `pg_restore`
+as well. Same-second PostgreSQL backups use the same numeric suffix pattern,
+such as `postgres-backup-20260705-150000Z-2.dump`.
 
 ### Daily cron
 

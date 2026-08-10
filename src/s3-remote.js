@@ -443,14 +443,35 @@ function parseS3BackupTimestamp(timestampKey) {
 // listing/planning/delete failure is a cleanup miss (warn) rather than a
 // data-safety issue — the new backup is already verified on both ends.
 //
-// `planRetentionFn`/`policy` are dependency-injected from index.js (the only
-// production caller) so this module never needs to require index.js (that
-// would be circular — index.js requires this module already) while still
-// running every prune through the SAME planRetention engine local and rclone
-// retention use — this is not a second retention system. Callers that omit
-// them (only the legacy 5-arg test signature does) fall back to the
-// original flat "keep newest N by name" behavior, preserved for back-compat.
-async function pruneS3Backups(s3, protectFileName, runtime, namePrefix, parseBackupFileName, planRetentionFn = null, policy = null, now = new Date()) {
+// `parseBackupFileNameFn` defaults to this package's OWN parseBackupFileName
+// (index.js's), so the documented 3-arg call —
+// `pruneS3Backups(s3, protectFileName, runtime)` — actually works instead of
+// throwing when the omitted parser is invoked as a function. The default is
+// required LAZILY, inside the function body, rather than via a top-level
+// `require('./index')`: index.js requires this module already, so a
+// module-load-time require here would be circular and get back index.js's
+// still-empty exports. By the time this function is actually CALLED, index.js
+// (the package's only entry point) has always finished loading and cached its
+// full exports, so a call-time require is safe. Also named distinctly from
+// the module-level `parseBackupFileName` this defaults to, so the parameter
+// never shadows it.
+//
+// `planRetentionFn`/`policy` stay dependency-injected from index.js (the only
+// production caller) the same way, so a legacy/default parser swap here can
+// never silently change which retention engine runs — this is not a second
+// retention system. Callers that omit them (only the legacy 5-arg test
+// signature does) fall back to the original flat "keep newest N by name"
+// behavior, preserved for back-compat.
+async function pruneS3Backups(
+  s3,
+  protectFileName,
+  runtime,
+  namePrefix = null,
+  parseBackupFileNameFn = require('./index').parseBackupFileName,
+  planRetentionFn = null,
+  policy = null,
+  now = new Date(),
+) {
   let names;
   try {
     names = await listS3BackupFileNames(s3, runtime);
@@ -459,7 +480,7 @@ async function pruneS3Backups(s3, protectFileName, runtime, namePrefix, parseBac
     return [];
   }
 
-  const parseableNames = names.filter((name) => name && parseBackupFileName(name, namePrefix));
+  const parseableNames = names.filter((name) => name && parseBackupFileNameFn(name, namePrefix));
 
   let doomedNames;
   if (planRetentionFn) {
@@ -470,7 +491,7 @@ async function pruneS3Backups(s3, protectFileName, runtime, namePrefix, parseBac
     // list. See pruneRemoteBackups in index.js for the rclone twin.
     const rawEntries = parseableNames
       .map((name) => {
-        const parsed = parseBackupFileName(name, namePrefix);
+        const parsed = parseBackupFileNameFn(name, namePrefix);
         const when = parseS3BackupTimestamp(parsed.timestampKey);
         return when ? { fileName: name, createdAt: when.toISOString() } : null;
       })

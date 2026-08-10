@@ -262,6 +262,9 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
     const calls: Array<{ command: string; args: string[] }> = [];
     const databaseUrl = 'postgresql://user:secret@db.example/app';
 
+    // pg_restore intentionally absent: this test is about the pg_dump
+    // invocation shape specifically, so it opts out of the (now required)
+    // pg_restore --list validation rather than mock pg_restore too.
     const runtime = makeRuntime({
       commandExists: (command) => command === 'pg_dump',
       execFileSync: (command, args) => {
@@ -274,6 +277,7 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
 
     const result = runBackupJob({ skipRemote: true,
       allowUnsafeCopy: true,
+      allowUnverifiedPostgresBackup: true,
       cwd,
       databaseUrl,
       outputDir,
@@ -311,8 +315,8 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
       },
     });
 
-    const first = runBackupJob({ skipRemote: true, cwd, databaseUrl, outputDir, runtime });
-    const second = runBackupJob({ skipRemote: true, cwd, databaseUrl, outputDir, runtime });
+    const first = runBackupJob({ skipRemote: true, allowUnverifiedPostgresBackup: true, cwd, databaseUrl, outputDir, runtime });
+    const second = runBackupJob({ skipRemote: true, allowUnverifiedPostgresBackup: true, cwd, databaseUrl, outputDir, runtime });
 
     expect(first.created.fileName).toBe('postgres-backup-20260705-150000Z.dump');
     expect(second.created.fileName).toBe('postgres-backup-20260705-150000Z-2.dump');
@@ -791,7 +795,11 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
     expect(dumpFiles).toEqual([]);
   });
 
-  it('skips Postgres verification (and keeps the dump) when pg_restore is absent', () => {
+  // PKG-148: pg_restore --list validation used to be skipped silently (no
+  // throw, no trace in the result) whenever only pg_dump was installed, so a
+  // never-verified dump could rotate into retention looking exactly like a
+  // verified one. It is now REQUIRED unless the caller explicitly opts out.
+  it('refuses to keep a Postgres dump when pg_restore is absent and allowUnverifiedPostgresBackup is not set', () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');
     const databaseUrl = 'postgresql://user:secret@db.example/app';
@@ -806,8 +814,42 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
       },
     });
 
-    const result = runBackupJob({ skipRemote: true, cwd, databaseUrl, outputDir, runtime });
+    expect(() => runBackupJob({ skipRemote: true, cwd, databaseUrl, outputDir, runtime })).toThrow(
+      /pg_restore.*(unavailable|not installed)|allowUnverifiedPostgresBackup/is,
+    );
+    const dumpFiles = fs.existsSync(outputDir)
+      ? fs.readdirSync(outputDir).filter((name) => name.endsWith('.dump'))
+      : [];
+    expect(dumpFiles).toEqual([]);
+  });
+
+  it('keeps an unverified Postgres dump and marks the result when allowUnverifiedPostgresBackup opts out of pg_restore validation', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+
+    const runtime = makeRuntime({
+      commandExists: (command) => command === 'pg_dump',
+      execFileSync: (command: string, args: string[]) => {
+        const outputArg = args.find((arg) => arg.startsWith('--file='));
+        if (!outputArg) throw new Error('pg_dump call missing --file argument');
+        fs.writeFileSync(outputArg.slice('--file='.length), 'dump bytes');
+        return undefined;
+      },
+    });
+
+    const result = runBackupJob({
+      skipRemote: true,
+      allowUnverifiedPostgresBackup: true,
+      cwd,
+      databaseUrl,
+      outputDir,
+      runtime,
+    });
     expect(fs.existsSync(result.created.fullPath)).toBe(true);
+    // The opt-out is visible in the RESULT, not only in the config that
+    // enabled it — mirrors how the SQLite unsafe-copy path surfaces state.
+    expect(result.created.verified).toBe(false);
   });
 
   // --- P1 #5: advisory backup lock ---

@@ -157,6 +157,7 @@ function parseArgs(argv) {
     configPath: null,
     commandTimeoutMs: null,
     allowUnsafeCopy: false,
+    allowUnverifiedPostgresBackup: false,
     passphraseFile: null,
     cipher: null,
     minBytes: null,
@@ -548,6 +549,11 @@ function parseArgs(argv) {
 
     if (arg === '--allow-unsafe-copy') {
       options.allowUnsafeCopy = true;
+      continue;
+    }
+
+    if (arg === '--allow-unverified-postgres-backup') {
+      options.allowUnverifiedPostgresBackup = true;
       continue;
     }
 
@@ -1240,6 +1246,7 @@ function resolveBackupOptions(options = {}) {
   const mode = options.mode || (process.env.NODE_ENV === 'production' ? 'prod' : 'dev');
   const compressSqlite = options.compressSqlite !== false;
   const allowUnsafeCopy = options.allowUnsafeCopy === true;
+  const allowUnverifiedPostgresBackup = options.allowUnverifiedPostgresBackup === true;
   const encryption = options.encryption || null;
   const minBytes = Number(options.minBytes) > 0 ? Number(options.minBytes) : 0;
   const stampFile = options.stampFile || null;
@@ -1302,6 +1309,7 @@ function resolveBackupOptions(options = {}) {
     outputDir,
     compressSqlite,
     allowUnsafeCopy,
+    allowUnverifiedPostgresBackup,
     encryption,
     minBytes,
     stampFile,
@@ -1720,7 +1728,14 @@ function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd =
   };
 }
 
-function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalizeRuntime(), namePrefix = null }) {
+function createPostgresBackup({
+  databaseUrl,
+  outputDir,
+  now,
+  runtime = normalizeRuntime(),
+  namePrefix = null,
+  allowUnverifiedPostgresBackup = false,
+}) {
   now = now || runtime.now();
   if (!runtime.commandExists('pg_dump')) {
     throw new Error('pg_dump is required for PostgreSQL backups but is not installed.');
@@ -1737,9 +1752,30 @@ function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalize
   restrictArtifact(fullPath);
 
   // Verify the dump before we keep it, mirroring the SQLite integrity check.
-  // Only possible when pg_restore is present; skip like the SQLite cp-fallback.
+  // REQUIRED: unlike sqlite3 (needed just to take the SQLite snapshot),
+  // pg_dump and pg_restore are independent binaries, so a pg_dump-only host
+  // can produce a dump and never learn whether it is truncated/corrupt/
+  // unreadable. Silently accepting it here — as this used to do — let a bad
+  // dump rotate into retention looking exactly like a good one. Refuse
+  // unless the caller explicitly opts in to keeping it unverified, mirroring
+  // how createSqliteSnapshot refuses a plain copy unless allowUnsafeCopy.
+  let verified = true;
   if (runtime.commandExists('pg_restore')) {
     verifyPostgresBackupIntegrity(fullPath, runtime);
+  } else if (!allowUnverifiedPostgresBackup) {
+    fs.rmSync(fullPath, { force: true });
+    throw new Error(
+      `Refusing to keep an unverified PostgreSQL backup: the 'pg_restore' binary is unavailable, so ` +
+        `${fileName} cannot be validated with 'pg_restore --list' before it is kept. Install pg_restore ` +
+        `(ships with the postgresql-client package), or pass allowUnverifiedPostgresBackup / ` +
+        `--allow-unverified-postgres-backup to accept an unverified dump.`
+    );
+  } else {
+    verified = false;
+    console.warn(
+      `[db-backup] WARNING: keeping ${fileName} without pg_restore verification ('pg_restore' unavailable, ` +
+        'allowUnverifiedPostgresBackup is set). UNSAFE.'
+    );
   }
 
   const stats = fs.statSync(fullPath);
@@ -1753,6 +1789,10 @@ function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalize
     createdAt: now.toISOString(),
     sizeBytes: stats.size,
     sha256: sha256File(fullPath),
+    // Visible trace of the allowUnverifiedPostgresBackup opt-out — absent
+    // (implicitly verified) on the normal path, mirroring how `encrypted`
+    // is only set when it applies rather than always present.
+    ...(verified ? {} : { verified: false }),
   };
 }
 
@@ -1788,6 +1828,7 @@ function createBackup(options = {}) {
         now,
         runtime: resolved.runtime,
         namePrefix: resolved.namePrefix,
+        allowUnverifiedPostgresBackup: resolved.allowUnverifiedPostgresBackup,
       })
     );
   }
@@ -3015,6 +3056,84 @@ function uploadBackupToRemote(entry, remote, runtime) {
   return remote.verify === false ? { target, sizeBytes: null } : verifyRemoteObject(entry, remote, runtime);
 }
 
+// Copy the just-created artifact to a LOCAL destination other than the
+// primary (staging) one — see resolveBackupOptions, which pins the FIRST
+// local destination as resolved.outputDir; every local destination after
+// that is replicated here, exactly like a remote upload. Verified by sha256
+// rather than trusted: a copy that lands truncated or corrupted must fail
+// the run the same way a bad remote upload does, not silently pass as a
+// backup that exists there.
+//
+// Copy-to-temp-then-rename, never straight onto the final name: a mid-copy
+// error or a checksum mismatch must never leave a partial file sitting at
+// the final path looking like a complete backup, and a rename within one
+// directory is atomic, so a reader can never observe a torn file there. The
+// temp file is removed on ANY failure (copy error, checksum mismatch,
+// rename error) via the try/finally below, so a throw can't leak it.
+//
+// Refuses outright — rather than overwriting or silently skipping — when the
+// final filename already exists at this destination: filenames carry a
+// timestamp and prefix, so a collision is genuinely anomalous (a clock
+// problem, or an unrelated file), and in a BACKUP tool it is never this
+// tool's call which of two same-named files is more valuable.
+//
+// `seenLocalPaths` (a Set of resolved directory paths, seeded by the caller
+// with the staging/primary destination) also rejects a secondary local
+// destination whose resolved path matches one already processed in this
+// run — including the staging path listed again as a secondary. Without
+// this, a duplicate would fall straight into fs.copyFileSync with the same
+// file as both source and destination, which is undefined/dangerous
+// (potentially truncating the very artifact it's copying) rather than a
+// deliberate, named refusal.
+function replicateBackupToLocal(entry, destination, runtime, seenLocalPaths) {
+  const resolvedDir = path.resolve(destination.path);
+  if (seenLocalPaths) {
+    if (seenLocalPaths.has(resolvedDir)) {
+      throw new Error(
+        `Duplicate local destination ${destination.path} (resolves to ${resolvedDir}): it matches the ` +
+          'staging/primary destination or another local destination already processed in this run. ' +
+          'Refusing to replicate a second time at the same path.',
+      );
+    }
+    seenLocalPaths.add(resolvedDir);
+  }
+
+  ensureBackupDir(destination.path);
+  const target = path.join(destination.path, entry.fileName);
+
+  if (fs.existsSync(target)) {
+    throw new Error(
+      `Refusing to replicate ${entry.fileName} to ${destination.path}: a file with that name already exists ` +
+        'there. A collision on a timestamped, prefixed backup filename is anomalous (clock skew, or an ' +
+        'unrelated file) — refusing rather than guessing which one to keep or silently overwriting it.',
+    );
+  }
+
+  const tempTarget = path.join(destination.path, `.${entry.fileName}.tmp-${runtime.randomId()}`);
+  let renamed = false;
+  try {
+    fs.copyFileSync(entry.fullPath, tempTarget);
+    restrictArtifact(tempTarget);
+
+    const actualSha256 = sha256File(tempTarget);
+    if (actualSha256 !== entry.sha256) {
+      throw new Error(
+        `Local destination checksum mismatch for ${target}: expected=${entry.sha256} actual=${actualSha256}; ` +
+          'refusing to prune or stamp',
+      );
+    }
+
+    fs.renameSync(tempTarget, target);
+    renamed = true;
+  } finally {
+    if (!renamed) {
+      fs.rmSync(tempTarget, { force: true });
+    }
+  }
+
+  return { target, sizeBytes: fs.statSync(target).size };
+}
+
 // Turn a bare remote/S3 filename listing into the minimal shape planRetention
 // needs ({ fileName, createdAt }) — recency comes from the filename's own
 // embedded timestamp (parseTimestampKey), the same identity the rest of the
@@ -3443,46 +3562,54 @@ function resolveDestinationPolicy(destination, resolved) {
 }
 
 // Shared bottom half of a backup run, once every destination's upload (if
-// any) is known-uploaded-and-verified: local retention, per-destination
-// remote retention, manifest, and the success stamp. `distributions` is a
-// per-non-local-destination `{ destination, uploaded, removed }` list.
-// Entirely synchronous — no network I/O here — so both the sync and async
-// distribute paths below call it identically.
+// any) is known-uploaded-and-verified: retention (at EVERY local destination,
+// independently, plus per remote destination), manifest (at every local
+// destination), and the success stamp. `distributions` is a
+// per-non-primary-destination `{ destination, uploaded, removed }` list —
+// remote entries carry their `removed` already (set by the retention loop in
+// the caller); local entries beyond the first get theirs filled in here,
+// alongside the primary's. Entirely synchronous — no network I/O here — so
+// both the sync and async distribute paths below call it identically.
 function finalizeBackupResult(resolved, created, now, distributions) {
-  const localDestination = resolved.destinations.find((dest) => dest.type === 'local');
+  const localDestinations = resolved.destinations.filter((dest) => dest.type === 'local');
   let removed = [];
   let kept = [];
 
-  if (localDestination) {
-    const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
-    const plan = planRetention(backups, resolved.policy, now);
+  // Retention and the manifest are applied INDEPENDENTLY at every local
+  // destination — each has its own pre-existing backups, so each gets its
+  // own listing/plan/prune. The FIRST local destination is the primary
+  // (staging) one: its removed/kept drive the back-compat top-level fields;
+  // every local destination after that only surfaces in destinationResults.
+  localDestinations.forEach((localDestination, index) => {
+    const backups = listBackups({ outputDir: localDestination.path, now, namePrefix: resolved.namePrefix });
+    const policy = resolveDestinationPolicy(localDestination, resolved);
+    const plan = planRetention(backups, policy, now);
 
     // NEVER prune the backup we just created and verified, whatever the plan
     // says. A host whose clock jumped backward at boot gives the new file an
     // older timestamp than existing ones, and a retention policy that trusts
     // the ordering would then delete the only known-good backup.
     const doomed = plan.remove.filter((entry) => entry.fileName !== created.fileName);
-    removed = pruneBackups(doomed);
-    kept = plan.keep;
-  } else {
-    // Local was not a chosen destination: the staged file was only ever
-    // scratch space for the upload(s) above. It must not linger as a silent,
-    // untracked local copy once every configured destination has confirmed
-    // it — remove it now that finalize is running only after every upload
-    // above succeeded and verified.
-    fs.rmSync(created.fullPath, { force: true });
-  }
+    const removedAtDestination = pruneBackups(doomed);
 
-  // Best-effort: a manifest write failure must never fail the backup itself.
-  // Safety/pre-restore backups (created via createBackup outside this job)
-  // are intentionally NOT manifested — they're transient. Only written when
-  // local is a destination — a manifest with no corresponding local file is
-  // misleading, and checksums are re-verifiable from the destination anyway.
-  if (localDestination) {
+    if (index === 0) {
+      removed = removedAtDestination;
+      kept = plan.keep;
+    } else {
+      // BackupDestinationResult.removed is filenames (string[]), matching the
+      // remote/S3 convention — pruneBackups (unlike those) returns full
+      // BackupEntry objects, so map down to fileName here.
+      const distribution = distributions.find((d) => d.destination === localDestination);
+      if (distribution) distribution.removed = removedAtDestination.map((entry) => entry.fileName);
+    }
+
+    // Best-effort: a manifest write failure must never fail the backup
+    // itself. Safety/pre-restore backups (created via createBackup outside
+    // this job) are intentionally NOT manifested — they're transient.
     try {
-      appendBackupManifestEntry(resolved.outputDir, {
+      appendBackupManifestEntry(localDestination.path, {
         name: created.fileName,
-        path: created.fullPath,
+        path: index === 0 ? created.fullPath : path.join(localDestination.path, created.fileName),
         createdAt: created.createdAt,
         sizeBytes: created.sizeBytes,
         engine: created.engine,
@@ -3492,6 +3619,15 @@ function finalizeBackupResult(resolved, created, now, distributions) {
     } catch (error) {
       console.warn(`[db-backup] Failed to append manifest entry: ${error.message}`);
     }
+  });
+
+  if (localDestinations.length === 0) {
+    // Local was not a chosen destination: the staged file was only ever
+    // scratch space for the upload(s) above. It must not linger as a silent,
+    // untracked local copy once every configured destination has confirmed
+    // it — remove it now that finalize is running only after every upload
+    // above succeeded and verified.
+    fs.rmSync(created.fullPath, { force: true });
   }
 
   // Stamped only after the backup exists, passed its integrity check, cleared
@@ -3593,18 +3729,37 @@ function runBackupJob(options = {}) {
       // backup dies with the disk it sits on; an unverified remote copy is not
       // a backup. If any upload or its verification fails we throw here, so
       // the previous good backups and the previous stamp both survive
-      // untouched at every destination, local included.
-      const distributions = remoteDestinations.map((destination) => ({
-        destination,
-        uploaded: uploadBackupToRemote(created, destination, resolved.runtime),
-        removed: [],
-      }));
+      // untouched at every destination, local included. This also covers
+      // every LOCAL destination beyond the first (the primary/staging one,
+      // already on disk at resolved.outputDir) — a local destination that
+      // can't be written, or whose copy fails checksum, is exactly as much of
+      // a failure as a bad remote upload.
+      const primaryLocal = resolved.destinations.find((dest) => dest.type === 'local');
+      // Seeded with the staging/primary destination's resolved path so a
+      // secondary local destination that resolves to the SAME path — the
+      // primary re-listed, or a duplicate secondary — is refused rather than
+      // silently self-copied. See replicateBackupToLocal.
+      const seenLocalPaths = new Set(primaryLocal ? [path.resolve(primaryLocal.path)] : []);
+      const distributions = resolved.destinations
+        .filter((destination) => destination !== primaryLocal)
+        .map((destination) => ({
+          destination,
+          uploaded:
+            destination.type === 'local'
+              ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
+              : uploadBackupToRemote(created, destination, resolved.runtime),
+          removed: [],
+        }));
 
       // Retention is applied per destination only after EVERY destination has
       // a verified copy — a prune must never run ahead of replication. The
       // SAME policy drives every destination once a GFS policy is configured
       // (resolveDestinationPolicy); otherwise each keeps its legacy count.
+      // Local destinations are excluded here: their retention (and the
+      // primary's) is applied together, independently per directory, inside
+      // finalizeBackupResult.
       for (const distribution of distributions) {
+        if (distribution.destination.type === 'local') continue;
         if (distribution.destination.prune === false) continue; // immutable/append-only destination: never attempt remote pruning
         const policy = resolveDestinationPolicy(distribution.destination, resolved);
         distribution.removed = pruneRemoteBackups(
@@ -3666,19 +3821,34 @@ async function runBackupJobAsync(options = {}) {
       // Replicate off-host BEFORE anything is pruned or stamped — see
       // runBackupJob for the full rationale. Uploads run in order (not
       // parallel) so a failure on destination N leaves destinations after it
-      // untouched, and the ones before it already verified.
+      // untouched, and the ones before it already verified. This also covers
+      // every LOCAL destination beyond the first (the primary/staging one,
+      // already on disk at resolved.outputDir) — a local destination that
+      // can't be written, or whose copy fails checksum, is exactly as much of
+      // a failure as a bad remote upload.
+      const primaryLocal = resolved.destinations.find((dest) => dest.type === 'local');
+      // Seeded with the staging/primary destination's resolved path — see
+      // runBackupJob for the full rationale.
+      const seenLocalPaths = new Set(primaryLocal ? [path.resolve(primaryLocal.path)] : []);
       const distributions = [];
-      for (const destination of remoteDestinations) {
+      for (const destination of resolved.destinations) {
+        if (destination === primaryLocal) continue;
         const uploaded =
-          destination.type === 's3'
-            ? await uploadBackupToS3(created, destination, resolved.runtime)
-            : uploadBackupToRemote(created, destination, resolved.runtime);
+          destination.type === 'local'
+            ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
+            : destination.type === 's3'
+              ? await uploadBackupToS3(created, destination, resolved.runtime)
+              : uploadBackupToRemote(created, destination, resolved.runtime);
         distributions.push({ destination, uploaded, removed: [] });
       }
 
       // Retention is applied per destination only after EVERY destination has
-      // a verified copy — a prune must never run ahead of replication.
+      // a verified copy — a prune must never run ahead of replication. Local
+      // destinations are excluded here: their retention (and the primary's)
+      // is applied together, independently per directory, inside
+      // finalizeBackupResult.
       for (const distribution of distributions) {
+        if (distribution.destination.type === 'local') continue;
         if (distribution.destination.prune === false) continue; // immutable/append-only destination: never attempt remote pruning
         const policy = resolveDestinationPolicy(distribution.destination, resolved);
         distribution.removed =
@@ -3789,6 +3959,8 @@ Options:
   --keep-days <n>         [legacy] Flat retention: keep backups younger than N days (env: DB_BACKUP_KEEP_DAYS)
   --command-timeout <s>   Bound every external command (env: DB_BACKUP_COMMAND_TIMEOUT_MS)
   --allow-unsafe-copy     Permit a byte copy when sqlite3 is absent (inconsistent)
+  --allow-unverified-postgres-backup  Permit keeping a Postgres dump when pg_restore is
+                          absent, skipping the pg_restore --list validation (unverified)
   --encrypt-passphrase-file <path>  Encrypt the backup (gpg symmetric AES256)
   --cipher <algo>         gpg cipher algorithm (default: AES256)
   --min-bytes <n>         Discard and fail if the backup is smaller than n bytes
@@ -4110,6 +4282,7 @@ async function runCli(argv = process.argv.slice(2)) {
     outputDir: options.outputDir,
     compressSqlite: options.compressSqlite,
     allowUnsafeCopy: options.allowUnsafeCopy,
+    allowUnverifiedPostgresBackup: options.allowUnverifiedPostgresBackup,
     ...(configDatabaseUrl ? { databaseUrl: configDatabaseUrl } : {}),
     encryption: passphraseFile ? { passphraseFile, ...(cipher ? { cipher } : {}) } : null,
     minBytes,
