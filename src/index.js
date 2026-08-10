@@ -1518,6 +1518,85 @@ function decryptBackupToPath(sourcePath, destPath, encryption, runtime) {
   restrictArtifact(destPath);
 }
 
+// Decrypts `backupEntry` (when encrypted) into a throwaway location under
+// `scratchParentDir`, hands the callback the plaintext path to work with, and
+// always removes that location afterward. Shared by BOTH restore paths
+// (PKG-132) rather than each hand-rolling its own decrypt-to-temp routine
+// with its own — potentially divergent — safety properties.
+//
+// `scratchParentDir` is caller-supplied rather than derived from
+// `backupEntry`, because the two restore paths need different guarantees:
+// restoreSqliteBackup passes the LIVE DATABASE's directory (guaranteed
+// writable — the restore is about to write there anyway), not the backup
+// artifact's directory, which may be a read-only mount (a standard way to
+// stop anything mutating backups). restorePostgresBackup has no local live-DB
+// file to anchor to, so it passes the backup artifact's own directory.
+//
+// The temp location is a freshly `mkdtemp`'d DIRECTORY, not a filename built
+// from `runtime.randomId()`. That matters: `randomId()`'s default is
+// `Date.now()-Math.random()`, not cryptographically random, and a filename
+// merely computed (not exclusively created) can be pre-planted as a symlink
+// before this function ever touches it — `gpg --yes` would then happily write
+// the decrypted dump through that link to wherever the attacker pointed it.
+// `mkdtempSync` closes that window: the directory is exclusively created,
+// unpredictably named, and 0700 by construction, atomically.
+function withDecryptedCopy(backupEntry, encryption, runtime, scratchParentDir, fn) {
+  if (!backupEntry.encrypted) {
+    return fn(backupEntry.fullPath);
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(scratchParentDir, '.restore-'));
+  const decryptedPath = path.join(tempDir, path.basename(backupEntry.fullPath).replace(/\.gpg$/, ''));
+
+  // Best-effort removal of the whole scratch directory, used from both the
+  // success and failure branches below. Never thrown from directly — callers
+  // decide how loudly a cleanup failure should be surfaced, since that
+  // depends on whether the body already failed.
+  const cleanup = () => {
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      return null;
+    } catch (cleanupError) {
+      return cleanupError;
+    }
+  };
+
+  let result;
+  try {
+    decryptBackupToPath(backupEntry.fullPath, decryptedPath, encryption, runtime);
+    result = fn(decryptedPath);
+  } catch (error) {
+    // The body (or decryption itself) is the real failure here; a cleanup
+    // problem on top of it is secondary. Log it — never let it replace or
+    // mask the original error, which is what the caller actually needs to see.
+    const cleanupError = cleanup();
+    if (cleanupError) {
+      console.error(
+        `[db-backup] WARNING: failed to remove restore scratch directory ${tempDir} after ` +
+          `a failed restore: ${cleanupError.message}. It may still contain a decrypted ` +
+          'plaintext copy of the backup and should be removed manually.'
+      );
+    }
+    throw error;
+  }
+
+  // The restore itself succeeded. A decrypted plaintext database just sat in
+  // this directory, so a failure to remove it is security-significant —
+  // surfaced loudly (mirrors the startWriters-after-restore precedent below:
+  // a failed secondary step is reported, never silently swallowed, but also
+  // never allowed to turn a successful restore into a thrown error).
+  const cleanupError = cleanup();
+  if (cleanupError) {
+    console.error(
+      `[db-backup] WARNING: restore succeeded but failed to remove the decrypted plaintext ` +
+        `scratch directory ${tempDir}: ${cleanupError.message}. It contains a decrypted copy ` +
+        'of the backup and must be removed manually.'
+    );
+  }
+
+  return result;
+}
+
 // A snapshot far smaller than expected is a failure, not a backup: an empty or
 // truncated database sails through `integrity_check`. A minimum-size floor
 // catches this. Disabled (0) unless the consumer sets it.
@@ -1923,33 +2002,28 @@ function restoreSqliteBackup({
     path.dirname(destinationPath),
     `.restore-${runtime.randomId()}.db`
   );
-  // Decryption lands here first; `.gpg` is the outermost layer, so unwind it
-  // before gunzip. Cleaned up alongside tempPath on any failure.
-  const decryptedPath = `${tempPath}.decrypted`;
 
   let writersStopped = false;
   let rescue = null;
 
   try {
     // Unwind the layers in reverse: decrypt -> decompress -> verify -> replace.
-    let sourcePath = backupEntry.fullPath;
-    if (backupEntry.encrypted) {
-      decryptBackupToPath(sourcePath, decryptedPath, encryption, runtime);
-      sourcePath = decryptedPath;
-    }
-
-    if (backupEntry.compressed) {
-      const compressed = fs.readFileSync(sourcePath);
-      const decompressed = zlib.gunzipSync(compressed);
-      fs.writeFileSync(tempPath, decompressed);
-    } else {
-      fs.copyFileSync(sourcePath, tempPath);
-    }
+    // withDecryptedCopy owns the decrypted plaintext's lifetime entirely (a
+    // throwaway mkdtemp'd directory, removed before it returns) — by the time
+    // this call returns, there is nothing of the decrypt step left to clean up.
+    // Scratch lives next to the LIVE DATABASE (guaranteed writable — we're
+    // about to write there anyway), not next to the backup artifact, which
+    // may be a read-only mount.
+    withDecryptedCopy(backupEntry, encryption, runtime, path.dirname(destinationPath), (sourcePath) => {
+      if (backupEntry.compressed) {
+        const compressed = fs.readFileSync(sourcePath);
+        const decompressed = zlib.gunzipSync(compressed);
+        fs.writeFileSync(tempPath, decompressed);
+      } else {
+        fs.copyFileSync(sourcePath, tempPath);
+      }
+    });
     restrictArtifact(tempPath);
-
-    // The decrypted plaintext has served its purpose; don't leave it beside the
-    // live database.
-    fs.rmSync(decryptedPath, { force: true });
 
     // Validate the restored file on the TEMP path, BEFORE it ever replaces the
     // live database: if this throws, the catch below cleans up tempPath only —
@@ -2034,12 +2108,10 @@ function restoreSqliteBackup({
       throw swapError;
     }
   } catch (error) {
-    for (const scratch of [tempPath, decryptedPath]) {
-      try {
-        fs.rmSync(scratch, { force: true });
-      } catch {
-        // Best effort cleanup.
-      }
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch {
+      // Best effort cleanup.
     }
     throw error;
   } finally {
@@ -2068,25 +2140,31 @@ function restorePostgresBackup({
   databaseUrl,
   backupEntry,
   runtime = normalizeRuntime(),
+  encryption = null,
 } = {}) {
   if (!runtime.commandExists('pg_restore')) {
     throw new Error('pg_restore is required for PostgreSQL restores but is not installed.');
   }
 
-  runtime.execFileSync(
-    'pg_restore',
-    [
-      '--clean',
-      '--if-exists',
-      '--no-owner',
-      '--no-privileges',
-      '--single-transaction',
-      '--dbname',
-      databaseUrl,
-      backupEntry.fullPath,
-    ],
-    { stdio: 'inherit' }
-  );
+  // The `.gpg` ciphertext must never be handed to pg_restore directly. No
+  // live local DB file to anchor scratch to here, so it lives next to the
+  // backup artifact itself.
+  withDecryptedCopy(backupEntry, encryption, runtime, path.dirname(backupEntry.fullPath), (sourcePath) => {
+    runtime.execFileSync(
+      'pg_restore',
+      [
+        '--clean',
+        '--if-exists',
+        '--no-owner',
+        '--no-privileges',
+        '--single-transaction',
+        '--dbname',
+        databaseUrl,
+        sourcePath,
+      ],
+      { stdio: 'inherit' }
+    );
+  });
 
   return {
     target: redactDatabaseUrl(databaseUrl),
@@ -2182,6 +2260,7 @@ function restoreBackup(options = {}) {
         databaseUrl: resolved.databaseUrl,
         backupEntry,
         runtime: resolved.runtime,
+        encryption: resolved.encryption,
       });
     }
 
