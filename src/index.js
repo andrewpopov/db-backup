@@ -3063,18 +3063,72 @@ function uploadBackupToRemote(entry, remote, runtime) {
 // rather than trusted: a copy that lands truncated or corrupted must fail
 // the run the same way a bad remote upload does, not silently pass as a
 // backup that exists there.
-function replicateBackupToLocal(entry, destination) {
+//
+// Copy-to-temp-then-rename, never straight onto the final name: a mid-copy
+// error or a checksum mismatch must never leave a partial file sitting at
+// the final path looking like a complete backup, and a rename within one
+// directory is atomic, so a reader can never observe a torn file there. The
+// temp file is removed on ANY failure (copy error, checksum mismatch,
+// rename error) via the try/finally below, so a throw can't leak it.
+//
+// Refuses outright — rather than overwriting or silently skipping — when the
+// final filename already exists at this destination: filenames carry a
+// timestamp and prefix, so a collision is genuinely anomalous (a clock
+// problem, or an unrelated file), and in a BACKUP tool it is never this
+// tool's call which of two same-named files is more valuable.
+//
+// `seenLocalPaths` (a Set of resolved directory paths, seeded by the caller
+// with the staging/primary destination) also rejects a secondary local
+// destination whose resolved path matches one already processed in this
+// run — including the staging path listed again as a secondary. Without
+// this, a duplicate would fall straight into fs.copyFileSync with the same
+// file as both source and destination, which is undefined/dangerous
+// (potentially truncating the very artifact it's copying) rather than a
+// deliberate, named refusal.
+function replicateBackupToLocal(entry, destination, runtime, seenLocalPaths) {
+  const resolvedDir = path.resolve(destination.path);
+  if (seenLocalPaths) {
+    if (seenLocalPaths.has(resolvedDir)) {
+      throw new Error(
+        `Duplicate local destination ${destination.path} (resolves to ${resolvedDir}): it matches the ` +
+          'staging/primary destination or another local destination already processed in this run. ' +
+          'Refusing to replicate a second time at the same path.',
+      );
+    }
+    seenLocalPaths.add(resolvedDir);
+  }
+
   ensureBackupDir(destination.path);
   const target = path.join(destination.path, entry.fileName);
-  fs.copyFileSync(entry.fullPath, target);
-  restrictArtifact(target);
 
-  const actualSha256 = sha256File(target);
-  if (actualSha256 !== entry.sha256) {
+  if (fs.existsSync(target)) {
     throw new Error(
-      `Local destination checksum mismatch for ${target}: expected=${entry.sha256} actual=${actualSha256}; ` +
-        'refusing to prune or stamp',
+      `Refusing to replicate ${entry.fileName} to ${destination.path}: a file with that name already exists ` +
+        'there. A collision on a timestamped, prefixed backup filename is anomalous (clock skew, or an ' +
+        'unrelated file) — refusing rather than guessing which one to keep or silently overwriting it.',
     );
+  }
+
+  const tempTarget = path.join(destination.path, `.${entry.fileName}.tmp-${runtime.randomId()}`);
+  let renamed = false;
+  try {
+    fs.copyFileSync(entry.fullPath, tempTarget);
+    restrictArtifact(tempTarget);
+
+    const actualSha256 = sha256File(tempTarget);
+    if (actualSha256 !== entry.sha256) {
+      throw new Error(
+        `Local destination checksum mismatch for ${target}: expected=${entry.sha256} actual=${actualSha256}; ` +
+          'refusing to prune or stamp',
+      );
+    }
+
+    fs.renameSync(tempTarget, target);
+    renamed = true;
+  } finally {
+    if (!renamed) {
+      fs.rmSync(tempTarget, { force: true });
+    }
   }
 
   return { target, sizeBytes: fs.statSync(target).size };
@@ -3681,13 +3735,18 @@ function runBackupJob(options = {}) {
       // can't be written, or whose copy fails checksum, is exactly as much of
       // a failure as a bad remote upload.
       const primaryLocal = resolved.destinations.find((dest) => dest.type === 'local');
+      // Seeded with the staging/primary destination's resolved path so a
+      // secondary local destination that resolves to the SAME path — the
+      // primary re-listed, or a duplicate secondary — is refused rather than
+      // silently self-copied. See replicateBackupToLocal.
+      const seenLocalPaths = new Set(primaryLocal ? [path.resolve(primaryLocal.path)] : []);
       const distributions = resolved.destinations
         .filter((destination) => destination !== primaryLocal)
         .map((destination) => ({
           destination,
           uploaded:
             destination.type === 'local'
-              ? replicateBackupToLocal(created, destination)
+              ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
               : uploadBackupToRemote(created, destination, resolved.runtime),
           removed: [],
         }));
@@ -3768,12 +3827,15 @@ async function runBackupJobAsync(options = {}) {
       // can't be written, or whose copy fails checksum, is exactly as much of
       // a failure as a bad remote upload.
       const primaryLocal = resolved.destinations.find((dest) => dest.type === 'local');
+      // Seeded with the staging/primary destination's resolved path — see
+      // runBackupJob for the full rationale.
+      const seenLocalPaths = new Set(primaryLocal ? [path.resolve(primaryLocal.path)] : []);
       const distributions = [];
       for (const destination of resolved.destinations) {
         if (destination === primaryLocal) continue;
         const uploaded =
           destination.type === 'local'
-            ? replicateBackupToLocal(created, destination)
+            ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
             : destination.type === 's3'
               ? await uploadBackupToS3(created, destination, resolved.runtime)
               : uploadBackupToRemote(created, destination, resolved.runtime);

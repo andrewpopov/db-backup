@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { execFileSync } from 'child_process';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { dbBackup, fixedNow, makeTempDir, makeRuntime, cleanupTempDirs } from './helpers';
 
@@ -1229,6 +1229,215 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
         'previous backup at the primary destination must survive',
       ).toBe(true);
       expect(fs.readFileSync(stampFile, 'utf8').trim()).toBe('2026-07-01T00:00:00.000Z');
+    });
+
+    // PKG-148 P1: replication used to copy straight onto the final filename
+    // with no exclusivity check. If that filename already existed at a
+    // secondary destination — very possibly a previous known-good backup
+    // that retention was keeping — it was silently clobbered. Filenames
+    // carry a timestamp and prefix, so a real collision is anomalous (clock
+    // skew, or an unrelated file); this tool must never guess which one to
+    // keep.
+    it('refuses to replicate onto a filename that already exists at a secondary local destination, and never touches its contents (PKG-148)', () => {
+      const cwd = makeTempDir();
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'database bytes');
+      const primaryDir = path.join(cwd, 'primary');
+      const secondDir = path.join(cwd, 'second');
+      fs.mkdirSync(secondDir, { recursive: true });
+
+      // This run (fixedNow, sqlite, uncompressed) always produces this exact
+      // filename — see the other tests in this file that assert the same.
+      const collisionName = 'sqlite-backup-20260705-150000Z.db';
+      const preexistingContents = 'a previous, known-good backup that must not be clobbered';
+      fs.writeFileSync(path.join(secondDir, collisionName), preexistingContents);
+
+      expect(() =>
+        runBackupJob({
+          allowUnsafeCopy: true,
+          cwd,
+          databaseUrl: 'file:./app.db',
+          compressSqlite: false,
+          runtime: makeRuntime(),
+          destinations: [
+            { type: 'local', path: primaryDir },
+            { type: 'local', path: secondDir },
+          ],
+        }),
+      ).toThrow(/already exists/i);
+
+      // The pre-existing file at the secondary destination must be byte-for-byte
+      // unchanged — not overwritten, and not left partially written.
+      expect(fs.readFileSync(path.join(secondDir, collisionName), 'utf8')).toBe(preexistingContents);
+    });
+
+    // PKG-148 P1: a checksum mismatch used to throw WITHOUT removing the
+    // file it had already written to the final path — leaving a
+    // partial/corrupt file that looks exactly like a complete backup. The
+    // fix copies to a temp name first and only renames it into place after
+    // the sha256 check passes, so a mismatch can never leave anything at the
+    // final path.
+    it('a checksum mismatch during replication leaves no file at the final target path, and leaves the primary and stamp untouched (PKG-148)', () => {
+      const cwd = makeTempDir();
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'database bytes');
+      const primaryDir = path.join(cwd, 'primary');
+      const secondDir = path.join(cwd, 'second');
+      fs.mkdirSync(primaryDir, { recursive: true });
+      fs.writeFileSync(path.join(primaryDir, 'sqlite-backup-20260701-000000Z.db'), 'previous good backup');
+
+      const stampFile = path.join(cwd, '.last-success');
+      fs.writeFileSync(stampFile, '2026-07-01T00:00:00.000Z\n');
+
+      // Inject a mid-copy corruption at the SECOND destination only: after
+      // the real copy lands, overwrite it with different bytes, so the
+      // sha256 verification inside replicateBackupToLocal fails exactly the
+      // way a truncated/corrupted copy would in production.
+      const originalCopyFileSync = fs.copyFileSync;
+      const copySpy = vi.spyOn(fs, 'copyFileSync').mockImplementation((...args: Parameters<typeof fs.copyFileSync>) => {
+        const result = originalCopyFileSync(...(args as [never, never]));
+        const dest = String(args[1]);
+        if (dest.startsWith(secondDir + path.sep)) {
+          fs.writeFileSync(dest, 'corrupted in transit');
+        }
+        return result;
+      });
+
+      try {
+        expect(() =>
+          runBackupJob({
+            allowUnsafeCopy: true,
+            cwd,
+            databaseUrl: 'file:./app.db',
+            compressSqlite: false,
+            runtime: makeRuntime(),
+            stampFile,
+            policy: { mode: 'keep-last', keepLast: 1 },
+            destinations: [
+              { type: 'local', path: primaryDir },
+              { type: 'local', path: secondDir },
+            ],
+          }),
+        ).toThrow(/checksum mismatch/i);
+      } finally {
+        copySpy.mockRestore();
+      }
+
+      // No partial, final-looking artifact left at the second destination —
+      // and no leftover temp file either.
+      const finalPath = path.join(secondDir, 'sqlite-backup-20260705-150000Z.db');
+      expect(fs.existsSync(finalPath), 'no file at the final target path after a checksum mismatch').toBe(false);
+      expect(fs.readdirSync(secondDir), 'no leftover temp file at the destination').toEqual([]);
+
+      // Primary's previous backups and the success stamp are untouched.
+      expect(fs.existsSync(path.join(primaryDir, 'sqlite-backup-20260701-000000Z.db'))).toBe(true);
+      expect(fs.readFileSync(stampFile, 'utf8').trim()).toBe('2026-07-01T00:00:00.000Z');
+    });
+
+    // PKG-148 P1: retention/stamping must never run at ANY destination
+    // unless EVERY destination succeeded — including one that already
+    // received a good copy before a later destination failed.
+    it('when a later local destination fails, no retention ran anywhere and the previous stamp is unchanged (PKG-148)', () => {
+      const cwd = makeTempDir();
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'database bytes');
+      const primaryDir = path.join(cwd, 'primary');
+      const secondDir = path.join(cwd, 'second');
+      fs.mkdirSync(primaryDir, { recursive: true });
+      fs.mkdirSync(secondDir, { recursive: true });
+      fs.writeFileSync(path.join(primaryDir, 'sqlite-backup-20260701-000000Z.db'), 'primary old backup');
+      fs.writeFileSync(path.join(secondDir, 'sqlite-backup-20260702-000000Z.db'), 'second old backup');
+
+      const stampFile = path.join(cwd, '.last-success');
+      fs.writeFileSync(stampFile, '2026-07-01T00:00:00.000Z\n');
+
+      // Block the THIRD destination exactly like the existing single-destination
+      // ENOTDIR test above: a plain file sits where its directory needs to be.
+      const blocker = path.join(cwd, 'blocker');
+      fs.writeFileSync(blocker, 'not a directory');
+      const unwritableThirdDir = path.join(blocker, 'third');
+
+      expect(() =>
+        runBackupJob({
+          allowUnsafeCopy: true,
+          cwd,
+          databaseUrl: 'file:./app.db',
+          compressSqlite: false,
+          runtime: makeRuntime(),
+          stampFile,
+          policy: { mode: 'keep-last', keepLast: 1 },
+          destinations: [
+            { type: 'local', path: primaryDir },
+            { type: 'local', path: secondDir },
+            { type: 'local', path: unwritableThirdDir },
+          ],
+        }),
+      ).toThrow(/ENOTDIR|not a directory/);
+
+      // Second destination DID receive its copy before the third destination
+      // failed — but retention must not have run there: its old backup
+      // survives alongside the new one.
+      expect(
+        fs.existsSync(path.join(secondDir, 'sqlite-backup-20260702-000000Z.db')),
+        "second's old backup must survive — no retention ran there",
+      ).toBe(true);
+      expect(
+        fs.existsSync(path.join(secondDir, 'sqlite-backup-20260705-150000Z.db')),
+        'second did receive the new copy before the run failed',
+      ).toBe(true);
+
+      // Primary: no retention either, and the stamp is untouched.
+      expect(fs.existsSync(path.join(primaryDir, 'sqlite-backup-20260701-000000Z.db'))).toBe(true);
+      expect(fs.readFileSync(stampFile, 'utf8').trim()).toBe('2026-07-01T00:00:00.000Z');
+    });
+
+    // PKG-148 P1: a duplicate local destination path used to rely on
+    // fs.copyFileSync happening to fail when asked to copy a file onto
+    // itself — incidental, not intended, and dangerous (a same-file copy is
+    // undefined behavior that can truncate the very artifact it's copying).
+    // A resolved-path collision must now be refused outright, with a clear
+    // error, instead of silently reporting success or corrupting data.
+    it('a duplicate local destination path — repeated verbatim, or the staging path listed again as a secondary — fails clearly (PKG-148)', () => {
+      // Case A: the same secondary path listed twice.
+      {
+        const cwd = makeTempDir();
+        fs.writeFileSync(path.join(cwd, 'app.db'), 'database bytes');
+        const primaryDir = path.join(cwd, 'primary');
+        const dupDir = path.join(cwd, 'dup');
+
+        expect(() =>
+          runBackupJob({
+            allowUnsafeCopy: true,
+            cwd,
+            databaseUrl: 'file:./app.db',
+            compressSqlite: false,
+            runtime: makeRuntime(),
+            destinations: [
+              { type: 'local', path: primaryDir },
+              { type: 'local', path: dupDir },
+              { type: 'local', path: dupDir },
+            ],
+          }),
+        ).toThrow(/duplicate local destination/i);
+      }
+
+      // Case B: the staging/primary path listed again as a secondary.
+      {
+        const cwd = makeTempDir();
+        fs.writeFileSync(path.join(cwd, 'app.db'), 'database bytes');
+        const primaryDir = path.join(cwd, 'primary');
+
+        expect(() =>
+          runBackupJob({
+            allowUnsafeCopy: true,
+            cwd,
+            databaseUrl: 'file:./app.db',
+            compressSqlite: false,
+            runtime: makeRuntime(),
+            destinations: [
+              { type: 'local', path: primaryDir },
+              { type: 'local', path: primaryDir },
+            ],
+          }),
+        ).toThrow(/duplicate local destination/i);
+      }
     });
 
     it('mixing legacy location flags with the new destinations model is rejected by resolveBackupOptions too', () => {
