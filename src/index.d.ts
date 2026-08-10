@@ -65,7 +65,14 @@ export type RetentionPolicy =
 /** WHERE a backup is written/replicated to — orthogonal to `RetentionPolicy`
  * (HOW MANY/WHICH survive). A `local` destination is not privileged: a
  * caller may configure `destinations: [{ type: 's3', ... }]` alone for an
- * S3-only backup. See `resolveDestinations` / `BackupOptions.destinations`. */
+ * S3-only backup. See `resolveDestinations` / `BackupOptions.destinations`.
+ *
+ * Every `local` destination is a REAL, independently-validated replication
+ * target, not a label: the FIRST one is the staging directory the artifact
+ * is created in; every `local` destination after that is copied to and
+ * sha256-verified, gets its own retention plan applied, and its own manifest
+ * — exactly like a remote destination. A config listing two or more `local`
+ * destinations backs up to all of them. */
 export interface LocalDestination {
   type: 'local';
   path: string;
@@ -338,10 +345,15 @@ export interface BackupPlan {
   policy: RetentionPolicy;
 }
 
-/** Per-destination upload/prune result — one entry per non-local destination
- * in `BackupOptions.destinations` (or the legacy `remote`/`s3` mapped onto
- * it). `uploaded`/`removedRemote` on `BackupJobResult` mirror the FIRST
- * entry here, for back-compat with the single-remote era. */
+/** Per-destination upload/prune result — one entry per destination in
+ * `BackupOptions.destinations` OTHER than the primary (the first `local`
+ * destination, which stages the artifact directly rather than being copied
+ * to — see `BackupJobResult.outputDir`). Covers every remote (rclone/S3) *and*
+ * every additional `local` destination beyond the first: an additional local
+ * destination is replicated to (copied + sha256-verified) and pruned
+ * independently, exactly like a remote. `uploaded`/`removedRemote` on
+ * `BackupJobResult` mirror the FIRST non-local entry here, for back-compat
+ * with the single-remote era. */
 export interface BackupDestinationResult {
   destination: BackupDestination;
   uploaded: BackupUploadResult;

@@ -3056,6 +3056,30 @@ function uploadBackupToRemote(entry, remote, runtime) {
   return remote.verify === false ? { target, sizeBytes: null } : verifyRemoteObject(entry, remote, runtime);
 }
 
+// Copy the just-created artifact to a LOCAL destination other than the
+// primary (staging) one — see resolveBackupOptions, which pins the FIRST
+// local destination as resolved.outputDir; every local destination after
+// that is replicated here, exactly like a remote upload. Verified by sha256
+// rather than trusted: a copy that lands truncated or corrupted must fail
+// the run the same way a bad remote upload does, not silently pass as a
+// backup that exists there.
+function replicateBackupToLocal(entry, destination) {
+  ensureBackupDir(destination.path);
+  const target = path.join(destination.path, entry.fileName);
+  fs.copyFileSync(entry.fullPath, target);
+  restrictArtifact(target);
+
+  const actualSha256 = sha256File(target);
+  if (actualSha256 !== entry.sha256) {
+    throw new Error(
+      `Local destination checksum mismatch for ${target}: expected=${entry.sha256} actual=${actualSha256}; ` +
+        'refusing to prune or stamp',
+    );
+  }
+
+  return { target, sizeBytes: fs.statSync(target).size };
+}
+
 // Turn a bare remote/S3 filename listing into the minimal shape planRetention
 // needs ({ fileName, createdAt }) — recency comes from the filename's own
 // embedded timestamp (parseTimestampKey), the same identity the rest of the
@@ -3484,46 +3508,54 @@ function resolveDestinationPolicy(destination, resolved) {
 }
 
 // Shared bottom half of a backup run, once every destination's upload (if
-// any) is known-uploaded-and-verified: local retention, per-destination
-// remote retention, manifest, and the success stamp. `distributions` is a
-// per-non-local-destination `{ destination, uploaded, removed }` list.
-// Entirely synchronous — no network I/O here — so both the sync and async
-// distribute paths below call it identically.
+// any) is known-uploaded-and-verified: retention (at EVERY local destination,
+// independently, plus per remote destination), manifest (at every local
+// destination), and the success stamp. `distributions` is a
+// per-non-primary-destination `{ destination, uploaded, removed }` list —
+// remote entries carry their `removed` already (set by the retention loop in
+// the caller); local entries beyond the first get theirs filled in here,
+// alongside the primary's. Entirely synchronous — no network I/O here — so
+// both the sync and async distribute paths below call it identically.
 function finalizeBackupResult(resolved, created, now, distributions) {
-  const localDestination = resolved.destinations.find((dest) => dest.type === 'local');
+  const localDestinations = resolved.destinations.filter((dest) => dest.type === 'local');
   let removed = [];
   let kept = [];
 
-  if (localDestination) {
-    const backups = listBackups({ outputDir: resolved.outputDir, now, namePrefix: resolved.namePrefix });
-    const plan = planRetention(backups, resolved.policy, now);
+  // Retention and the manifest are applied INDEPENDENTLY at every local
+  // destination — each has its own pre-existing backups, so each gets its
+  // own listing/plan/prune. The FIRST local destination is the primary
+  // (staging) one: its removed/kept drive the back-compat top-level fields;
+  // every local destination after that only surfaces in destinationResults.
+  localDestinations.forEach((localDestination, index) => {
+    const backups = listBackups({ outputDir: localDestination.path, now, namePrefix: resolved.namePrefix });
+    const policy = resolveDestinationPolicy(localDestination, resolved);
+    const plan = planRetention(backups, policy, now);
 
     // NEVER prune the backup we just created and verified, whatever the plan
     // says. A host whose clock jumped backward at boot gives the new file an
     // older timestamp than existing ones, and a retention policy that trusts
     // the ordering would then delete the only known-good backup.
     const doomed = plan.remove.filter((entry) => entry.fileName !== created.fileName);
-    removed = pruneBackups(doomed);
-    kept = plan.keep;
-  } else {
-    // Local was not a chosen destination: the staged file was only ever
-    // scratch space for the upload(s) above. It must not linger as a silent,
-    // untracked local copy once every configured destination has confirmed
-    // it — remove it now that finalize is running only after every upload
-    // above succeeded and verified.
-    fs.rmSync(created.fullPath, { force: true });
-  }
+    const removedAtDestination = pruneBackups(doomed);
 
-  // Best-effort: a manifest write failure must never fail the backup itself.
-  // Safety/pre-restore backups (created via createBackup outside this job)
-  // are intentionally NOT manifested — they're transient. Only written when
-  // local is a destination — a manifest with no corresponding local file is
-  // misleading, and checksums are re-verifiable from the destination anyway.
-  if (localDestination) {
+    if (index === 0) {
+      removed = removedAtDestination;
+      kept = plan.keep;
+    } else {
+      // BackupDestinationResult.removed is filenames (string[]), matching the
+      // remote/S3 convention — pruneBackups (unlike those) returns full
+      // BackupEntry objects, so map down to fileName here.
+      const distribution = distributions.find((d) => d.destination === localDestination);
+      if (distribution) distribution.removed = removedAtDestination.map((entry) => entry.fileName);
+    }
+
+    // Best-effort: a manifest write failure must never fail the backup
+    // itself. Safety/pre-restore backups (created via createBackup outside
+    // this job) are intentionally NOT manifested — they're transient.
     try {
-      appendBackupManifestEntry(resolved.outputDir, {
+      appendBackupManifestEntry(localDestination.path, {
         name: created.fileName,
-        path: created.fullPath,
+        path: index === 0 ? created.fullPath : path.join(localDestination.path, created.fileName),
         createdAt: created.createdAt,
         sizeBytes: created.sizeBytes,
         engine: created.engine,
@@ -3533,6 +3565,15 @@ function finalizeBackupResult(resolved, created, now, distributions) {
     } catch (error) {
       console.warn(`[db-backup] Failed to append manifest entry: ${error.message}`);
     }
+  });
+
+  if (localDestinations.length === 0) {
+    // Local was not a chosen destination: the staged file was only ever
+    // scratch space for the upload(s) above. It must not linger as a silent,
+    // untracked local copy once every configured destination has confirmed
+    // it — remove it now that finalize is running only after every upload
+    // above succeeded and verified.
+    fs.rmSync(created.fullPath, { force: true });
   }
 
   // Stamped only after the backup exists, passed its integrity check, cleared
@@ -3634,18 +3675,32 @@ function runBackupJob(options = {}) {
       // backup dies with the disk it sits on; an unverified remote copy is not
       // a backup. If any upload or its verification fails we throw here, so
       // the previous good backups and the previous stamp both survive
-      // untouched at every destination, local included.
-      const distributions = remoteDestinations.map((destination) => ({
-        destination,
-        uploaded: uploadBackupToRemote(created, destination, resolved.runtime),
-        removed: [],
-      }));
+      // untouched at every destination, local included. This also covers
+      // every LOCAL destination beyond the first (the primary/staging one,
+      // already on disk at resolved.outputDir) — a local destination that
+      // can't be written, or whose copy fails checksum, is exactly as much of
+      // a failure as a bad remote upload.
+      const primaryLocal = resolved.destinations.find((dest) => dest.type === 'local');
+      const distributions = resolved.destinations
+        .filter((destination) => destination !== primaryLocal)
+        .map((destination) => ({
+          destination,
+          uploaded:
+            destination.type === 'local'
+              ? replicateBackupToLocal(created, destination)
+              : uploadBackupToRemote(created, destination, resolved.runtime),
+          removed: [],
+        }));
 
       // Retention is applied per destination only after EVERY destination has
       // a verified copy — a prune must never run ahead of replication. The
       // SAME policy drives every destination once a GFS policy is configured
       // (resolveDestinationPolicy); otherwise each keeps its legacy count.
+      // Local destinations are excluded here: their retention (and the
+      // primary's) is applied together, independently per directory, inside
+      // finalizeBackupResult.
       for (const distribution of distributions) {
+        if (distribution.destination.type === 'local') continue;
         if (distribution.destination.prune === false) continue; // immutable/append-only destination: never attempt remote pruning
         const policy = resolveDestinationPolicy(distribution.destination, resolved);
         distribution.removed = pruneRemoteBackups(
@@ -3707,19 +3762,31 @@ async function runBackupJobAsync(options = {}) {
       // Replicate off-host BEFORE anything is pruned or stamped — see
       // runBackupJob for the full rationale. Uploads run in order (not
       // parallel) so a failure on destination N leaves destinations after it
-      // untouched, and the ones before it already verified.
+      // untouched, and the ones before it already verified. This also covers
+      // every LOCAL destination beyond the first (the primary/staging one,
+      // already on disk at resolved.outputDir) — a local destination that
+      // can't be written, or whose copy fails checksum, is exactly as much of
+      // a failure as a bad remote upload.
+      const primaryLocal = resolved.destinations.find((dest) => dest.type === 'local');
       const distributions = [];
-      for (const destination of remoteDestinations) {
+      for (const destination of resolved.destinations) {
+        if (destination === primaryLocal) continue;
         const uploaded =
-          destination.type === 's3'
-            ? await uploadBackupToS3(created, destination, resolved.runtime)
-            : uploadBackupToRemote(created, destination, resolved.runtime);
+          destination.type === 'local'
+            ? replicateBackupToLocal(created, destination)
+            : destination.type === 's3'
+              ? await uploadBackupToS3(created, destination, resolved.runtime)
+              : uploadBackupToRemote(created, destination, resolved.runtime);
         distributions.push({ destination, uploaded, removed: [] });
       }
 
       // Retention is applied per destination only after EVERY destination has
-      // a verified copy — a prune must never run ahead of replication.
+      // a verified copy — a prune must never run ahead of replication. Local
+      // destinations are excluded here: their retention (and the primary's)
+      // is applied together, independently per directory, inside
+      // finalizeBackupResult.
       for (const distribution of distributions) {
+        if (distribution.destination.type === 'local') continue;
         if (distribution.destination.prune === false) continue; // immutable/append-only destination: never attempt remote pruning
         const policy = resolveDestinationPolicy(distribution.destination, resolved);
         distribution.removed =

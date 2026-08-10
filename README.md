@@ -171,6 +171,14 @@ await runBackupJobAsync({
   then the local staging copy is removed, exactly like today's `skipRemote`
   never leaving a phantom local file, but without requiring a local
   destination to exist at all.
+- **Every `local` destination is a real replication target, not just the
+  first.** The first `local` destination is where the artifact is created
+  (staging). Any `local` destination configured after that is copied to and
+  verified by sha256 before anything is pruned or stamped — a copy that
+  can't be written, or that doesn't checksum-match, fails the whole run
+  exactly like a failed remote upload does. Retention and the manifest are
+  then applied independently at every local destination, so two configured
+  local paths really do both end up with the backup, not just the first one.
 - **Zero destinations aborts** — "you must choose where backups go" — the
   same fail-closed spirit as the local-only guard below, generalized to any
   number of destinations.
