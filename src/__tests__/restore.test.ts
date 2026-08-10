@@ -56,6 +56,431 @@ describe('@andrewpopov/db-backup — restore (round-trip, safety guards, writer 
     expect(result.target).toBe('postgresql://user:***@db.example/app');
   });
 
+  // --- PKG-132: encrypted PostgreSQL backups must be decrypted before pg_restore ---
+
+  it('decrypts an encrypted PostgreSQL backup before pg_restore runs, and cleans up the plaintext afterward', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const passphraseFile = path.join(cwd, 'pass');
+    const backupPath = path.join(outputDir, 'postgres-backup-20260705-150000Z.dump.gpg');
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+    const calls: Array<{ command: string; args: string[] }> = [];
+    let decryptedPathSeen: string | null = null;
+
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(passphraseFile, 'secret');
+    fs.writeFileSync(backupPath, 'ciphertext');
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl,
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      encryption: { passphraseFile },
+      runtime: makeRuntime({
+        commandExists: (command) => command === 'pg_restore' || command === 'gpg',
+        execFileSync: (command, args) => {
+          calls.push({ command, args });
+          if (command === 'gpg') {
+            const destPath = args[args.indexOf('-o') + 1];
+            decryptedPathSeen = destPath;
+            fs.writeFileSync(destPath, 'decrypted postgres dump');
+          }
+        },
+      }),
+    });
+
+    const gpgCall = calls.find((call) => call.command === 'gpg');
+    const pgRestoreCall = calls.find((call) => call.command === 'pg_restore');
+
+    expect(gpgCall).toBeDefined();
+    expect(gpgCall!.args).toContain(backupPath);
+    expect(pgRestoreCall).toBeDefined();
+    // pg_restore must never see the ciphertext path.
+    expect(pgRestoreCall!.args).not.toContain(backupPath);
+    expect(decryptedPathSeen).not.toBeNull();
+    expect(pgRestoreCall!.args[pgRestoreCall!.args.length - 1]).toBe(decryptedPathSeen);
+    // The plaintext scratch copy must not survive the restore.
+    expect(fs.existsSync(decryptedPathSeen as unknown as string)).toBe(false);
+    expect(result.target).toBe('postgresql://user:***@db.example/app');
+  });
+
+  it('cleans up the decrypted PostgreSQL plaintext even when pg_restore throws', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const passphraseFile = path.join(cwd, 'pass');
+    const backupPath = path.join(outputDir, 'postgres-backup-20260705-150000Z.dump.gpg');
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+    let decryptedPathSeen: string | null = null;
+
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(passphraseFile, 'secret');
+    fs.writeFileSync(backupPath, 'ciphertext');
+
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl,
+        outputDir,
+        backupFile: path.basename(backupPath),
+        createPreRestoreBackup: false,
+        encryption: { passphraseFile },
+        runtime: makeRuntime({
+          commandExists: (command) => command === 'pg_restore' || command === 'gpg',
+          execFileSync: (command, args) => {
+            if (command === 'gpg') {
+              const destPath = args[args.indexOf('-o') + 1];
+              decryptedPathSeen = destPath;
+              fs.writeFileSync(destPath, 'decrypted postgres dump');
+              return;
+            }
+            if (command === 'pg_restore') {
+              throw new Error('pg_restore boom');
+            }
+          },
+        }),
+      }),
+    ).toThrow(/pg_restore boom/);
+
+    expect(decryptedPathSeen).not.toBeNull();
+    expect(fs.existsSync(decryptedPathSeen as unknown as string)).toBe(false);
+  });
+
+  it('refuses to restore an encrypted PostgreSQL backup without a passphrase, and never invokes pg_restore', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const backupPath = path.join(outputDir, 'postgres-backup-20260705-150000Z.dump.gpg');
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+    const calls: Array<{ command: string; args: string[] }> = [];
+
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(backupPath, 'ciphertext');
+
+    expect(() =>
+      restoreBackup({
+        cwd,
+        databaseUrl,
+        outputDir,
+        backupFile: path.basename(backupPath),
+        createPreRestoreBackup: false,
+        runtime: makeRuntime({
+          commandExists: (command) => command === 'pg_restore',
+          execFileSync: (command, args) => calls.push({ command, args }),
+        }),
+      }),
+    ).toThrow(/encrypted; encryption.passphraseFile is required/);
+
+    expect(calls.find((call) => call.command === 'pg_restore')).toBeUndefined();
+  });
+
+  it('cannot be redirected by a pre-planted symlink at the old predictable `.restore-<id>` path', () => {
+    // Regression for the security review on PKG-132: the decrypt destination
+    // used to be `.restore-${runtime.randomId()}.dump`, computed (not
+    // exclusively created) directly inside outputDir. makeRuntime's default
+    // randomId is deterministic ('fixed-restore-id'), so anyone able to
+    // predict it could plant a symlink there before the restore ever runs;
+    // `gpg --yes` would then write the decrypted dump through that link.
+    // withDecryptedCopy now uses `fs.mkdtempSync`, which exclusively creates
+    // an unpredictably-named directory, so that old path is never touched.
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const passphraseFile = path.join(cwd, 'pass');
+    const backupPath = path.join(outputDir, 'postgres-backup-20260705-150000Z.dump.gpg');
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+    const attackTarget = path.join(cwd, 'attacker-target.dump');
+    const calls: Array<{ command: string; args: string[] }> = [];
+
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(passphraseFile, 'secret');
+    fs.writeFileSync(backupPath, 'ciphertext');
+
+    const predictablePath = path.join(outputDir, '.restore-fixed-restore-id.dump');
+    fs.symlinkSync(attackTarget, predictablePath);
+    const before = new Set(fs.readdirSync(outputDir));
+
+    restoreBackup({
+      cwd,
+      databaseUrl,
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      encryption: { passphraseFile },
+      runtime: makeRuntime({
+        commandExists: (command) => command === 'pg_restore' || command === 'gpg',
+        execFileSync: (command, args) => {
+          calls.push({ command, args });
+          if (command === 'gpg') {
+            const destPath = args[args.indexOf('-o') + 1];
+            fs.writeFileSync(destPath, 'decrypted postgres dump');
+          }
+        },
+      }),
+    });
+
+    // The planted symlink was never used: still a symlink, and nothing was
+    // ever written through it to the attacker's target.
+    expect(fs.lstatSync(predictablePath).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(attackTarget)).toBe(false);
+
+    // The actual decrypt destination was a freshly created directory — not
+    // the predictable filename, and not outputDir itself.
+    const gpgCall = calls.find((call) => call.command === 'gpg');
+    const destPath = gpgCall!.args[gpgCall!.args.indexOf('-o') + 1];
+    expect(destPath).not.toBe(predictablePath);
+    const scratchDir = path.dirname(destPath);
+    expect(scratchDir).not.toBe(outputDir);
+    expect(before.has(path.basename(scratchDir))).toBe(false);
+
+    // And it was cleaned up after the (successful) restore.
+    expect(fs.existsSync(scratchDir)).toBe(false);
+  });
+
+  it('surfaces (does not swallow, does not throw) a cleanup failure after a successful restore', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const passphraseFile = path.join(cwd, 'pass');
+    const backupPath = path.join(outputDir, 'postgres-backup-20260705-150000Z.dump.gpg');
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(passphraseFile, 'secret');
+    fs.writeFileSync(backupPath, 'ciphertext');
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const originalRmSync = fs.rmSync.bind(fs);
+    // Only fail removal of the decrypt scratch directory — the backup lock
+    // file (also cleaned up via fs.rmSync, in restoreBackup's own finally)
+    // must still be removed normally, or this test would be exercising lock
+    // cleanup instead of the thing under test.
+    const rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation((target, options) => {
+      if (typeof target === 'string' && target.includes(`${path.sep}.restore-`)) {
+        throw new Error('permission denied removing scratch dir');
+      }
+      return originalRmSync(target as string, options);
+    });
+
+    try {
+      const result = restoreBackup({
+        cwd,
+        databaseUrl,
+        outputDir,
+        backupFile: path.basename(backupPath),
+        createPreRestoreBackup: false,
+        encryption: { passphraseFile },
+        runtime: makeRuntime({
+          commandExists: (command) => command === 'pg_restore' || command === 'gpg',
+          execFileSync: (command, args) => {
+            if (command === 'gpg') {
+              const destPath = args[args.indexOf('-o') + 1];
+              fs.writeFileSync(destPath, 'decrypted postgres dump');
+            }
+          },
+        }),
+      });
+
+      // A cleanup failure must never turn a successful restore into a thrown
+      // error...
+      expect(result.target).toBe('postgresql://user:***@db.example/app');
+      // ...but it must be surfaced, not silently swallowed — this file's
+      // established idiom (see the startWriters-after-restore handling) is a
+      // console.error warning rather than a throw.
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('restore succeeded but failed to remove the decrypted plaintext')
+      );
+    } finally {
+      rmSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('propagates the ORIGINAL restore error, not a cleanup error, when both the restore and cleanup fail', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const passphraseFile = path.join(cwd, 'pass');
+    const backupPath = path.join(outputDir, 'postgres-backup-20260705-150000Z.dump.gpg');
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(passphraseFile, 'secret');
+    fs.writeFileSync(backupPath, 'ciphertext');
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const originalRmSync = fs.rmSync.bind(fs);
+    const rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation((target, options) => {
+      if (typeof target === 'string' && target.includes(`${path.sep}.restore-`)) {
+        throw new Error('cleanup also failed');
+      }
+      return originalRmSync(target as string, options);
+    });
+
+    try {
+      expect(() =>
+        restoreBackup({
+          cwd,
+          databaseUrl,
+          outputDir,
+          backupFile: path.basename(backupPath),
+          createPreRestoreBackup: false,
+          encryption: { passphraseFile },
+          runtime: makeRuntime({
+            commandExists: (command) => command === 'pg_restore' || command === 'gpg',
+            execFileSync: (command, args) => {
+              if (command === 'gpg') {
+                const destPath = args[args.indexOf('-o') + 1];
+                fs.writeFileSync(destPath, 'decrypted postgres dump');
+                return;
+              }
+              if (command === 'pg_restore') {
+                throw new Error('pg_restore boom');
+              }
+            },
+          }),
+        }),
+      ).toThrow(/pg_restore boom/); // the ORIGINAL error — not "cleanup also failed"
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('failed to remove restore scratch directory')
+      );
+    } finally {
+      rmSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('restores an encrypted SQLite backup end to end through the shared decrypt helper (no regression from unification)', () => {
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const dbPath = path.join(cwd, 'data', 'app.db');
+    const passphraseFile = path.join(cwd, 'pass');
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db.gpg');
+
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(passphraseFile, 'secret');
+    fs.writeFileSync(dbPath, 'old database');
+    fs.writeFileSync(backupPath, 'ciphertext');
+
+    const result = restoreBackup({
+      cwd,
+      databaseUrl: 'file:./data/app.db',
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      skipVerify: true,
+      allowOnlineRestore: true,
+      encryption: { passphraseFile },
+      runtime: makeRuntime({
+        commandExists: (command) => command === 'gpg',
+        execFileSync: (command, args) => {
+          if (command === 'gpg') {
+            const destPath = args[args.indexOf('-o') + 1];
+            fs.writeFileSync(destPath, 'restored database');
+          }
+        },
+      }),
+    });
+
+    expect(result.target).toBe(dbPath);
+    expect(fs.readFileSync(dbPath, 'utf8')).toBe('restored database');
+
+    // No scratch survives: neither the swap tempPath nor a leftover mkdtemp'd
+    // decrypt directory, in either the backup directory or the live DB's.
+    expect(fs.readdirSync(outputDir).filter((name) => name.startsWith('.restore-'))).toEqual([]);
+    expect(
+      fs.readdirSync(path.dirname(dbPath)).filter((name) => name.startsWith('.restore-'))
+    ).toEqual([]);
+  });
+
+  it('an encrypted SQLite restore creates its scratch directory next to the LIVE DATABASE, not next to the backup artifact', () => {
+    // Regression pin: withDecryptedCopy's scratch directory used to be
+    // derived from the backup artifact's own directory. That directory has no
+    // writability guarantee — mounting a backup share read-only is a standard
+    // way to stop anything mutating backups — whereas the live DB's directory
+    // is guaranteed writable, since the restore is about to write there
+    // anyway. The scratch parent must stay caller-supplied per restore path.
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const dbPath = path.join(cwd, 'data', 'app.db');
+    const passphraseFile = path.join(cwd, 'pass');
+    const backupPath = path.join(outputDir, 'sqlite-backup-20260705-150000Z.db.gpg');
+    let gpgDestPath: string | null = null;
+
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(passphraseFile, 'secret');
+    fs.writeFileSync(dbPath, 'old database');
+    fs.writeFileSync(backupPath, 'ciphertext');
+
+    restoreBackup({
+      cwd,
+      databaseUrl: 'file:./data/app.db',
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      skipVerify: true,
+      allowOnlineRestore: true,
+      encryption: { passphraseFile },
+      runtime: makeRuntime({
+        commandExists: (command) => command === 'gpg',
+        execFileSync: (command, args) => {
+          if (command === 'gpg') {
+            const destPath = args[args.indexOf('-o') + 1];
+            gpgDestPath = destPath;
+            fs.writeFileSync(destPath, 'restored database');
+          }
+        },
+      }),
+    });
+
+    expect(gpgDestPath).not.toBeNull();
+    const scratchDir = path.dirname(gpgDestPath as unknown as string);
+    // The scratch directory (mkdtemp's own random suffix) sits directly
+    // inside the live database's directory...
+    expect(path.dirname(scratchDir)).toBe(path.dirname(dbPath));
+    // ...never inside the backup artifact's directory.
+    expect(path.dirname(scratchDir)).not.toBe(outputDir);
+  });
+
+  it('an encrypted Postgres restore still creates its scratch directory next to the backup artifact', () => {
+    // There is no live local DB file for the Postgres path to anchor to (the
+    // destination is a connection string, not a filesystem path), so its
+    // scratch parent stays the backup artifact's own directory.
+    const cwd = makeTempDir();
+    const outputDir = path.join(cwd, 'backups');
+    const passphraseFile = path.join(cwd, 'pass');
+    const backupPath = path.join(outputDir, 'postgres-backup-20260705-150000Z.dump.gpg');
+    const databaseUrl = 'postgresql://user:secret@db.example/app';
+    let gpgDestPath: string | null = null;
+
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(passphraseFile, 'secret');
+    fs.writeFileSync(backupPath, 'ciphertext');
+
+    restoreBackup({
+      cwd,
+      databaseUrl,
+      outputDir,
+      backupFile: path.basename(backupPath),
+      createPreRestoreBackup: false,
+      encryption: { passphraseFile },
+      runtime: makeRuntime({
+        commandExists: (command) => command === 'pg_restore' || command === 'gpg',
+        execFileSync: (command, args) => {
+          if (command === 'gpg') {
+            const destPath = args[args.indexOf('-o') + 1];
+            gpgDestPath = destPath;
+            fs.writeFileSync(destPath, 'decrypted postgres dump');
+          }
+        },
+      }),
+    });
+
+    expect(gpgDestPath).not.toBeNull();
+    const scratchDir = path.dirname(gpgDestPath as unknown as string);
+    expect(path.dirname(scratchDir)).toBe(outputDir);
+  });
+
   it('restores compressed SQLite backups atomically through a temp file', () => {
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');
