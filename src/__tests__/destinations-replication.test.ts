@@ -761,6 +761,34 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
     expect(objects.has('sqlite-backup-20260103-000000Z.db')).toBe(true);
   });
 
+  // PKG-148: src/index.d.ts declares `namePrefix` and `parseBackupFileNameFn`
+  // as optional, so `pruneS3Backups(s3, protectFileName, runtime)` — exactly
+  // the 3 REQUIRED args — is a legal call per the published types. Before the
+  // fix, the omitted 5th positional arg was called as a function
+  // (`parseBackupFileName(name, namePrefix)`) and threw a TypeError instead
+  // of pruning, because nothing supplied a default parser.
+  it('pruneS3Backups prunes with just the 3 documented arguments (s3, protectFileName, runtime)', async () => {
+    const { objects, fetchImpl } = makeFakeS3();
+    const runtime = makeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never);
+    const s3 = { bucket: 'mybucket', keep: 1 } as never;
+
+    const dir = makeTempDir();
+    for (const name of [
+      'sqlite-backup-20260101-000000Z.db',
+      'sqlite-backup-20260102-000000Z.db',
+      'sqlite-backup-20260103-000000Z.db',
+    ]) {
+      const filePath = path.join(dir, name);
+      fs.writeFileSync(filePath, name);
+      await uploadBackupToS3({ fileName: name, fullPath: filePath } as never, s3, runtime as never);
+    }
+
+    const deleted = await pruneS3Backups(s3, 'sqlite-backup-20260103-000000Z.db', runtime as never);
+
+    expect(deleted.sort()).toEqual(['sqlite-backup-20260101-000000Z.db', 'sqlite-backup-20260102-000000Z.db']);
+    expect(objects.has('sqlite-backup-20260103-000000Z.db')).toBe(true);
+  });
+
   // BWK: append-only / immutable destinations (e.g. an S3 bucket whose IAM
   // key has an explicit Deny on s3:DeleteObject) can never be client-pruned.
   // `prune: false` lets such a destination opt out of remote retention

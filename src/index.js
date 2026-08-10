@@ -157,6 +157,7 @@ function parseArgs(argv) {
     configPath: null,
     commandTimeoutMs: null,
     allowUnsafeCopy: false,
+    allowUnverifiedPostgresBackup: false,
     passphraseFile: null,
     cipher: null,
     minBytes: null,
@@ -548,6 +549,11 @@ function parseArgs(argv) {
 
     if (arg === '--allow-unsafe-copy') {
       options.allowUnsafeCopy = true;
+      continue;
+    }
+
+    if (arg === '--allow-unverified-postgres-backup') {
+      options.allowUnverifiedPostgresBackup = true;
       continue;
     }
 
@@ -1240,6 +1246,7 @@ function resolveBackupOptions(options = {}) {
   const mode = options.mode || (process.env.NODE_ENV === 'production' ? 'prod' : 'dev');
   const compressSqlite = options.compressSqlite !== false;
   const allowUnsafeCopy = options.allowUnsafeCopy === true;
+  const allowUnverifiedPostgresBackup = options.allowUnverifiedPostgresBackup === true;
   const encryption = options.encryption || null;
   const minBytes = Number(options.minBytes) > 0 ? Number(options.minBytes) : 0;
   const stampFile = options.stampFile || null;
@@ -1302,6 +1309,7 @@ function resolveBackupOptions(options = {}) {
     outputDir,
     compressSqlite,
     allowUnsafeCopy,
+    allowUnverifiedPostgresBackup,
     encryption,
     minBytes,
     stampFile,
@@ -1720,7 +1728,14 @@ function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd =
   };
 }
 
-function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalizeRuntime(), namePrefix = null }) {
+function createPostgresBackup({
+  databaseUrl,
+  outputDir,
+  now,
+  runtime = normalizeRuntime(),
+  namePrefix = null,
+  allowUnverifiedPostgresBackup = false,
+}) {
   now = now || runtime.now();
   if (!runtime.commandExists('pg_dump')) {
     throw new Error('pg_dump is required for PostgreSQL backups but is not installed.');
@@ -1737,9 +1752,30 @@ function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalize
   restrictArtifact(fullPath);
 
   // Verify the dump before we keep it, mirroring the SQLite integrity check.
-  // Only possible when pg_restore is present; skip like the SQLite cp-fallback.
+  // REQUIRED: unlike sqlite3 (needed just to take the SQLite snapshot),
+  // pg_dump and pg_restore are independent binaries, so a pg_dump-only host
+  // can produce a dump and never learn whether it is truncated/corrupt/
+  // unreadable. Silently accepting it here — as this used to do — let a bad
+  // dump rotate into retention looking exactly like a good one. Refuse
+  // unless the caller explicitly opts in to keeping it unverified, mirroring
+  // how createSqliteSnapshot refuses a plain copy unless allowUnsafeCopy.
+  let verified = true;
   if (runtime.commandExists('pg_restore')) {
     verifyPostgresBackupIntegrity(fullPath, runtime);
+  } else if (!allowUnverifiedPostgresBackup) {
+    fs.rmSync(fullPath, { force: true });
+    throw new Error(
+      `Refusing to keep an unverified PostgreSQL backup: the 'pg_restore' binary is unavailable, so ` +
+        `${fileName} cannot be validated with 'pg_restore --list' before it is kept. Install pg_restore ` +
+        `(ships with the postgresql-client package), or pass allowUnverifiedPostgresBackup / ` +
+        `--allow-unverified-postgres-backup to accept an unverified dump.`
+    );
+  } else {
+    verified = false;
+    console.warn(
+      `[db-backup] WARNING: keeping ${fileName} without pg_restore verification ('pg_restore' unavailable, ` +
+        'allowUnverifiedPostgresBackup is set). UNSAFE.'
+    );
   }
 
   const stats = fs.statSync(fullPath);
@@ -1753,6 +1789,10 @@ function createPostgresBackup({ databaseUrl, outputDir, now, runtime = normalize
     createdAt: now.toISOString(),
     sizeBytes: stats.size,
     sha256: sha256File(fullPath),
+    // Visible trace of the allowUnverifiedPostgresBackup opt-out — absent
+    // (implicitly verified) on the normal path, mirroring how `encrypted`
+    // is only set when it applies rather than always present.
+    ...(verified ? {} : { verified: false }),
   };
 }
 
@@ -1788,6 +1828,7 @@ function createBackup(options = {}) {
         now,
         runtime: resolved.runtime,
         namePrefix: resolved.namePrefix,
+        allowUnverifiedPostgresBackup: resolved.allowUnverifiedPostgresBackup,
       })
     );
   }
@@ -3789,6 +3830,8 @@ Options:
   --keep-days <n>         [legacy] Flat retention: keep backups younger than N days (env: DB_BACKUP_KEEP_DAYS)
   --command-timeout <s>   Bound every external command (env: DB_BACKUP_COMMAND_TIMEOUT_MS)
   --allow-unsafe-copy     Permit a byte copy when sqlite3 is absent (inconsistent)
+  --allow-unverified-postgres-backup  Permit keeping a Postgres dump when pg_restore is
+                          absent, skipping the pg_restore --list validation (unverified)
   --encrypt-passphrase-file <path>  Encrypt the backup (gpg symmetric AES256)
   --cipher <algo>         gpg cipher algorithm (default: AES256)
   --min-bytes <n>         Discard and fail if the backup is smaller than n bytes
@@ -4110,6 +4153,7 @@ async function runCli(argv = process.argv.slice(2)) {
     outputDir: options.outputDir,
     compressSqlite: options.compressSqlite,
     allowUnsafeCopy: options.allowUnsafeCopy,
+    allowUnverifiedPostgresBackup: options.allowUnverifiedPostgresBackup,
     ...(configDatabaseUrl ? { databaseUrl: configDatabaseUrl } : {}),
     encryption: passphraseFile ? { passphraseFile, ...(cipher ? { cipher } : {}) } : null,
     minBytes,

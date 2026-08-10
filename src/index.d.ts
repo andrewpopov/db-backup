@@ -207,6 +207,15 @@ export interface BackupEntry {
    * createPostgresBackup; absent on entries derived from disk scans alone
    * (e.g. via getBackupEntryFromPath/listBackups) until re-hashed. */
   sha256?: string;
+  /** Postgres backups only: `false` when the dump was kept WITHOUT
+   * `pg_restore --list` validation, because `pg_restore` was unavailable and
+   * `allowUnverifiedPostgresBackup` opted in to keeping it anyway. Absent
+   * (implicitly verified) on every normal backup — this is the visible trace
+   * of that opt-out in the result, mirroring `encrypted` (present only when
+   * it applies). SQLite entries never carry this field: taking a SQLite
+   * snapshot at all already requires `sqlite3`, the same binary that verifies
+   * it — see `allowUnsafeCopy` for that engine's analogous escape hatch. */
+  verified?: boolean;
 }
 
 export interface BackupOptions {
@@ -218,6 +227,14 @@ export interface BackupOptions {
   policy?: RetentionPolicy;
   /** Permit a plain byte copy when `sqlite3` is unavailable (default false). */
   allowUnsafeCopy?: boolean;
+  /** Postgres only: permit keeping a `pg_dump` archive that could not be
+   * validated with `pg_restore --list` because `pg_restore` is unavailable
+   * (default false — the backup is refused instead). The analogous escape
+   * hatch to `allowUnsafeCopy`, one layer over: `pg_dump` can still produce a
+   * dump without `pg_restore` present, so this is opted into per run rather
+   * than failing closed. Sets `BackupEntry.verified: false` on the result so
+   * the opt-out is visible without re-reading config. */
+  allowUnverifiedPostgresBackup?: boolean;
   /** Encrypt the backup at rest with gpg symmetric AES256. Required to restore
    * an encrypted backup. */
   encryption?: BackupEncryption | null;
@@ -659,7 +676,10 @@ export function verifyS3Object(
 /** Best-effort S3 retention: keep the newest `s3.keep` objects under the
  * bucket/prefix, protecting `protectFileName` (the object just uploaded and
  * verified). Async. A listing or delete failure is a cleanup miss (warns),
- * never a data-safety issue — mirrors `pruneRemoteBackups`. */
+ * never a data-safety issue — mirrors `pruneRemoteBackups`. `namePrefix` and
+ * `parseBackupFileNameFn` are both genuinely optional: the 3-arg call
+ * `pruneS3Backups(s3, protectFileName, runtime)` is fully supported and uses
+ * this package's own `parseBackupFileName` and no name prefix. */
 export function pruneS3Backups(
   s3: BackupS3Remote,
   protectFileName: string,
