@@ -1,0 +1,72 @@
+#!/usr/bin/env sh
+#
+# Local pre-push gate — this repo's CI, run on your own machine.
+#
+# GitHub Actions is disabled across this fleet, so nothing runs server-side.
+# For a PACKAGE that matters more than it does for an app, not less: a broken
+# push here is consumed by every app pinning this repo, and the failure surfaces
+# in their deploy rather than here, where the cause is.
+#
+# Order is cheapest-first so you fail fast.
+#
+# Escape hatch: `git push --no-verify`. Use it when you mean to — pushing a WIP
+# branch for review, or a docs-only branch — not to get past a red check. A
+# guard you routinely bypass is a guard you do not have.
+#
+# Wired by the `prepare` script (`git config core.hooksPath .githooks`), so a
+# fresh clone gets it on install. If it is not firing, run `npm install` and
+# check `git config core.hooksPath` resolves to a directory that exists.
+set -e
+
+# A push that only deletes refs has nothing to verify.
+only_deletes=1
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  case "$local_sha" in
+    *[!0]*) only_deletes=0 ;;
+  esac
+done
+if [ "$only_deletes" = "1" ]; then
+  exit 0
+fi
+
+step() { printf '\n\033[36m▸ pre-push: %s\033[0m\n' "$1"; }
+fail() {
+  printf '\n\033[31m✗ pre-push: %s FAILED — push blocked.\033[0m\n' "$1"
+  shift
+  for line in "$@"; do printf '  %s\n' "$line"; done
+  exit 1
+}
+
+# Reconcile node_modules with the lockfile BEFORE verifying anything. Most of
+# the drift found across this fleet was not a bad bump — it was a tree that had
+# simply never been installed after pulling someone else's.
+lock_state() { git status --porcelain -- '*package-lock.json' '*pnpm-lock.yaml' 2>/dev/null; }
+lock_before="$(lock_state)"
+step 'install'
+npm install --prefer-offline || fail 'install'
+
+# If installing MOVED the lockfile, the committed one was stale — everything
+# below would then verify a tree that is not the one being pushed.
+if [ "$(lock_state)" != "$lock_before" ]; then
+  lock_state
+  fail 'lockfile changed during install' \
+    'The committed lockfile did not match the manifest, so what you just' \
+    'tested is not what you are pushing. Review and commit the lockfile.'
+fi
+
+# A `github:owner/repo#tag` pin does NOT re-resolve when only the tag moves —
+# npm keys the lockfile on the resolved commit, so a bumped pin installs clean
+# while leaving the old code on disk. This reads the installed version off disk
+# and compares it to the pin. It is the first real check for exactly that
+# reason: everything below would otherwise verify the wrong code.
+step 'verify-pins'
+npx --no-install deploy-kit verify-pins || fail 'verify-pins' \
+  'A pinned dependency on disk does not match its manifest pin.' \
+  'Install it explicitly (npm install <name>@github:owner/repo#<tag>) and' \
+  'confirm by reading node_modules/<name>/package.json — not the manifest.'
+
+# lint + types + tests + build + pack + bins (per repo's own verify chain).
+step 'verify'
+npm run verify || fail 'verify'
+
+printf '\n\033[32m✓ pre-push gate passed.\033[0m\n'
