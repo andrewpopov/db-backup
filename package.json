@@ -59,7 +59,7 @@
     "dotenv": "^16.5.0"
   },
   "devDependencies": {
-    "@andrewpopov/deploy-kit": "github:andrewpopov/deploy-kit#v0.23.0",
+    "@andrewpopov/deploy-kit": "github:andrewpopov/deploy-kit#v0.25.0",
     "@andrewpopov/release-kit": "github:andrewpopov/release-kit#v0.3.1",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.3",
