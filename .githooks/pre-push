@@ -18,6 +18,18 @@
 # check `git config core.hooksPath` resolves to a directory that exists.
 set -e
 
+# Git exports its repository-local variables to hooks. From a WORKTREE it sets
+# GIT_DIR, so any `git -C <somewhere>` in a child process silently operates on
+# THIS repo instead of <somewhere> -- `-C` changes directory, but GIT_DIR still
+# wins the repository lookup. Reproduced: a fixture running
+# `git config core.bare true` wrote to the live repo instead of its fixture.
+# It does NOT reproduce from the primary checkout, only from a worktree, which
+# is where all implementation work in this fleet happens.
+#
+# Use git's OWN list rather than a hand-kept one: a partial list already missed
+# GIT_CONFIG, the direct mutation hazard. This cannot drift as git adds vars.
+for v in $(git rev-parse --local-env-vars) GIT_QUARANTINE_PATH; do unset "$v"; done
+
 # A push that only deletes refs has nothing to verify.
 only_deletes=1
 while read -r _local_ref local_sha _remote_ref _remote_sha; do
