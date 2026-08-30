@@ -10,7 +10,7 @@ to be trustworthy without a human watching it.
 ## Install
 
 ```bash
-npm install github:andrewpopov/db-backup#v0.19.0
+npm install github:andrewpopov/db-backup#v0.21.0
 ```
 
 ## Retention

@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.21.0
+
+- PostgreSQL backups now require pg_restore to validate the dump before keeping it
+  `createPostgresBackup` used to silently accept and rotate an unverified
+  `pg_dump` archive whenever `pg_restore` was not installed — the only
+  consequence was a comment, never an error or a marked result. `pg_restore
+  --list` validation (mirroring the SQLite `PRAGMA integrity_check`) is now
+  **required**: if `pg_restore` is unavailable, the run throws naming the
+  missing binary and what to install, and the dump is deleted rather than kept.
+  Pass `allowUnverifiedPostgresBackup` (CLI: `--allow-unverified-postgres-backup`)
+  to explicitly accept an unverified dump — the opt-out is then surfaced on the
+  result as `BackupEntry.verified: false`, not only in config. Impact: none for
+  hosts with `pg_restore` installed (the common case); a pg_dump-only host must
+  either install `pg_restore` or opt in explicitly.
+- restore now decrypts an encrypted PostgreSQL backup before running pg_restore
+  An encrypted PostgreSQL backup could not be restored: `createBackup` applied
+  GPG encryption to Postgres dumps, but `restorePostgresBackup` handed the
+  `.dump.gpg` ciphertext straight to `pg_restore`, which cannot parse it.
+  `decryptBackupToPath` (already used by the SQLite restore path) had exactly
+  one call site — the Postgres path never called it at all, and the dispatcher
+  never threaded `encryption` through to it either. Restore now decrypts an
+  encrypted Postgres backup to a private scratch file before invoking
+  `pg_restore`, mirroring the SQLite path; an unencrypted backup is unaffected.
+- pruneS3Backups now works with just the 3 documented arguments
+  `src/index.d.ts` documented `namePrefix` and `parseBackupFileNameFn` as
+  optional on the exported `pruneS3Backups`, so `pruneS3Backups(s3,
+  protectFileName, runtime)` was legal TypeScript — but the omitted parser
+  parameter was called as a function and threw before any pruning happened.
+  `pruneS3Backups` now defaults `parseBackupFileNameFn` to the package's own
+  `parseBackupFileName` (required lazily, at call time, to avoid a circular
+  require with index.js) and `namePrefix` to `null`, so the documented 3-arg
+  call actually works. The parameter was also renamed from `parseBackupFileName`
+  to `parseBackupFileNameFn` so it no longer shadows the function it defaults
+  to. Every existing 5+-arg call site (internal and test) is unaffected.
+- additional local destinations are now actually replicated to, not silently dropped
+  A config listing two or more `local` destinations silently backed up to only
+  the first: `resolveBackupOptions` picked the FIRST `local` entry as the
+  staging/output directory, and both job paths (`runBackupJob` and
+  `runBackupJobAsync`) filtered `destinations` down to `dest.type !== 'local'`
+  before distributing, so every `local` destination after the first was never
+  written to, never retained, and never manifested — the run still reported
+  success. Every `local` destination is now a real replication target: the
+  first stays the staging directory the artifact is created in, and each one
+  after that is copied to and verified by sha256 before anything is pruned or
+  stamped, exactly like a remote upload — a copy that can't be written, or
+  that doesn't checksum-match, fails the whole run and leaves every
+  destination's previous backups and the stamp untouched. Retention and the
+  manifest are then applied independently at every local destination. The
+  back-compat top-level `removed`/`kept` still describe the primary (staging)
+  destination only; every additional local destination's upload and prune
+  result now appears in `destinationResults`, alongside remote destinations.
+- restore's decrypt-to-temp scratch directory is now created via mkdtemp, closing a symlink-plant window
+  Both restore paths used to decrypt an encrypted backup to a filename built
+  from `runtime.randomId()` — not cryptographically random, and merely computed
+  rather than exclusively created. A file or symlink pre-planted at that
+  predictable path before a restore ran would be reused: `gpg --yes` writes
+  through a symlink, so the decrypted plaintext could land wherever the symlink
+  pointed, outside the backup directory entirely. Both paths now decrypt into a
+  directory created with `fs.mkdtempSync` — exclusively created, unpredictably
+  named, and `0700` by construction — via one shared helper instead of two
+  divergent implementations. Cleanup of that directory can itself fail (a
+  permissions or filesystem error); that is now handled without masking the
+  real outcome: a cleanup failure after a successful restore is logged, not
+  thrown, and a cleanup failure after a failed restore never replaces the
+  original error. The SQLite path's scratch directory is created next to the
+  live database (guaranteed writable), not next to the backup artifact (which
+  may sit on a read-only mount); the Postgres path, which has no local live-DB
+  file to anchor to, keeps using the backup artifact's own directory.
+
 ## 0.20.0
 
 - freshness alert suppression: one alert per incident, with reminders and a recovery notice
