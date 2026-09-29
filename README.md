@@ -412,6 +412,19 @@ secret key.
   `--retain-*`/`--retention-policy` (or a `policy` with `mode: 'gfs'`) is set,
   S3 (like rclone) follows that SAME unified plan instead; see
   [Destinations: WHERE backups go](#destinations-where-backups-go).
+- **Pruning needs delete permission on the prefix.** The credential must allow
+  `s3:DeleteObject` on `<bucket>/<prefix>/*`, not just `PutObject`/`GetObject`.
+  Without it, backups still upload, and each rotated-out object logs
+  `Failed to prune remote backup <file> (leaving it in place): DELETE returned 403`.
+  The backup itself still succeeds, so the only symptom is the bucket growing
+  past your retention. Grant delete per prefix rather than bucket-wide, and
+  never grant `s3:DeleteObjectVersion` to a backup writer.
+- **On a versioned bucket, a prune only hides the object.** `DeleteObject`
+  adds a delete marker, and the data stays as a noncurrent version. That's a
+  useful recovery window, but nothing reclaims the space unless the bucket has
+  a lifecycle rule with `NoncurrentVersionExpiration` (plus
+  `ExpiredObjectDeleteMarker`) on the prefix. Without that rule, retention
+  controls what you can *see*, not what you *pay for*.
 
 ## Backup liveness
 
