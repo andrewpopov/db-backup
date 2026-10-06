@@ -21,8 +21,8 @@ describe('@andrewpopov/db-backup — restore (round-trip, safety guards, writer 
     const cwd = makeTempDir();
     const outputDir = path.join(cwd, 'backups');
     const backupPath = path.join(outputDir, 'postgres-backup-20260705-150000Z.dump');
-    const calls: Array<{ command: string; args: string[] }> = [];
-    const databaseUrl = 'postgresql://user:secret@db.example/app';
+    const calls: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> = [];
+    const databaseUrl = 'postgresql://user:secret@db.example/app?connection_limit=5&sslmode=require';
     fs.mkdirSync(outputDir, { recursive: true });
     fs.writeFileSync(backupPath, 'postgres dump');
 
@@ -34,26 +34,27 @@ describe('@andrewpopov/db-backup — restore (round-trip, safety guards, writer 
       createPreRestoreBackup: false,
       runtime: makeRuntime({
         commandExists: (command) => command === 'pg_restore',
-        execFileSync: (command, args) => calls.push({ command, args }),
+        execFileSync: (command, args, options) =>
+          calls.push({ command, args, env: (options as { env?: NodeJS.ProcessEnv }).env }),
       }),
     });
 
-    expect(calls).toEqual([
-      {
-        command: 'pg_restore',
-        args: [
-          '--clean',
-          '--if-exists',
-          '--no-owner',
-          '--no-privileges',
-          '--single-transaction',
-          '--dbname',
-          databaseUrl,
-          backupPath,
-        ],
-      },
+    // Password travels via PGPASSWORD, never argv; Prisma-only params are dropped, sslmode kept.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe('pg_restore');
+    expect(calls[0].args).toEqual([
+      '--clean',
+      '--if-exists',
+      '--no-owner',
+      '--no-privileges',
+      '--single-transaction',
+      '--dbname',
+      'postgresql://user@db.example/app?sslmode=require',
+      backupPath,
     ]);
-    expect(result.target).toBe('postgresql://user:***@db.example/app');
+    expect(calls[0].args.join(' ')).not.toContain('secret');
+    expect(calls[0].env?.PGPASSWORD).toBe('secret');
+    expect(result.target).toBe('postgresql://user:***@db.example/app?connection_limit=5&sslmode=require');
   });
 
   // --- PKG-132: encrypted PostgreSQL backups must be decrypted before pg_restore ---

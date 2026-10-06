@@ -294,9 +294,73 @@ describe('@andrewpopov/db-backup — backup job (SQLite/Postgres creation, integ
     expect(calls).toEqual([
       {
         command: 'pg_dump',
-        args: ['--format=custom', `--file=${expectedPath}`, databaseUrl],
+        args: ['--format=custom', `--file=${expectedPath}`, 'postgresql://user@db.example/app'],
       },
     ]);
+  });
+
+  // The password must reach libpq through the child's environment, never argv
+  // (readable by every local user via `ps`).
+  describe('pg_dump connection handling', () => {
+    function runPgDump(databaseUrl: string) {
+      const cwd = makeTempDir();
+      const calls: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> = [];
+      const runtime = makeRuntime({
+        commandExists: (command) => command === 'pg_dump',
+        execFileSync: (command, args, options) => {
+          calls.push({ command, args, env: (options as { env?: NodeJS.ProcessEnv }).env });
+          const outputArg = args.find((arg) => arg.startsWith('--file='));
+          if (!outputArg) throw new Error('pg_dump call missing --file argument');
+          fs.writeFileSync(outputArg.slice('--file='.length), 'postgres dump');
+        },
+      });
+      runBackupJob({
+        skipRemote: true,
+        allowUnverifiedPostgresBackup: true,
+        cwd,
+        databaseUrl,
+        outputDir: path.join(cwd, 'backups'),
+        runtime,
+      });
+      return calls[0];
+    }
+
+    it('moves the password into PGPASSWORD and keeps it out of argv', () => {
+      const call = runPgDump('postgresql://user:s3cret@db.example/app');
+      expect(call.args.join(' ')).not.toContain('s3cret');
+      expect(call.args[call.args.length - 1]).toBe('postgresql://user@db.example/app');
+      expect(call.env?.PGPASSWORD).toBe('s3cret');
+    });
+
+    it('decodes a percent-encoded password', () => {
+      const call = runPgDump('postgresql://user:p%40ss%2Fw%3Ard%25@db.example/app');
+      expect(call.env?.PGPASSWORD).toBe('p@ss/w:rd%');
+      expect(call.args.join(' ')).not.toMatch(/p%40ss|p@ss/);
+    });
+
+    it('drops Prisma-only query params but keeps libpq ones', () => {
+      const call = runPgDump(
+        'postgresql://user:pw@db.example/app?connection_limit=5&pool_timeout=10&socket_timeout=3&sslaccept=strict&pgbouncer=true&statement_cache_size=0&schema=public&sslmode=require&connect_timeout=7&application_name=bk'
+      );
+      const url = call.args[call.args.length - 1];
+      for (const param of ['connection_limit', 'pool_timeout', 'socket_timeout', 'sslaccept', 'pgbouncer', 'statement_cache_size', 'schema']) {
+        expect(url).not.toContain(`${param}=`);
+      }
+      expect(new URL(url).searchParams.get('sslmode')).toBe('require');
+      expect(new URL(url).searchParams.get('connect_timeout')).toBe('7');
+      expect(new URL(url).searchParams.get('application_name')).toBe('bk');
+    });
+
+    it('sets no PGPASSWORD for a URL without a password', () => {
+      const saved = process.env.PGPASSWORD;
+      delete process.env.PGPASSWORD;
+      try {
+        const call = runPgDump('postgresql://user@db.example/app');
+        expect(call.env?.PGPASSWORD).toBeUndefined();
+      } finally {
+        if (saved !== undefined) process.env.PGPASSWORD = saved;
+      }
+    });
   });
 
   it('does not overwrite a same-second PostgreSQL backup', () => {
