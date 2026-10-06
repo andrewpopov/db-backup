@@ -1728,6 +1728,39 @@ function createSqliteBackup({ databaseUrl, outputDir, compressSqlite, now, cwd =
   };
 }
 
+// Query parameters Prisma understands but libpq rejects ("invalid URI query
+// parameter"). A DATABASE_URL shared with a Prisma app commonly carries them.
+const PRISMA_ONLY_QUERY_PARAMS = [
+  'connection_limit',
+  'pool_timeout',
+  'socket_timeout',
+  'sslaccept',
+  'pgbouncer',
+  'statement_cache_size',
+  'schema',
+];
+
+// A password in a pg_dump/pg_restore argv element is readable by every local
+// user via `ps`. libpq reads PGPASSWORD from the child's environment instead,
+// so the URL handed to the binary never carries the secret.
+function libpqConnection(databaseUrl, baseEnv = process.env) {
+  let parsed;
+  try {
+    parsed = new URL(databaseUrl);
+  } catch {
+    return { connectionUrl: databaseUrl, env: baseEnv };
+  }
+  const env = { ...baseEnv };
+  if (parsed.password) {
+    env.PGPASSWORD = decodeURIComponent(parsed.password);
+    parsed.password = '';
+  }
+  for (const param of PRISMA_ONLY_QUERY_PARAMS) {
+    parsed.searchParams.delete(param);
+  }
+  return { connectionUrl: parsed.toString(), env };
+}
+
 function createPostgresBackup({
   databaseUrl,
   outputDir,
@@ -1748,7 +1781,8 @@ function createPostgresBackup({
     outputDir,
     namePrefix,
   });
-  runtime.execFileSync('pg_dump', ['--format=custom', `--file=${fullPath}`, databaseUrl], { stdio: 'inherit' });
+  const { connectionUrl, env } = libpqConnection(databaseUrl, runtime.env);
+  runtime.execFileSync('pg_dump', ['--format=custom', `--file=${fullPath}`, connectionUrl], { stdio: 'inherit', env });
   restrictArtifact(fullPath);
 
   // Verify the dump before we keep it, mirroring the SQLite integrity check.
@@ -2190,6 +2224,7 @@ function restorePostgresBackup({
   // The `.gpg` ciphertext must never be handed to pg_restore directly. No
   // live local DB file to anchor scratch to here, so it lives next to the
   // backup artifact itself.
+  const { connectionUrl, env } = libpqConnection(databaseUrl, runtime.env);
   withDecryptedCopy(backupEntry, encryption, runtime, path.dirname(backupEntry.fullPath), (sourcePath) => {
     runtime.execFileSync(
       'pg_restore',
@@ -2200,10 +2235,10 @@ function restorePostgresBackup({
         '--no-privileges',
         '--single-transaction',
         '--dbname',
-        databaseUrl,
+        connectionUrl,
         sourcePath,
       ],
-      { stdio: 'inherit' }
+      { stdio: 'inherit', env }
     );
   });
 
