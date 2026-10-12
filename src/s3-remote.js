@@ -24,6 +24,7 @@
 
 const fs = require('fs');
 const crypto = require('crypto');
+const { planFlatRemoteRetention } = require('./remote-retention');
 
 const DEFAULT_S3_KEEP = 30; // mirrors DEFAULT_REMOTE_KEEP in index.js
 const DEFAULT_S3_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per HTTP request
@@ -438,10 +439,8 @@ function parseS3BackupTimestamp(timestampKey) {
   ));
 }
 
-// Keep the newest remote objects, same shape as pruneRemoteBackups (index.js):
-// never delete the object just uploaded/verified, never drop below 1, and a
-// listing/planning/delete failure is a cleanup miss (warn) rather than a
-// data-safety issue — the new backup is already verified on both ends.
+// Prune remote objects like pruneRemoteBackups (index.js): never the object just
+// uploaded, and a flat keep-last count keeps `keepLast` objects in total, that one included.
 //
 // `parseBackupFileNameFn` defaults to this package's OWN parseBackupFileName
 // (index.js's), so the documented 3-arg call —
@@ -460,7 +459,7 @@ function parseS3BackupTimestamp(timestampKey) {
 // production caller) the same way, so a legacy/default parser swap here can
 // never silently change which retention engine runs — this is not a second
 // retention system. Callers that omit them (only the legacy 5-arg test
-// signature does) fall back to the original flat "keep newest N by name"
+// signature does) fall back to the original flat "keep newest N"
 // behavior, preserved for back-compat.
 async function pruneS3Backups(
   s3,
@@ -480,44 +479,36 @@ async function pruneS3Backups(
     return [];
   }
 
-  const parseableNames = names.filter((name) => name && parseBackupFileNameFn(name, namePrefix));
+  const rawEntries = names
+    .filter((name) => name && parseBackupFileNameFn(name, namePrefix))
+    .map((name) => {
+      const when = parseS3BackupTimestamp(parseBackupFileNameFn(name, namePrefix).timestampKey);
+      return when ? { fileName: name, createdAt: when.toISOString() } : null;
+    })
+    .filter(Boolean);
+  const effectivePolicy = planRetentionFn && policy ? policy : { mode: 'keep-last', keepLast: s3.keep };
 
   let doomedNames;
-  if (planRetentionFn) {
-    // Unified (GFS) policy: include the just-uploaded/protected file in the
-    // planning pool (like local's finalizeBackupResult does with `created`)
-    // so slot/anchor budgets are counted accurately — this is what makes the
-    // plan identical to local's — then exclude it from the resulting delete
-    // list. See pruneRemoteBackups in index.js for the rclone twin.
-    const rawEntries = parseableNames
-      .map((name) => {
-        const parsed = parseBackupFileNameFn(name, namePrefix);
-        const when = parseS3BackupTimestamp(parsed.timestampKey);
-        return when ? { fileName: name, createdAt: when.toISOString() } : null;
-      })
-      .filter(Boolean);
-    const entries = rawEntries.some((entry) => entry.fileName === protectFileName)
-      ? rawEntries
-      : [...rawEntries, { fileName: protectFileName, createdAt: now.toISOString() }];
-    const effectivePolicy = policy || { mode: 'keep-last', keepLast: Math.max(1, Number(s3.keep) > 0 ? Number(s3.keep) : DEFAULT_S3_KEEP) };
-    let plan;
+  if (!planRetentionFn || effectivePolicy.mode === 'keep-last') {
+    const keep = Math.max(1, Number(effectivePolicy.keepLast) > 0 ? Number(effectivePolicy.keepLast) : DEFAULT_S3_KEEP);
     try {
-      plan = planRetentionFn(entries, effectivePolicy, now);
+      doomedNames = planFlatRemoteRetention(rawEntries, protectFileName, keep);
     } catch (error) {
       console.warn(`[db-backup] Retention planning failed for S3 backups (leaving them in place): ${error.message}`);
       return [];
     }
-    doomedNames = plan.remove.map((entry) => entry.fileName).filter((name) => name !== protectFileName);
   } else {
-    // Legacy flat count: exclude the protected file from the pool BEFORE
-    // counting, exactly as before — `--remote-keep N` means "keep N OTHER
-    // objects", not "N total including the brand new one".
-    const keep = Math.max(1, Number(s3.keep) > 0 ? Number(s3.keep) : DEFAULT_S3_KEEP);
-    doomedNames = parseableNames
-      .filter((name) => name !== protectFileName)
-      .sort()
-      .reverse()
-      .slice(keep - 1);
+    const entries = rawEntries.some((entry) => entry.fileName === protectFileName)
+      ? rawEntries
+      : [...rawEntries, { fileName: protectFileName, createdAt: now.toISOString() }];
+    try {
+      doomedNames = planRetentionFn(entries, effectivePolicy, now)
+        .remove.map((entry) => entry.fileName)
+        .filter((name) => name !== protectFileName);
+    } catch (error) {
+      console.warn(`[db-backup] Retention planning failed for S3 backups (leaving them in place): ${error.message}`);
+      return [];
+    }
   }
 
   const deleted = [];

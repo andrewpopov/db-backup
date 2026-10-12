@@ -38,6 +38,7 @@ const {
   DEFAULT_S3_KEEP,
   DEFAULT_S3_TIMEOUT_MS,
 } = require('./s3-remote');
+const { planFlatRemoteRetention } = require('./remote-retention');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -1025,6 +1026,13 @@ function resolveRetentionPolicy({
 // ---------------------------------------------------------------------------
 const DESTINATION_TYPES = ['local', 'rclone', 's3'];
 
+function assertValidRemoteKeep(dest, label) {
+  if (dest.keep === undefined || dest.keep === null) return;
+  if (!Number.isInteger(dest.keep) || dest.keep < 1) {
+    throw new Error(`Invalid "keep" for ${label}: must be an integer >= 1 (got ${JSON.stringify(dest.keep)})`);
+  }
+}
+
 function normalizeDestination(dest, cwd) {
   if (!dest || typeof dest !== 'object' || !DESTINATION_TYPES.includes(dest.type)) {
     throw new Error(
@@ -1042,6 +1050,7 @@ function normalizeDestination(dest, cwd) {
     if (!target) {
       throw new Error('A "rclone" destination requires "target" (or "remote")');
     }
+    assertValidRemoteKeep(dest, `rclone destination "${target}"`);
     return {
       type: 'rclone',
       target,
@@ -1055,6 +1064,7 @@ function normalizeDestination(dest, cwd) {
   if (!dest.bucket) {
     throw new Error('An "s3" destination requires "bucket"');
   }
+  assertValidRemoteKeep(dest, `s3 destination "${dest.bucket}"`);
   return {
     type: 's3',
     bucket: dest.bucket,
@@ -3188,25 +3198,9 @@ function remoteBackupEntries(names, namePrefix) {
     .filter(Boolean);
 }
 
-// Keep the newest remote objects per `policy` (same planRetention engine as
-// local retention — see resolveDestinationPolicy for how the policy is
-// chosen), never fewer than 1, and never the object we just uploaded and
-// verified. A prune failure — whether listing, planning, or an individual
-// delete — is a cleanup miss, not a data-safety issue: the new backup is
-// already verified on both ends, so warn and carry on rather than fail the
-// whole backup job.
-//
-// The just-uploaded/protected file is handled two different ways depending
-// on whether `policy` is the SAME unified plan local retention uses
-// (`usingUnifiedPolicy`):
-//  - unified (GFS): included in the planning pool (like local's
-//    finalizeBackupResult does with `created`) so slot/anchor budgets are
-//    counted accurately — matching "the same plan, everywhere" exactly — and
-//    then excluded from the resulting delete list.
-//  - legacy flat count (policy omitted): excluded from the pool BEFORE
-//    planning, exactly as today — preserved for back-compat so
-//    `--remote-keep N` still means "keep N OTHER objects", not "N total
-//    including the brand new one".
+// Prune remote objects per `policy`, never the one just uploaded and verified.
+// A flat keep-last count keeps `keepLast` objects in total, that one included.
+// A prune failure is a cleanup miss, not a data-safety issue: warn and carry on.
 function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null, policy = null, now = new Date()) {
   let listing = '';
   try {
@@ -3221,40 +3215,42 @@ function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null,
     return [];
   }
 
-  const usingUnifiedPolicy = Boolean(policy);
   const rawEntries = remoteBackupEntries(listing.split(/\r?\n/), namePrefix);
   const effectivePolicy =
     policy || { mode: 'keep-last', keepLast: Math.max(1, Number(remote.keep) > 0 ? Number(remote.keep) : DEFAULT_REMOTE_KEEP) };
 
-  let entries;
-  if (usingUnifiedPolicy) {
-    entries = rawEntries.some((entry) => entry.fileName === protectFileName)
+  let doomedNames;
+  if (effectivePolicy.mode === 'keep-last') {
+    try {
+      doomedNames = planFlatRemoteRetention(rawEntries, protectFileName, effectivePolicy.keepLast);
+    } catch (error) {
+      console.warn(`[db-backup] Retention planning failed for remote backups (leaving them in place): ${error.message}`);
+      return [];
+    }
+  } else {
+    const entries = rawEntries.some((entry) => entry.fileName === protectFileName)
       ? rawEntries
       : [...rawEntries, { fileName: protectFileName, createdAt: now.toISOString() }];
-  } else {
-    entries = rawEntries.filter((entry) => entry.fileName !== protectFileName);
+    try {
+      doomedNames = planRetention(entries, effectivePolicy, now)
+        .remove.map((entry) => entry.fileName)
+        .filter((name) => name !== protectFileName);
+    } catch (error) {
+      console.warn(`[db-backup] Retention planning failed for remote backups (leaving them in place): ${error.message}`);
+      return [];
+    }
   }
-
-  let plan;
-  try {
-    plan = planRetention(entries, effectivePolicy, now);
-  } catch (error) {
-    console.warn(`[db-backup] Retention planning failed for remote backups (leaving them in place): ${error.message}`);
-    return [];
-  }
-
-  const doomed = usingUnifiedPolicy ? plan.remove.filter((entry) => entry.fileName !== protectFileName) : plan.remove;
 
   const deleted = [];
-  for (const entry of doomed) {
+  for (const fileName of doomedNames) {
     try {
-      runtime.execFileSync('rclone', ['deletefile', remoteObjectPath(remote, entry.fileName)], {
+      runtime.execFileSync('rclone', ['deletefile', remoteObjectPath(remote, fileName)], {
         stdio: 'pipe',
         env: rcloneEnv(remote),
       });
-      deleted.push(entry.fileName);
+      deleted.push(fileName);
     } catch (error) {
-      console.warn(`[db-backup] Failed to prune remote backup ${entry.fileName} (leaving it in place): ${error.message}`);
+      console.warn(`[db-backup] Failed to prune remote backup ${fileName} (leaving it in place): ${error.message}`);
     }
   }
   return deleted;
@@ -3577,23 +3573,20 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
   return { attempted, delivered };
 }
 
-// The retention policy applied AT a given destination. Local always uses
-// `resolved.policy` directly. A remote (rclone/s3) destination follows the
-// SAME unified plan too, once a GFS policy is configured (usingUnifiedRetention)
-// — that is the whole point of the destinations+retention split: one plan,
-// every destination. Absent that, a remote destination keeps its legacy,
-// independent flat count (dest.keep, defaulting per-type) exactly as before,
-// so an existing `--remote-keep`-only deployment behaves unchanged.
+// Retention policy at a destination: local uses the shared plan. A remote with
+// an explicit `keep` gets its own flat count; otherwise it follows GFS or the default count.
 function resolveDestinationPolicy(destination, resolved) {
   if (destination.type === 'local') {
     return resolved.policy;
+  }
+  if (destination.keep) {
+    return { mode: 'keep-last', keepLast: destination.keep };
   }
   if (resolved.usingUnifiedRetention) {
     return resolved.policy;
   }
   const defaultKeep = destination.type === 's3' ? DEFAULT_S3_KEEP : DEFAULT_REMOTE_KEEP;
-  const keep = Math.max(1, Number(destination.keep) > 0 ? Number(destination.keep) : defaultKeep);
-  return { mode: 'keep-last', keepLast: keep };
+  return { mode: 'keep-last', keepLast: defaultKeep };
 }
 
 // Shared bottom half of a backup run, once every destination's upload (if
@@ -3796,6 +3789,10 @@ function runBackupJob(options = {}) {
       for (const distribution of distributions) {
         if (distribution.destination.type === 'local') continue;
         if (distribution.destination.prune === false) continue; // immutable/append-only destination: never attempt remote pruning
+        if (distribution.destination.verify === false) {
+          console.warn('[db-backup] Not pruning an unverified remote (verify: false); its old backups stay in place.');
+          continue;
+        }
         const policy = resolveDestinationPolicy(distribution.destination, resolved);
         distribution.removed = pruneRemoteBackups(
           distribution.destination,
@@ -3885,6 +3882,10 @@ async function runBackupJobAsync(options = {}) {
       for (const distribution of distributions) {
         if (distribution.destination.type === 'local') continue;
         if (distribution.destination.prune === false) continue; // immutable/append-only destination: never attempt remote pruning
+        if (distribution.destination.verify === false) {
+          console.warn('[db-backup] Not pruning an unverified remote (verify: false); its old backups stay in place.');
+          continue;
+        }
         const policy = resolveDestinationPolicy(distribution.destination, resolved);
         distribution.removed =
           distribution.destination.type === 's3'
@@ -4003,9 +4004,8 @@ Options:
   --stamp-file <path>     Write .last-success only after a fully successful run
   --max-age-hours <n>     Freshness threshold (command: freshness, default 36)
   --remote <dest>         [legacy] Upload off-host via rclone and verify (e.g. remote:path)
-  --remote-keep <n>       [legacy] Remote backups to retain (default 30) when no GFS
-                          policy is configured; ignored (the unified plan wins) once
-                          --retain-*/--retention-policy/config.retention is set.
+  --remote-keep <n>       [legacy] Remote backups to retain in total (default 30), the new
+                          one included; overrides the shared GFS plan for this remote.
   --rclone-config <path>  RCLONE_CONFIG for the upload (and remote freshness check)
   --s3-bucket <name>      [legacy] Upload off-host to S3/R2 natively (SigV4, no rclone) and
                           verify. Mutually exclusive with --remote. Credentials come from

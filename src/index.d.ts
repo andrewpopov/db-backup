@@ -84,8 +84,8 @@ export interface RcloneDestination {
   target: string;
   /** Re-read the uploaded object and compare sizes. Default true. */
   verify?: boolean;
-  /** Legacy per-destination flat count, used ONLY when no unified (GFS)
-   * policy is configured. Default 30, never fewer than 1. */
+  /** Total remote objects to retain, including the one just uploaded. Overrides
+   * the shared GFS plan for this destination. Integer >= 1. Unset: the GFS plan if any, else 30. */
   keep?: number;
   /** RCLONE_CONFIG for the upload. */
   configFile?: string;
@@ -100,8 +100,8 @@ export interface S3Destination {
   prefix?: string;
   endpoint?: string;
   region?: string;
-  /** Legacy per-destination flat count, used ONLY when no unified (GFS)
-   * policy is configured. Default 30, never fewer than 1. */
+  /** Total remote objects to retain, including the one just uploaded. Overrides
+   * the shared GFS plan for this destination. Integer >= 1. Unset: the GFS plan if any, else 30. */
   keep?: number;
   /** Set false to never attempt remote retention pruning for this destination
    *  (e.g. an append-only / immutable bucket where DELETE is denied). Default: pruning runs. */
@@ -124,7 +124,8 @@ export interface BackupRemote {
   /** Re-read the uploaded object and compare sizes. Default true. Turning this
    * off means the "backup" is unverified — prefer not to. */
   verify?: boolean;
-  /** Remote objects to retain. Default 30, never fewer than 1. */
+  /** Total remote objects to retain, including the one just uploaded. Overrides
+   * the shared GFS plan for this remote. Integer >= 1. Unset: the GFS plan if any, else 30. */
   keep?: number;
   /** RCLONE_CONFIG for the upload. */
   configFile?: string;
@@ -143,7 +144,8 @@ export interface BackupS3Remote {
   /** SigV4 signing region. Default: `auto` when `endpoint` is set (R2's own
    * convention), otherwise `us-east-1`. */
   region?: string;
-  /** Remote objects to retain. Default 30, never fewer than 1. */
+  /** Total remote objects to retain, including the one just uploaded. Overrides
+   * the shared GFS plan for this remote. Integer >= 1. Unset: the GFS plan if any, else 30. */
   keep?: number;
 }
 
