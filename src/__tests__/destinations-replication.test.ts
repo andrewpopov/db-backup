@@ -1510,4 +1510,297 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
       expect(result.backups[0].retentionReason).toBe('keep_last');
     });
   });
+
+  describe('PKG-234: per-remote keep overrides the shared GFS plan', () => {
+    const NEW_NAME = 'sqlite-backup-20260705-150000Z.db';
+    const GFS = { mode: 'gfs' as const, daily: 3, weekly: 2 };
+    const HISTORY = [
+      'sqlite-backup-20260704-150000Z.db',
+      'sqlite-backup-20260703-150000Z.db',
+      'sqlite-backup-20260702-150000Z.db',
+      'sqlite-backup-20260701-150000Z.db',
+      'sqlite-backup-20260628-150000Z.db',
+      'sqlite-backup-20260621-150000Z.db',
+      'sqlite-backup-20260614-150000Z.db',
+      'sqlite-backup-20260607-150000Z.db',
+    ];
+
+    function entriesOf(names: string[]) {
+      return names.map((fileName) => {
+        const m = fileName.match(/(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})Z/)!;
+        return { fileName, createdAt: `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}.000Z` };
+      });
+    }
+
+    function gfsKeptNames(names: string[]): string[] {
+      return (dbBackup.planRetention(entriesOf(names) as never, GFS as never, fixedNow) as { keep: { fileName: string }[] }).keep
+        .map((e) => e.fileName)
+        .sort();
+    }
+
+    function seedLocal(outputDir: string, names: string[]) {
+      fs.mkdirSync(outputDir, { recursive: true });
+      for (const name of names) fs.writeFileSync(path.join(outputDir, name), 'old backup bytes');
+    }
+
+    function localNames(outputDir: string): string[] {
+      return fs.readdirSync(outputDir).filter((f) => f.startsWith('sqlite-backup-')).sort();
+    }
+
+    function makeFakeRclone(outputDir: string, seeded: string[]) {
+      const objects = new Set<string>(seeded);
+      const deleted: string[] = [];
+      const execFileSync = ((_c: string, args: string[]) => {
+        if (args[0] === 'copyto') {
+          objects.add(String(args[2]).split('/').pop()!);
+        } else if (args[0] === 'lsjson') {
+          return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, NEW_NAME)).size }));
+        } else if (args[0] === 'lsf') {
+          return Buffer.from([...objects].join('\n'));
+        } else if (args[0] === 'deletefile') {
+          const name = String(args[1]).split('/').pop()!;
+          deleted.push(name);
+          objects.delete(name);
+        }
+        return Buffer.from('');
+      }) as never;
+      return { objects, deleted, execFileSync };
+    }
+
+    function seedS3(names: string[]) {
+      return new Map<string, Buffer>(names.map((n) => [n, Buffer.from('old backup bytes')]));
+    }
+
+    function baseJob(cwd: string, outputDir: string) {
+      fs.writeFileSync(path.join(cwd, 'app.db'), 'database bytes');
+      return { allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', compressSqlite: false, now: fixedNow, outputDir };
+    }
+
+    it('PKG-234 canary: GFS-local + keep-1-remote (S3): local keeps the GFS history, S3 keeps exactly the new object', async () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      seedLocal(outputDir, HISTORY);
+      const objects = seedS3(HISTORY);
+      const { fetchImpl } = makeFakeS3({ objects });
+
+      await runBackupJobAsync({
+        ...baseJob(cwd, outputDir),
+        destinations: [{ type: 'local', path: outputDir }, { type: 's3', bucket: 'mybucket', keep: 1 }],
+        policy: GFS,
+        runtime: makeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never),
+      });
+
+      const expectedLocal = gfsKeptNames([...HISTORY, NEW_NAME]);
+      expect(expectedLocal.length).toBeGreaterThan(1);
+      expect(expectedLocal.length).toBeLessThan(HISTORY.length + 1);
+      expect(localNames(outputDir)).toEqual(expectedLocal);
+      expect([...objects.keys()]).toEqual([NEW_NAME]);
+    });
+
+    it('PKG-234 canary: GFS-local + keep-1-remote (rclone): local keeps the GFS history, remote keeps exactly the new object', async () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      seedLocal(outputDir, HISTORY);
+      const rclone = makeFakeRclone(outputDir, HISTORY);
+
+      await runBackupJobAsync({
+        ...baseJob(cwd, outputDir),
+        destinations: [{ type: 'local', path: outputDir }, { type: 'rclone', target: 'offsite:app', keep: 1 }],
+        policy: GFS,
+        runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync }),
+      });
+
+      const expectedLocal = gfsKeptNames([...HISTORY, NEW_NAME]);
+      expect(expectedLocal.length).toBeGreaterThan(1);
+      expect(expectedLocal.length).toBeLessThan(HISTORY.length + 1);
+      expect(localNames(outputDir)).toEqual(expectedLocal);
+      expect([...rclone.objects]).toEqual([NEW_NAME]);
+    });
+
+    it('PKG-234 canary: keep:1 leaves exactly 1 remote object even when another object sorts newer', async () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      const skewed = ['sqlite-backup-20260709-120000Z.db', 'sqlite-backup-20260708-120000Z.db', 'sqlite-backup-20260101-000000Z.db'];
+      const rclone = makeFakeRclone(outputDir, skewed);
+      const objects = seedS3(skewed);
+      const { fetchImpl } = makeFakeS3({ objects });
+
+      await runBackupJobAsync({
+        ...baseJob(cwd, outputDir),
+        destinations: [
+          { type: 'local', path: outputDir },
+          { type: 'rclone', target: 'offsite:app', keep: 1 },
+          { type: 's3', bucket: 'mybucket', keep: 1 },
+        ],
+        runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync, fetchImpl, env: S3_CREDS_ENV } as never),
+      });
+
+      expect([...rclone.objects]).toEqual([NEW_NAME]);
+      expect([...objects.keys()]).toEqual([NEW_NAME]);
+    });
+
+    it('PKG-234 canary: a failed upload prunes nothing at any destination', async () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      const stampFile = path.join(cwd, 'stamp', '.last-success');
+      seedLocal(outputDir, HISTORY);
+      const rclone = makeFakeRclone(outputDir, HISTORY);
+      const objects = seedS3(HISTORY);
+      const s3Requests: string[] = [];
+      const { fetchImpl: okFetch } = makeFakeS3({ objects });
+      const fetchImpl = (url: string, opts: { method: string }) => {
+        s3Requests.push(opts.method);
+        if (opts.method === 'PUT') return { status: 500, headers: {}, body: Buffer.from('InternalError') };
+        return okFetch(url, opts as never);
+      };
+
+      await expect(
+        runBackupJobAsync({
+          ...baseJob(cwd, outputDir),
+          stampFile,
+          destinations: [
+            { type: 'local', path: outputDir },
+            { type: 'rclone', target: 'offsite:app', keep: 1 },
+            { type: 's3', bucket: 'mybucket', keep: 1 },
+          ],
+          policy: GFS,
+          runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync, fetchImpl, env: S3_CREDS_ENV } as never),
+        }),
+      ).rejects.toThrow();
+
+      expect(rclone.objects.has(NEW_NAME), 'rclone upload happened before the S3 failure').toBe(true);
+      expect(rclone.deleted).toEqual([]);
+      expect(s3Requests).not.toContain('DELETE');
+      expect(HISTORY.every((n) => rclone.objects.has(n))).toBe(true);
+      expect([...objects.keys()].sort()).toEqual([...HISTORY].sort());
+      expect(HISTORY.every((n) => fs.existsSync(path.join(outputDir, n)))).toBe(true);
+      expect(fs.existsSync(stampFile)).toBe(false);
+    });
+
+    it('PKG-234: a remote without keep still follows the shared GFS plan when another remote has keep:1', async () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      seedLocal(outputDir, HISTORY);
+      const rclone = makeFakeRclone(outputDir, HISTORY);
+      const objects = seedS3(HISTORY);
+      const { fetchImpl } = makeFakeS3({ objects });
+
+      await runBackupJobAsync({
+        ...baseJob(cwd, outputDir),
+        destinations: [
+          { type: 'local', path: outputDir },
+          { type: 'rclone', target: 'offsite:app' },
+          { type: 's3', bucket: 'mybucket', keep: 1 },
+        ],
+        policy: GFS,
+        runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync, fetchImpl, env: S3_CREDS_ENV } as never),
+      });
+
+      expect([...rclone.objects].sort()).toEqual(gfsKeptNames([...HISTORY, NEW_NAME]));
+      expect([...objects.keys()]).toEqual([NEW_NAME]);
+    });
+
+    it('PKG-234: keep must be an integer >= 1 on a remote destination', () => {
+      const cwd = makeTempDir();
+      for (const keep of [0, -1, 1.5, '2', Number.NaN]) {
+        expect(() => normalizeDestination({ type: 's3', bucket: 'mybucket', keep } as never, cwd)).toThrow(/Invalid "keep" for s3 destination "mybucket"/);
+        expect(() => normalizeDestination({ type: 'rclone', target: 'offsite:app', keep } as never, cwd)).toThrow(/Invalid "keep" for rclone destination "offsite:app"/);
+      }
+      expect(normalizeDestination({ type: 's3', bucket: 'mybucket', keep: 2 } as never, cwd)).toMatchObject({ keep: 2 });
+      expect(normalizeDestination({ type: 'rclone', target: 'offsite:app', keep: null } as never, cwd)).not.toHaveProperty('keep');
+      expect(() => normalizeDestination({ type: 'local', path: cwd, keep: 0 } as never, cwd)).not.toThrow();
+    });
+
+    it('PKG-234: keep:N retains exactly N remote objects (rclone and S3)', async () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      const seeded = HISTORY.slice(0, 5);
+      const rclone = makeFakeRclone(outputDir, seeded);
+      const objects = seedS3(seeded);
+      const { fetchImpl } = makeFakeS3({ objects });
+
+      await runBackupJobAsync({
+        ...baseJob(cwd, outputDir),
+        destinations: [
+          { type: 'local', path: outputDir },
+          { type: 'rclone', target: 'offsite:app', keep: 3 },
+          { type: 's3', bucket: 'mybucket', keep: 3 },
+        ],
+        runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync, fetchImpl, env: S3_CREDS_ENV } as never),
+      });
+
+      const expected = [NEW_NAME, ...seeded.slice(0, 2)].sort();
+      expect([...rclone.objects].sort()).toEqual(expected);
+      expect([...objects.keys()].sort()).toEqual(expected);
+    });
+
+    it('PKG-234: a verification failure at a later destination prunes nothing at any destination', async () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      seedLocal(outputDir, HISTORY);
+      const rclone = makeFakeRclone(outputDir, HISTORY);
+      const objects = seedS3(HISTORY);
+      const s3Requests: string[] = [];
+      const { fetchImpl: okFetch } = makeFakeS3({ objects });
+      const fetchImpl = (url: string, opts: { method: string }) => {
+        s3Requests.push(opts.method);
+        if (opts.method === 'HEAD') return { status: 200, headers: { 'content-length': '1' }, body: Buffer.alloc(0) };
+        return okFetch(url, opts as never);
+      };
+
+      await expect(
+        runBackupJobAsync({
+          ...baseJob(cwd, outputDir),
+          destinations: [
+            { type: 'local', path: outputDir },
+            { type: 'rclone', target: 'offsite:app', keep: 1 },
+            { type: 's3', bucket: 'mybucket', keep: 1 },
+          ],
+          policy: GFS,
+          runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync, fetchImpl, env: S3_CREDS_ENV } as never),
+        }),
+      ).rejects.toThrow();
+
+      expect(rclone.deleted).toEqual([]);
+      expect(s3Requests).not.toContain('DELETE');
+      expect(HISTORY.every((n) => objects.has(n) && rclone.objects.has(n) && fs.existsSync(path.join(outputDir, n)))).toBe(true);
+    });
+
+    it('PKG-234: a remote with verify:false is never pruned', async () => {
+      const cwd = makeTempDir();
+      const outputDir = path.join(cwd, 'backups');
+      const rclone = makeFakeRclone(outputDir, HISTORY);
+
+      await runBackupJobAsync({
+        ...baseJob(cwd, outputDir),
+        destinations: [{ type: 'local', path: outputDir }, { type: 'rclone', target: 'offsite:app', keep: 1, verify: false }],
+        policy: GFS,
+        runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync }),
+      });
+
+      expect(rclone.deleted).toEqual([]);
+      expect(HISTORY.every((n) => rclone.objects.has(n))).toBe(true);
+    });
+
+    it('PKG-234: an invalid flat keep reaching the prune functions deletes nothing (rclone and S3)', async () => {
+      const outputDir = makeTempDir();
+      for (const policy of [{ mode: 'keep-last', keepLast: Number.NaN }, { mode: 'keep-last' }]) {
+        const rclone = makeFakeRclone(outputDir, HISTORY);
+        const removed = dbBackup.pruneRemoteBackups(
+          { target: 'offsite:app' } as never, NEW_NAME, makeRuntime({ execFileSync: rclone.execFileSync }) as never, null, policy as never, fixedNow,
+        );
+        expect(removed).toEqual([]);
+        expect(rclone.deleted).toEqual([]);
+
+        const objects = seedS3(HISTORY);
+        const { fetchImpl } = makeFakeS3({ objects });
+        const s3Removed = await pruneS3Backups(
+          { bucket: 'mybucket', keep: 1.5 } as never, NEW_NAME, makeRuntime({ fetchImpl, env: S3_CREDS_ENV } as never) as never,
+          null, parseBackupFileName, dbBackup.planRetention, { mode: 'keep-last', keepLast: 1.5 } as never, fixedNow,
+        );
+        expect(s3Removed).toEqual([]);
+        expect(objects.size).toBe(HISTORY.length);
+      }
+    });
+  });
 });

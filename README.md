@@ -187,8 +187,24 @@ await runBackupJobAsync({
   configured, `planRetention` runs against each destination's own listing and
   produces the exact same keep/remove decision everywhere — local and S3 (or
   rclone) can no longer drift apart. Without a GFS policy, each remote
-  destination keeps its own legacy flat count (`--remote-keep`, default 30),
-  exactly as before this release.
+  destination keeps its own flat count (`--remote-keep`, default 30).
+  A remote destination with an explicit `keep` (`destinations[].keep` or
+  `--remote-keep`) overrides the shared plan: it retains exactly `keep` objects
+  in total, counting the one just uploaded, while local keeps the full GFS
+  history.
+
+  ```json
+  {
+    "retention": { "daily": 7, "weekly": 4, "monthly": 6 },
+    "destinations": [
+      { "type": "local", "path": "/var/backups/app" },
+      { "type": "s3", "bucket": "my-bucket", "prefix": "app", "keep": 1 }
+    ]
+  }
+  ```
+
+  On a versioned bucket, a deleted or replaced object stays as a noncurrent
+  version; add a lifecycle `NoncurrentVersionExpiration` rule to remove them.
 - **Legacy flags map onto the same `destinations` shape internally** — there
   is one retention/distribution engine underneath both models, not two.
   `--remote <target>` and `--s3-bucket <name>` continue to work exactly as
@@ -288,7 +304,9 @@ failure, not a pass. If `rclone` is missing, the run refuses rather than silentl
 skipping the off-site copy.
 
 Remote retention never deletes the object it just uploaded (a host whose clock
-rolled backward would otherwise delete the only verified copy).
+rolled backward would otherwise delete the only verified copy). `--remote-keep n`
+leaves exactly `n` objects, that one included, and overrides any GFS plan for
+this remote.
 
 If you genuinely want a local-only run — a pre-migration deploy hook, local
 dev, a first bootstrap run before offsite is wired up — pass `--skip-remote`
@@ -405,12 +423,11 @@ secret key.
   than either blocking the caller's event loop or silently doing nothing.
   Every request is bounded by `--s3-timeout <seconds>` (env
   `DB_BACKUP_S3_TIMEOUT_MS`, default 300s).
-- **Remote retention:** `--remote-keep <n>` (default 30) works the same way
-  it does for rclone — the bucket/prefix is listed and the oldest objects
-  beyond `n` are deleted, never including the object just uploaded and
-  verified. **Only applies when no GFS policy is configured** — once
-  `--retain-*`/`--retention-policy` (or a `policy` with `mode: 'gfs'`) is set,
-  S3 (like rclone) follows that SAME unified plan instead; see
+- **Remote retention:** `--remote-keep <n>` (default 30) keeps exactly `n`
+  objects in the bucket/prefix, counting the object just uploaded and verified
+  (which is never deleted); of the others, the newest by filename timestamp
+  stay and the rest are removed. It is honored alongside GFS: when set, it overrides the shared plan
+  for this remote; without it, S3 follows that plan, see
   [Destinations: WHERE backups go](#destinations-where-backups-go).
 - **Pruning needs delete permission on the prefix.** The credential must allow
   `s3:DeleteObject` on `<bucket>/<prefix>/*`, not just `PutObject`/`GetObject`.
