@@ -13,9 +13,9 @@
 # branch for review, or a docs-only branch — not to get past a red check. A
 # guard you routinely bypass is a guard you do not have.
 #
-# Wired by the `prepare` script (`git config core.hooksPath .githooks`), so a
-# fresh clone gets it on install. If it is not firing, run `npm install` and
-# check `git config core.hooksPath` resolves to a directory that exists.
+# Wired by `npm run hooks` (`git config core.hooksPath .githooks`), which you run
+# once after cloning. If it is not firing, run it and check
+# `git config core.hooksPath` resolves to a directory that exists.
 set -e
 
 # Git exports its repository-local variables to hooks. From a WORKTREE it sets

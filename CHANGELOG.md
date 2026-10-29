@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.22.1
+
+- Installing from git no longer runs a full dependency install: the `prepare` script is gone (run `npm run hooks` once after cloning)
+  Git installs of this package no longer trigger a nested `npm install`; local development needs `npm run hooks` once after cloning to enable the pre-push gate.
+- Update shared release notes tooling
+  Refresh the shared release notes package pins and lockfiles. Full release verification and production rollout remain with the next release candidate.
+
 ## 0.22.0
 
 - A remote destination's `keep` now overrides the shared GFS plan, and `keep: N` leaves exactly N objects

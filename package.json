@@ -1,6 +1,6 @@
 {
   "name": "@andrewpopov/db-backup",
-  "version": "0.22.0",
+  "version": "0.22.1",
   "description": "Reusable database backup manager with age-tier retention (SQLite raw/gzip + Postgres pg_dump)",
   "author": "Andrew Popov",
   "main": "src/index.js",
@@ -52,7 +52,7 @@
     "release:check": "release-kit check",
     "release:hygiene": "release-kit hygiene",
     "verify:bins": "release-kit verify-bins",
-    "prepare": "git config core.hooksPath .githooks || true"
+    "hooks": "git config core.hooksPath .githooks"
   },
   "dependencies": {
     "@andrewpopov/alert-kit": "github:andrewpopov/alert-kit#v0.6.1",
@@ -60,7 +60,7 @@
   },
   "devDependencies": {
     "@andrewpopov/deploy-kit": "github:andrewpopov/deploy-kit#v0.25.0",
-    "@andrewpopov/release-kit": "github:andrewpopov/release-kit#v0.7.0",
+    "@andrewpopov/release-kit": "github:andrewpopov/release-kit#v0.7.1",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
