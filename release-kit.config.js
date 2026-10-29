@@ -4,6 +4,7 @@ module.exports = defineConfig({
   productName: '@andrewpopov/db-backup',
   stage: 'stable',
   rootDir: __dirname,
+  installFromGit: true,
   paths: { notesDir: '.changes', indexPath: '.changes/INDEX.md' },
   kinds: [
     { id: 'breaking', heading: 'Breaking' },

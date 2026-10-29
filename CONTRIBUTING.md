@@ -13,6 +13,8 @@ npm run verify
 npm audit --audit-level=high
 ```
 
+Run `npm run hooks` once after cloning to enable the pre-push gate.
+
 Keep changes focused, add regression coverage for behavior changes, update the
 README and changelog when the public contract changes, and submit a pull request.
 

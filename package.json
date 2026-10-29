@@ -52,7 +52,7 @@
     "release:check": "release-kit check",
     "release:hygiene": "release-kit hygiene",
     "verify:bins": "release-kit verify-bins",
-    "prepare": "git config core.hooksPath .githooks || true"
+    "hooks": "git config core.hooksPath .githooks"
   },
   "dependencies": {
     "@andrewpopov/alert-kit": "github:andrewpopov/alert-kit#v0.6.1",
