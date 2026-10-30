@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.22.2
+
+- Depends on alert-kit v0.7.1, so installing db-backup no longer starts a nested npm install
+  alert-kit v0.6.1 still declared a build script, which made npm run a nested install in every consumer of db-backup. v0.7.1 does not.
+
 ## 0.22.1
 
 - Installing from git no longer runs a full dependency install: the `prepare` script is gone (run `npm run hooks` once after cloning)
