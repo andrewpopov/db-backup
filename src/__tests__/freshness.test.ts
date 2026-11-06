@@ -180,17 +180,17 @@ describe('checkRemoteFreshness (off-host dead-man switch)', () => {
 });
 describe('webhook URL redaction', () => {
   // The real leak, reproduced: a DNS failure on pitelite made curl fail, and
-  // execFileSync put the ENTIRE command line -- including rouge's live #alerts
-  // webhook -- into error.message, which was then console.warn'd straight into
+  // execFileSync put the ENTIRE command line -- including rouge's #alerts
+  // webhook (a real URL committed here leaked and was revoked; fixtures stay fake) -- into error.message, which was then console.warn'd straight into
   // journald in plaintext.
   const LIVE_SHAPE =
     'Command failed: curl -fsS -X POST -H Content-Type: application/json -d @- ' +
-    'https://discord.com/api/webhooks/1525256591954415686/FSoes7Eddk3i8tlqwKXREXdg7U0LD35lZsY4gEAmKyI6Nhiawt57Td09qBtk7fkzZu0c';
+    'https://discord.com/api/webhooks/1000000000000000001/FAKE-TOKEN-not-a-real-webhook-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 
   it('redacts the exact string shape that leaked into the journal', () => {
     const out = redactWebhookUrl(LIVE_SHAPE);
-    expect(out).not.toContain('FSoes7Eddk3i8tlqwKXREXdg7U0LD35lZsY4gEAmKyI6Nhiawt57Td09qBtk7fkzZu0c');
-    expect(out).not.toContain('1525256591954415686');
+    expect(out).not.toContain('FAKE-TOKEN-not-a-real-webhook-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    expect(out).not.toContain('1000000000000000001');
     expect(out).toContain('<redacted-webhook-url>');
     // The useful part of the diagnostic survives.
     expect(out).toContain('Command failed');
@@ -217,7 +217,7 @@ describe('webhook URL redaction', () => {
   });
 
   it('notifyAlert never logs the Discord webhook when the POST fails', () => {
-    const url = 'https://discord.com/api/webhooks/1525256591954415686/FSoes7EddkSECRETtoken';
+    const url = 'https://discord.com/api/webhooks/1000000000000000001/FSoes7EddkSECRETtoken';
     const warnings: string[] = [];
     const warn = console.warn;
     console.warn = (...parts: unknown[]) => { warnings.push(parts.join(' ')); };
