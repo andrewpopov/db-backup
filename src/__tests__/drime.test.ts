@@ -713,6 +713,7 @@ describe('drime-audit', () => {
     cryptDuplicates?: string[];
     decodeFails?: Record<string, Failure>;
     catFails?: string[];
+    catFlaky?: Record<string, number>;
     catShort?: boolean;
     listFails?: boolean;
     latencyMs?: number;
@@ -729,6 +730,7 @@ describe('drime-audit', () => {
     const calls: Call[] = [];
     const gone = () => Object.assign(new Error('rclone: not found'), { status: 3, stderr: Buffer.from('directory not found') });
     const replaced = new Set<string>();
+    const flakyLeft: Record<string, number> = {};
     const rawTarget = (arg: string) => arg.replace('dbbdrimebase:backups-encrypted/', '');
     const execFileSync = (_c: string, args: string[], opts?: { env?: Record<string, string> }) => {
       calls.push({ args, env: opts?.env || {}, config: { exists: false, mode: 0, size: 0, file: '' } });
@@ -775,6 +777,10 @@ describe('drime-audit', () => {
           return options.replace[target];
         }
         if ((options.catFails || []).includes(target)) throw failure('timeout');
+        if (options.catFlaky && (flakyLeft[target] ??= options.catFlaky[target] ?? 0) > 0) {
+          flakyLeft[target] -= 1;
+          throw failure({ stderr: 'transient' });
+        }
         if (options.catShort) return Buffer.from('RCL');
         return Buffer.from(rawAt(Math.max(rawListings - 1, 0)).find((r) => r.path === target && !r.dir)?.head ?? MAGIC);
       }
@@ -800,7 +806,7 @@ describe('drime-audit', () => {
     limits: { concurrency?: number; maxChanged?: number } = {},
   ) => {
     const { envFile } = setup();
-    return drimeAudit({ envFile, ...limits, runtime: { execFileSync: fake.execFileSync, execFile: fake.execFile, env } });
+    return drimeAudit({ envFile, ...limits, runtime: { execFileSync: fake.execFileSync, execFile: fake.execFile, env, sleepAsync: async () => {} } });
   };
   const kinds = (report: { findings: { kind: string }[] }) => report.findings.map((f) => f.kind);
 
@@ -905,8 +911,49 @@ describe('drime-audit', () => {
       await throwsWith({ strict: 'decrypt', decodeFails: { 'dirx/filea': 'timeout' } }, /^decoding names: rclone backend failed \(exit unknown\)$/);
     });
 
+    describe('header read retry', () => {
+      const sleeps: number[] = [];
+      const run = (options: Parameters<typeof makeAuditRclone>[0]) => {
+        sleeps.length = 0;
+        const fake = makeAuditRclone(options);
+        const { envFile } = setup();
+        const runtime = { execFileSync: fake.execFileSync, execFile: fake.execFile, env: {}, sleepAsync: async (ms: number) => { sleeps.push(ms); } };
+        return { fake, report: drimeAudit({ envFile, runtime } as Parameters<typeof drimeAudit>[0]) };
+      };
+      const catsOf = (fake: ReturnType<typeof makeAuditRclone>, path: string) => fake.calls.filter((c) => c.args[0] === 'cat' && c.args[3].endsWith(`/${path}`));
+
+      it('retry canary: a read that fails once then succeeds is checked and the audit is clean', async () => {
+        const { fake, report } = run({ catFlaky: { 'dirx/filea': 1 } });
+        const result = await report;
+        expect(result.findings).toEqual([]);
+        expect(catsOf(fake, 'dirx/filea')).toHaveLength(2);
+        expect(sleeps).toEqual([1000]);
+      });
+
+      it('retry canary: a read that fails every attempt is exit 2 naming the path after 3 attempts', async () => {
+        const { fake, report } = run({ catFlaky: { 'dirx/filea': 99 } });
+        await expect(report).rejects.toThrow(/^reading object header of drime:backups-encrypted\/dirx\/filea: rclone cat failed \(exit 1\) after 3 attempt\(s\)$/);
+        expect(catsOf(fake, 'dirx/filea')).toHaveLength(3);
+        expect(sleeps).toEqual([1000, 3000]);
+      });
+
+      it('retry canary: a non-magic header is a finding on the first attempt, never retried', async () => {
+        const { fake, report } = run({ raw: [{ path: 'dirx', dir: true }, { path: 'dirx/filea', head: Buffer.from('SQLite f') }] });
+        expect((await report).findings.map((f) => f.kind)).toEqual(['not-crypt-format']);
+        expect(catsOf(fake, 'dirx/filea')).toHaveLength(1);
+        expect(sleeps).toEqual([]);
+      });
+
+      it('retry canary: a not-found read keeps its re-stat path and is not retried', async () => {
+        const { fake, report } = run({ raw: [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }], vanish: ['dirx/filea'] });
+        expect((await report).changedDuringAudit).toHaveLength(1);
+        expect(catsOf(fake, 'dirx/filea')).toHaveLength(1);
+        expect(sleeps).toEqual([]);
+      });
+    });
+
     it('a header read that fails or returns too few bytes', async () => {
-      await throwsWith({ catFails: ['dirx/filea'] }, /^reading object header of drime:backups-encrypted\/dirx\/filea: rclone cat failed \(exit unknown\)$/);
+      await throwsWith({ catFails: ['dirx/filea'] }, /^reading object header of drime:backups-encrypted\/dirx\/filea: rclone cat failed \(exit unknown\) after 3 attempt\(s\)$/);
       await throwsWith({ catShort: true }, /fewer bytes than requested/);
     });
 
@@ -1014,7 +1061,7 @@ describe('drime-audit', () => {
     it('a failed read among many is exit 2 naming its raw path, never a clean report', async () => {
       const fake = makeAuditRclone({ raw: manyFiles(40), latencyMs: 1, catFails: ['d/f33'] });
       const failure = await audit(fake, {}, { concurrency: 8 }).then(() => null, (error: Error) => error);
-      expect(failure?.message).toBe('reading object header of drime:backups-encrypted/d/f33: rclone cat failed (exit unknown)');
+      expect(failure?.message).toBe('reading object header of drime:backups-encrypted/d/f33: rclone cat failed (exit unknown) after 3 attempt(s)');
       expectNoSecrets(failure?.message || '');
     });
 

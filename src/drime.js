@@ -592,6 +592,24 @@ function isNotFound(result) {
   return !result.ok && NOT_FOUND_EXIT_CODES.includes(result.status);
 }
 
+const HEADER_READ_ATTEMPTS = 3;
+const HEADER_READ_BACKOFF_MS = [1000, 3000];
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A failed read that is not a not-found is retried with backoff: one transient
+// error must not fail a whole audit. A read that returned bytes is never here.
+async function readHeader(ctx, runtime, rawPath) {
+  const wait = runtime.sleepAsync || delay;
+  let read;
+  for (let attempt = 1; attempt <= HEADER_READ_ATTEMPTS; attempt += 1) {
+    read = await auditExecAsync(ctx, runtime, { op: 'catHead', rawPath });
+    read.attempts = attempt;
+    if (read.result.ok || isNotFound(read.result) || attempt === HEADER_READ_ATTEMPTS) return read;
+    await wait(HEADER_READ_BACKOFF_MS[attempt - 1]);
+  }
+  return read;
+}
+
 // One object's header check. A not-found read means the object changed after
 // the listing: re-list that path, and read a replacement once.
 async function checkObject(ctx, runtime, entry, rawName, onChanged) {
@@ -601,7 +619,7 @@ async function checkObject(ctx, runtime, entry, rawName, onChanged) {
   const changed = { changed: true, path: entry.Path };
   if (tooSmall(entry.Size)) return notCrypt(`only ${entry.Size} bytes`);
 
-  let read = await auditExecAsync(ctx, runtime, { op: 'catHead', rawPath: entry.Path });
+  let read = await readHeader(ctx, runtime, entry.Path);
   if (isNotFound(read.result)) {
     const listed = await auditExecAsync(ctx, runtime, { op: 'statRaw', rawPath: entry.Path });
     if (isNotFound(listed.result)) return onChanged(changed);
@@ -614,10 +632,10 @@ async function checkObject(ctx, runtime, entry, rawName, onChanged) {
     }
     if (!current || current.IsDir) return onChanged(changed);
     if (tooSmall(current.Size)) return notCrypt(`only ${current.Size} bytes`);
-    read = await auditExecAsync(ctx, runtime, { op: 'catHead', rawPath: entry.Path });
+    read = await readHeader(ctx, runtime, entry.Path);
     if (isNotFound(read.result)) return onChanged(changed);
   }
-  if (!read.result.ok) throw new DrimeAuditError(`reading object header of ${name}: ${failureText(read.args, read.result)}`);
+  if (!read.result.ok) throw new DrimeAuditError(`reading object header of ${name}: ${failureText(read.args, read.result)} after ${read.attempts} attempt(s)`);
   const head = Buffer.from(read.result.output);
   if (head.length < CRYPT_MAGIC.length) {
     throw new DrimeAuditError(`reading object header of ${name}: rclone cat returned fewer bytes than requested`);
