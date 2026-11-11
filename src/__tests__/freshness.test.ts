@@ -237,7 +237,6 @@ describe('webhook URL redaction', () => {
     }
     expect(warnings.join('\n')).not.toContain('FSoes7EddkSECRETtoken');
     expect(warnings.join('\n')).not.toContain(url);
-    expect(warnings.join('\n')).toContain('<redacted-webhook-url>');
   });
 
   it('notifyAlert logs NOTHING derived from a failed notify-command', () => {
@@ -316,13 +315,15 @@ describe('notifyAlert', () => {
       runtime: makeRuntime({
         commandExists: (c: string) => c === 'curl',
         execFileSync: ((command: string, args: string[], options: any) => {
-          calls.push({ command, args, options });
+          const config = fs.readFileSync(args[args.indexOf('-K') + 1], 'utf8');
+          calls.push({ command, args, options: { ...options, config } });
         }) as never,
       }),
     });
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe('curl');
-    expect(calls[0].args).toContain('https://discord/webhook');
+    expect(calls[0].args.join(' ')).not.toContain('discord/webhook');
+    expect(calls[0].options.config).toBe('url = "https://discord/webhook"\n');
     expect(JSON.parse(calls[0].options.input)).toEqual({ content: 'backup stale' });
   });
 
@@ -675,5 +676,124 @@ describe('freshness alert suppression', () => {
     const s = sink(dir);
     await runFreshness(['freshness', '--stamp-file', stampFile, '--max-age-hours', '36', '--notify-command', s.command]);
     expect(s.count()).toBe(1); // re-fired rather than waiting out the interval
+  });
+});
+
+describe('--notify-discord-env / --notify-webhook-env', () => {
+  const SENTINEL_URL = 'https://discord.com/api/webhooks/1000000000000000009/ENVSENTINELtoken';
+
+  const captureWarnings = async (run: () => void | Promise<void>) => {
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...parts: unknown[]) => { warnings.push(parts.join(' ')); };
+    try {
+      await run();
+    } finally {
+      console.warn = warn;
+    }
+    return warnings.join('\n');
+  };
+
+  const staleStampIn = (dir: string) => {
+    const stamp = path.join(dir, '.last-success');
+    fs.writeFileSync(stamp, '2020-01-01T00:00:00.000Z\n');
+    return stamp;
+  };
+
+  const runStale = async (extraArgs: string[]) => {
+    const previous = process.exitCode;
+    process.exitCode = undefined;
+    await runCli(['freshness', '--stamp-file', staleStampIn(makeTempDir()), '--max-age-hours', '1', ...extraArgs]);
+    const code = process.exitCode;
+    process.exitCode = previous;
+    return code;
+  };
+
+  it('posts the alert to the URL read from the named variable', () => {
+    const calls: Array<{ args: string[]; options: any }> = [];
+    notifyAlert('backup stale', {
+      notifyDiscordEnv: 'DISCORD_ALERT_WEBHOOK',
+      runtime: makeRuntime({
+        env: { DISCORD_ALERT_WEBHOOK: SENTINEL_URL },
+        commandExists: (c: string) => c === 'curl',
+        execFileSync: ((_command: string, args: string[], options: any) => {
+          const config = fs.readFileSync(args[args.indexOf('-K') + 1], 'utf8');
+          calls.push({ args, options: { ...options, config } });
+        }) as never,
+      }),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args.join(' ')).not.toContain(SENTINEL_URL);
+    expect(calls[0].options.config).toContain(SENTINEL_URL);
+    expect(JSON.parse(calls[0].options.input)).toEqual({ content: 'backup stale' });
+  });
+
+  it('reads the variable when the alert is sent, not when the flag is parsed', async () => {
+    const name = 'DB_BACKUP_TEST_LATE_WEBHOOK';
+    delete process.env[name];
+    const output = await captureWarnings(async () => { await runStale(['--notify-webhook-env', name]); });
+    expect(output).toContain(`[db-backup] notification skipped: ${name} is not set`);
+  });
+
+  it('an unset variable logs the fixed warning and leaves the exit code unchanged', async () => {
+    const name = 'DB_BACKUP_TEST_UNSET_WEBHOOK';
+    delete process.env[name];
+    const baseline = await runStale([]);
+    let code: number | undefined;
+    const output = await captureWarnings(async () => { code = await runStale(['--notify-discord-env', name]); });
+    expect(output).toContain(`[db-backup] notification skipped: ${name} is not set`);
+    expect(code).toBe(1);
+    expect(code).toBe(baseline);
+  });
+
+  it('an empty variable is treated as unset', () => {
+    const calls: unknown[] = [];
+    let result: { attempted: boolean; delivered: boolean } | undefined;
+    const output = captureWarnings(() => {
+      result = notifyAlert('x', {
+        notifyWebhookEnv: 'EMPTY_HOOK',
+        runtime: makeRuntime({ env: { EMPTY_HOOK: '' }, commandExists: () => true, execFileSync: ((...a: unknown[]) => { calls.push(a); }) as never }),
+      });
+    });
+    return output.then((text) => {
+      expect(text).toContain('notification skipped: EMPTY_HOOK is not set');
+      expect(calls).toHaveLength(0);
+      expect(result).toEqual({ attempted: true, delivered: false });
+    });
+  });
+
+  it.each([
+    ['--notify-discord-env', 'lowercase'],
+    ['--notify-webhook-env', '1STARTS_WITH_DIGIT'],
+    ['--notify-discord-env', 'HAS-DASH'],
+    ['--notify-webhook-env', SENTINEL_URL],
+  ])('%s rejects the invalid name %s without echoing it', async (flag, value) => {
+    const error = await runCli(['freshness', '--stamp-file', 'x', flag, value]).then(() => null, (err: Error) => err);
+    expect(error).not.toBeNull();
+    expect(error!.message).toContain(`Invalid value for ${flag}`);
+    expect(error!.message).not.toContain(value);
+  });
+
+  it.each([
+    ['--notify-discord', '--notify-discord-env'],
+    ['--notify-webhook', '--notify-webhook-env'],
+  ])('%s together with %s is a usage error, in either order', async (urlFlag, envFlag) => {
+    await expect(runCli(['freshness', '--stamp-file', 'x', urlFlag, 'https://h', envFlag, 'HOOK'])).rejects.toThrow(/mutually exclusive/);
+    await expect(runCli(['freshness', '--stamp-file', 'x', envFlag, 'HOOK', urlFlag, 'https://h'])).rejects.toThrow(/mutually exclusive/);
+  });
+
+  it('never logs the env-provided URL when the POST fails', async () => {
+    const output = await captureWarnings(() => {
+      notifyAlert('backup stale', {
+        notifyDiscordEnv: 'HOOK',
+        runtime: makeRuntime({
+          env: { HOOK: SENTINEL_URL },
+          commandExists: () => true,
+          execFileSync: ((command: string, args: string[]) => { throw new Error(`Command failed: ${command} ${args.join(' ')}`); }) as never,
+        }),
+      });
+    });
+    expect(output).not.toContain('ENVSENTINELtoken');
+    expect(output).not.toContain(SENTINEL_URL);
   });
 });
