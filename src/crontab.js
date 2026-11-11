@@ -76,9 +76,9 @@ function insideAny(index, ranges) {
   return ranges.some((range) => insideRange(index, range));
 }
 
-function locateReplacedLine(lines, substring, ranges, ownBlockPresent, warnings) {
+function locateReplacedLine(lines, substring, ranges, replacedRanges, ownBlockPresent, warnings) {
   const matches = lines.flatMap((line, index) =>
-    isReplaceableLine(line) && line.includes(substring) ? [index] : [],
+    isReplaceableLine(line) && line.includes(substring) && !insideAny(index, replacedRanges) ? [index] : [],
   );
   const flag = `--replace-line ${JSON.stringify(substring)}`;
   for (const index of matches) {
@@ -98,7 +98,7 @@ function locateReplacedLine(lines, substring, ranges, ownBlockPresent, warnings)
  * Pure: `{ text, warnings }` for `currentText` with `block` ({ start, end, lines }) in place of its own marked
  * pair, the `replacements.blocks` pairs and the `replacements.lines` entries, at the first removed item's position.
  * A replacement matching nothing is a warning once the block is installed and an error before; matching more than one,
- * or a line inside any marked block, always throws, as do duplicate, unpaired, nested or overlapping markers.
+ * or a line inside any marked block other than its own or a replaced one, always throws, as do duplicate, unpaired, nested or overlapping markers.
  */
 function planCrontabBlock(currentText, block, replacements = {}) {
   const lines = splitLines(currentText);
@@ -126,7 +126,7 @@ function planCrontabBlock(currentText, block, replacements = {}) {
 
   const ranges = markedRanges(lines);
   const removedLineIndexes = (replacements.lines || []).flatMap((substring) => {
-    const index = locateReplacedLine(lines, substring, ranges, Boolean(own), warnings);
+    const index = locateReplacedLine(lines, substring, ranges, blockRanges, Boolean(own), warnings);
     return index === null ? [] : [index];
   });
   if (new Set(removedLineIndexes).size !== removedLineIndexes.length) {
