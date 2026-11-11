@@ -256,11 +256,11 @@ describe('replaceCrontabBlock', () => {
     expect(next.indexOf('# db-backup:app')).toBe(0);
   });
 
-  it('refuses a --replace-line that matches inside its own block', () => {
-    const installed = replaceCrontabBlock(HOST_CRONTAB, block(), { lines: ['db-backup-nightly'] });
-    expect(() => replaceCrontabBlock(installed, block(), { lines: ['npm run backup'] })).toThrow(
-      /matches a line inside block db-backup:app/,
-    );
+  it('ignores --replace-line matches inside its own block, so the same flag keeps working on every deploy', () => {
+    const installed = replaceCrontabBlock(HOST_CRONTAB, block(), { lines: ['npm run backup'] });
+    const plan = planCrontabBlock(installed, block(), { lines: ['npm run backup'] });
+    expect(plan.text).toBe(installed);
+    expect(plan.warnings.join('\n')).toMatch(/matched no line \(already migrated\)/);
   });
 
   it("refuses a --replace-line that matches inside another app's marked block", () => {
