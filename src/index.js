@@ -207,6 +207,7 @@ function parseArgs(argv) {
     drimeCryptRemote: null,
     drimeConcurrency: null,
     drimeMaxChanged: null,
+    drimePaths: [],
   };
 
   const commandArg = argv[0];
@@ -427,6 +428,14 @@ function parseArgs(argv) {
       const value = argv[index + 1];
       if (!value) throw new Error(`Missing value for ${arg}`);
       options[drimeFlags[arg]] = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--path') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --path');
+      options.drimePaths.push(value);
       index += 1;
       continue;
     }
@@ -4290,7 +4299,11 @@ Options:
                           <name> (default drime) and --crypt-remote <name> (default
                           drimecrypt); --concurrency <n> (default 8, max 64) parallel
                           header reads; --max-changed <n> (default 50) objects that
-                          may vanish or be replaced mid-audit before exit 2
+                          may vanish or be replaced mid-audit before exit 2;
+                          --path <set> (repeatable) audits only those decrypted
+                          top-level sets inside the crypt root (e.g. cairn), so a
+                          quiet set gets a verdict independent of a busy one; the
+                          top-level namespace check always runs in full
   --output-dir <path>     [legacy] Backup directory (default: backups/database)
   --retain-daily <n>      GFS: keep the N most-recent backups
   --retain-weekly <n>     GFS: keep one backup per week, for N weeks
@@ -4389,6 +4402,7 @@ async function runDrimeAuditCommand(options) {
       cryptRemote: options.drimeCryptRemote,
       concurrency: options.drimeConcurrency ?? undefined,
       maxChanged: options.drimeMaxChanged ?? undefined,
+      paths: options.drimePaths,
       runtime: normalizeRuntime({ commandTimeoutMs: options.commandTimeoutMs }),
     });
   } catch (error) {
@@ -4399,10 +4413,11 @@ async function runDrimeAuditCommand(options) {
   }
   const status = report.findings.length === 0 ? 'clean' : 'findings';
   if (options.json) {
-    console.log(JSON.stringify({ status, ...report }, null, 2));
+    console.log(JSON.stringify({ status, ...report, scope: report.scope ?? null }, null, 2));
   } else {
+    const scope = report.scope ? ` (scope: ${report.scope.join(', ')})` : '';
     console.log(
-      `[db-backup] drime-audit: ${status}, ${report.objects} object(s) checked, ${report.changedDuringAudit.length} changed during audit`,
+      `[db-backup] drime-audit: ${status}${scope}, ${report.objects} object(s) checked, ${report.changedDuringAudit.length} changed during audit`,
     );
     for (const changedPath of report.changedDuringAudit) {
       console.error(`[db-backup] changed-during-audit: ${changedPath}`);

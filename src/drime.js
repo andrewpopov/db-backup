@@ -437,6 +437,8 @@ function assertGenericRcloneTarget(target, runtime, env) {
 
 class DrimeAuditError extends Error {}
 
+// A malformed obscured credential: deterministic, so never retried.
+const CRYPT_INIT_FAILURE = /failed to decrypt password|illegal base64/i;
 // rclone crypt's name-decoding errors (backend/crypt/cipher.go). A credential
 // or crypt-initialisation failure ("failed to decrypt password", "illegal
 // base64") is deliberately not matched.
@@ -457,7 +459,7 @@ const NAME_DECRYPT_FAILURE = new RegExp(
 
 // Past this bound a listing is "cannot audit", never a truncated parse.
 const LISTING_MAX_BYTES = 256 * 1024 * 1024;
-const AUDIT_LISTING_OPS = ['listTop', 'listRaw', 'listCrypt'];
+const AUDIT_LISTING_OPS = ['listTop', 'listRaw', 'listCrypt', 'listCryptTop'];
 
 // Read-only audit operations. Raw names are always placed after `--`.
 function buildAuditArgs(ctx, operation) {
@@ -468,10 +470,12 @@ function buildAuditArgs(ctx, operation) {
       return ['backend', 'features', crypt];
     case 'listTop':
       return ['lsjson', rawBase];
+    case 'listCryptTop':
+      return ['lsjson', '--encrypted', crypt];
     case 'listRaw':
-      return ['lsjson', '-R', `${rawBase}${ctx.root}`];
+      return ['lsjson', '-R', `${rawBase}${ctx.root}${operation.dir ? `/${operation.dir}` : ''}`];
     case 'listCrypt':
-      return ['lsjson', '-R', '--encrypted', '--crypt-strict-names', crypt];
+      return ['lsjson', '-R', '--encrypted', '--crypt-strict-names', `${crypt}${operation.set || ''}`];
     case 'decode':
       return ['backend', 'decode', crypt, '--', operation.rawPath];
     case 'catHead':
@@ -500,21 +504,53 @@ function failureText(args, result) {
   return `rclone ${args[0]} failed (exit ${result.status === null ? 'unknown' : result.status})`;
 }
 
-function auditExec(ctx, runtime, operation) {
+// Listings run synchronously so they keep the listing byte bound; every other
+// operation awaits its child.
+async function auditExecOnce(ctx, runtime, operation) {
   const args = buildAuditArgs(ctx, operation);
-  const maxBuffer = AUDIT_LISTING_OPS.includes(operation.op) ? LISTING_MAX_BYTES : undefined;
-  return { args, result: execContext(ctx, runtime, args, maxBuffer) };
+  const result = AUDIT_LISTING_OPS.includes(operation.op)
+    ? execContext(ctx, runtime, args, LISTING_MAX_BYTES)
+    : await execContextAsync(ctx, runtime, args);
+  return { args, result };
 }
 
-async function auditExecAsync(ctx, runtime, operation) {
-  const args = buildAuditArgs(ctx, operation);
-  return { args, result: await execContextAsync(ctx, runtime, args) };
+function isNotFound(result) {
+  return !result.ok && NOT_FOUND_EXIT_CODES.includes(result.status);
 }
 
-function auditRun(ctx, runtime, operation, what) {
-  const { args, result } = auditExec(ctx, runtime, operation);
-  if (!result.ok) throw new DrimeAuditError(`${what}: ${failureText(args, result)}`);
-  return result.output;
+// A failure that retrying cannot change: a missing path, an over-limit listing,
+// a name that does not decrypt, a malformed credential.
+function isDeterministicFailure(result) {
+  return isNotFound(result) || result.code === 'ENOBUFS' || NAME_DECRYPT_FAILURE.test(result.stderr) || CRYPT_INIT_FAILURE.test(result.stderr);
+}
+
+const AUDIT_ATTEMPTS = 3;
+const AUDIT_BACKOFF_MS = [1000, 3000];
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// The one retry policy for every audit read: a failed run that is not
+// deterministic is retried with backoff, so one transient error does not fail a
+// whole audit. A run that returned output is never retried.
+async function auditExec(ctx, runtime, operation) {
+  const wait = runtime.sleepAsync || delay;
+  let run;
+  for (let attempt = 1; attempt <= AUDIT_ATTEMPTS; attempt += 1) {
+    run = await auditExecOnce(ctx, runtime, operation);
+    run.attempts = attempt;
+    if (run.result.ok || isDeterministicFailure(run.result) || attempt === AUDIT_ATTEMPTS) return run;
+    await wait(AUDIT_BACKOFF_MS[attempt - 1]);
+  }
+  return run;
+}
+
+function auditFailure(what, run) {
+  return new DrimeAuditError(`${what}: ${failureText(run.args, run.result)} after ${run.attempts} attempt(s)`);
+}
+
+async function auditRun(ctx, runtime, operation, what) {
+  const run = await auditExec(ctx, runtime, operation);
+  if (!run.result.ok) throw auditFailure(what, run);
+  return run.result.output;
 }
 
 function duplicates(values) {
@@ -527,18 +563,20 @@ function duplicates(values) {
 // Names the raw entries (files and directories) whose names rclone-crypt
 // cannot decrypt. Only a per-name decrypt failure is a violation; any other
 // failure means the audit could not complete.
-function findUndecryptable(ctx, runtime, rawPaths) {
-  return rawPaths.filter((rawPath) => {
-    const { args, result } = auditExec(ctx, runtime, { op: 'decode', rawPath });
-    if (result.ok) return false;
-    if (NAME_DECRYPT_FAILURE.test(result.stderr)) return true;
-    throw new DrimeAuditError(`decoding names: ${failureText(args, result)}`);
-  });
+async function findUndecryptable(ctx, runtime, rawPaths) {
+  const offenders = [];
+  for (const rawPath of rawPaths) {
+    const run = await auditExec(ctx, runtime, { op: 'decode', rawPath });
+    if (run.result.ok) continue;
+    if (!NAME_DECRYPT_FAILURE.test(run.result.stderr)) throw auditFailure('decoding names', run);
+    offenders.push(rawPath);
+  }
+  return offenders;
 }
 
-function auditReport(objects, findings) {
+function auditReport(objects, findings, sets) {
   const unique = new Map(findings.map((finding) => [`${finding.kind}\0${finding.path}`, finding]));
-  return { objects, findings: [...unique.values()], changedDuringAudit: [] };
+  return { objects, findings: [...unique.values()], changedDuringAudit: [], ...(sets ? { scope: sets } : {}) };
 }
 
 const DEFAULT_AUDIT_CONCURRENCY = 8;
@@ -588,27 +626,7 @@ async function runPool(items, concurrency, work) {
   return results;
 }
 
-function isNotFound(result) {
-  return !result.ok && NOT_FOUND_EXIT_CODES.includes(result.status);
-}
-
-const HEADER_READ_ATTEMPTS = 3;
-const HEADER_READ_BACKOFF_MS = [1000, 3000];
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// A failed read that is not a not-found is retried with backoff: one transient
-// error must not fail a whole audit. A read that returned bytes is never here.
-async function readHeader(ctx, runtime, rawPath) {
-  const wait = runtime.sleepAsync || delay;
-  let read;
-  for (let attempt = 1; attempt <= HEADER_READ_ATTEMPTS; attempt += 1) {
-    read = await auditExecAsync(ctx, runtime, { op: 'catHead', rawPath });
-    read.attempts = attempt;
-    if (read.result.ok || isNotFound(read.result) || attempt === HEADER_READ_ATTEMPTS) return read;
-    await wait(HEADER_READ_BACKOFF_MS[attempt - 1]);
-  }
-  return read;
-}
+const readHeader = (ctx, runtime, rawPath) => auditExec(ctx, runtime, { op: 'catHead', rawPath });
 
 // One object's header check. A not-found read means the object changed after
 // the listing: re-list that path, and read a replacement once.
@@ -621,9 +639,9 @@ async function checkObject(ctx, runtime, entry, rawName, onChanged) {
 
   let read = await readHeader(ctx, runtime, entry.Path);
   if (isNotFound(read.result)) {
-    const listed = await auditExecAsync(ctx, runtime, { op: 'statRaw', rawPath: entry.Path });
+    const listed = await auditExec(ctx, runtime, { op: 'statRaw', rawPath: entry.Path });
     if (isNotFound(listed.result)) return onChanged(changed);
-    if (!listed.result.ok) throw new DrimeAuditError(`re-listing ${name}: ${failureText(listed.args, listed.result)}`);
+    if (!listed.result.ok) throw auditFailure(`re-listing ${name}`, listed);
     let current;
     try {
       current = JSON.parse(listed.result.output.toString());
@@ -635,7 +653,7 @@ async function checkObject(ctx, runtime, entry, rawName, onChanged) {
     read = await readHeader(ctx, runtime, entry.Path);
     if (isNotFound(read.result)) return onChanged(changed);
   }
-  if (!read.result.ok) throw new DrimeAuditError(`reading object header of ${name}: ${failureText(read.args, read.result)} after ${read.attempts} attempt(s)`);
+  if (!read.result.ok) throw auditFailure(`reading object header of ${name}`, read);
   const head = Buffer.from(read.result.output);
   if (head.length < CRYPT_MAGIC.length) {
     throw new DrimeAuditError(`reading object header of ${name}: rclone cat returned fewer bytes than requested`);
@@ -680,13 +698,52 @@ function signaturesOf(listing) {
   return byPath;
 }
 
+function assertSafeAuditSet(value) {
+  let safe = null;
+  try {
+    safe = assertSafeDrimePath(value);
+  } catch {
+    // reported below with the audit's own wording
+  }
+  if (safe === null || safe !== value || value.includes('/')) {
+    throw new Error(`Invalid --path ${JSON.stringify(value)}: must be one safe path component (no "/", "..", ":" or empty)`);
+  }
+  return value;
+}
+
+// The decrypted top-level sets to audit, or null for the whole crypt root.
+function auditSets(paths) {
+  if (!paths || paths.length === 0) return null;
+  return [...new Set(paths.map(assertSafeAuditSet))];
+}
+
+// Maps each decrypted set to its encrypted directory name through the crypt
+// remote's own top-level listing (non-strict: an undecryptable name elsewhere
+// is out of scope, not a failure).
+async function resolveScope(ctx, runtime, sets) {
+  const top = parseJsonList(await auditRun(ctx, runtime, { op: 'listCryptTop' }, 'listing crypt top level'), 'crypt top-level listing');
+  return sets.map((set) => {
+    const matches = top.filter((entry) => entry.IsDir && entry.Path === set);
+    if (matches.length === 0) throw new DrimeAuditError(`set ${set} not found in the crypt root`);
+    if (matches.length > 1) throw new DrimeAuditError(`set ${set} is ambiguous in the crypt root`);
+    let dir;
+    try {
+      dir = assertSafeAuditSet(matches[0].EncryptedPath);
+    } catch {
+      throw new DrimeAuditError(`set ${set} has an unusable encrypted directory name`);
+    }
+    return { set, dir };
+  });
+}
+
 // Namespace + format audit. Proves rclone-crypt format, not restorability.
 // Demonstrated violations are findings (exit 1). Anything that stops the audit
 // from completing throws (exit 2), and an ambiguous inventory is never clean:
 // Drime allows duplicate names, and a path-addressed read cannot tell which
 // object it reached.
-async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurrency, maxChanged }) {
+async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurrency, maxChanged, paths }) {
   const limits = auditLimits({ concurrency, maxChanged });
+  const sets = auditSets(paths);
   const ctx = loadContext({
     envFile: envFile || DEFAULT_DRIME_ENV_FILE,
     baseRemote: baseRemote || DEFAULT_DRIME_BASE_REMOTE,
@@ -696,7 +753,7 @@ async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurren
   const rawName = (rawPath) => `${base}:${ctx.root}/${rawPath}`;
   const findings = [];
 
-  const listTop = () => parseJsonList(auditRun(ctx, runtime, { op: 'listTop' }, 'listing base remote'), 'base remote listing');
+  const listTop = async () => parseJsonList(await auditRun(ctx, runtime, { op: 'listTop' }, 'listing base remote'), 'base remote listing');
   const namespaceFindings = (topLevel) => {
     const found = topLevel
       .filter((entry) => entry.Path !== ctx.root)
@@ -707,25 +764,43 @@ async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurren
     }
     return found;
   };
-  const topLevel = listTop();
+  const topLevel = await listTop();
   findings.push(...namespaceFindings(topLevel));
   const rootEntries = topLevel.filter((entry) => entry.Path === ctx.root);
   if (rootEntries.length !== 1 || !rootEntries[0].IsDir) {
-    return auditReport(0, findings);
+    return auditReport(0, findings, sets);
   }
-  auditRun(ctx, runtime, { op: 'probeCrypt' }, 'initialising crypt remote');
+  await auditRun(ctx, runtime, { op: 'probeCrypt' }, 'initialising crypt remote');
 
-  const raw = parseJsonList(auditRun(ctx, runtime, { op: 'listRaw' }, 'listing raw objects'), 'raw listing');
+  const targets = sets ? await resolveScope(ctx, runtime, sets) : [{ set: '', dir: '' }];
+  const underDir = (target, entryPath) => (target.dir ? `${target.dir}/${entryPath}` : entryPath);
+  const listRaw = async (what, parseWhat) => {
+    const entries = [];
+    for (const target of targets) {
+      const listing = parseJsonList(await auditRun(ctx, runtime, { op: 'listRaw', dir: target.dir }, what), parseWhat);
+      entries.push(...listing.map((entry) => ({ ...entry, Path: underDir(target, entry.Path) })));
+    }
+    return entries;
+  };
+
+  const raw = await listRaw('listing raw objects', 'raw listing');
   const rawPaths = [...new Set(raw.map((entry) => entry.Path))];
   const ambiguous = new Set(duplicates(raw.map((entry) => entry.Path)));
   for (const rawPath of ambiguous) {
     findings.push({ kind: 'ambiguous-path', path: rawName(rawPath), detail: 'more than one raw entry has this path' });
   }
 
-  const { args: strictArgs, result: strict } = auditExec(ctx, runtime, { op: 'listCrypt' });
-  if (strict.ok) {
-    const mapped = parseJsonList(strict.output, 'crypt listing');
-    const mappedPaths = mapped.map((entry) => entry.EncryptedPath);
+  let strict = null;
+  const mappedPaths = [];
+  for (const target of targets) {
+    const run = await auditExec(ctx, runtime, { op: 'listCrypt', set: target.set });
+    if (!run.result.ok) {
+      strict = run;
+      break;
+    }
+    mappedPaths.push(...parseJsonList(run.result.output, 'crypt listing').map((entry) => underDir(target, entry.EncryptedPath)));
+  }
+  if (!strict) {
     const decryptable = new Set(mappedPaths);
     for (const rawPath of rawPaths) {
       if (!decryptable.has(rawPath)) {
@@ -740,8 +815,8 @@ async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurren
     for (const mappedPath of duplicates(mappedPaths)) {
       findings.push({ kind: 'ambiguous-path', path: rawName(mappedPath), detail: 'more than one crypt entry has this raw path' });
     }
-  } else if (NAME_DECRYPT_FAILURE.test(strict.stderr)) {
-    const offenders = findUndecryptable(ctx, runtime, rawPaths);
+  } else if (NAME_DECRYPT_FAILURE.test(strict.result.stderr)) {
+    const offenders = await findUndecryptable(ctx, runtime, rawPaths);
     if (offenders.length === 0) {
       throw new DrimeAuditError('strict crypt listing failed and no undecryptable name could be identified');
     }
@@ -749,7 +824,7 @@ async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurren
       findings.push({ kind: 'undecryptable', path: rawName(rawPath), detail: 'name does not decrypt through the crypt remote' });
     }
   } else {
-    throw new DrimeAuditError(`strict crypt listing: ${failureText(strictArgs, strict)}`);
+    throw auditFailure('strict crypt listing', strict);
   }
 
   const spendChange = changeBudget(limits.maxChanged);
@@ -776,8 +851,8 @@ async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurren
   let knownTop = signaturesOf(topLevel);
   let stable = false;
   for (let pass = 0; pass < MAX_CLOSING_PASSES && !stable; pass += 1) {
-    const relisted = parseJsonList(auditRun(ctx, runtime, { op: 'listRaw' }, 're-listing raw objects'), 'raw re-listing');
-    const relistedTop = listTop();
+    const relisted = await listRaw('re-listing raw objects', 'raw re-listing');
+    const relistedTop = await listTop();
     const nowTop = signaturesOf(relistedTop);
     const topChanged = [...new Set([...knownTop.keys(), ...nowTop.keys()])].filter((entryPath) => knownTop.get(entryPath) !== nowTop.get(entryPath));
     const now = signaturesOf(relisted);
@@ -793,7 +868,7 @@ async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurren
         headerFindings.delete(rawPath);
       }
       const touchedSet = new Set(touched);
-      for (const rawPath of findUndecryptable(ctx, runtime, touched)) {
+      for (const rawPath of await findUndecryptable(ctx, runtime, touched)) {
         findings.push({ kind: 'undecryptable', path: rawName(rawPath), detail: 'name does not decrypt through the crypt remote' });
       }
       const counts = new Map(relisted.map((entry) => [entry.Path, 0]));
@@ -815,7 +890,7 @@ async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurren
   findings.push(...headerFindings.values());
   const files = current.filter((candidate) => !candidate.IsDir);
   const checked = files.filter((entry) => !changed.has(entry.Path)).length;
-  return { ...auditReport(checked, findings), changedDuringAudit: [...changed].map(rawName) };
+  return { ...auditReport(checked, findings, sets), changedDuringAudit: [...changed].map(rawName) };
 }
 
 module.exports = {

@@ -716,6 +716,8 @@ describe('drime-audit', () => {
     catFlaky?: Record<string, number>;
     catShort?: boolean;
     listFails?: boolean;
+    listFlaky?: Partial<Record<'top' | 'raw' | 'crypt' | 'cryptTop' | 'stat' | 'decode', number>>;
+    setNames?: Record<string, string>;
     latencyMs?: number;
     vanish?: string[];
     replace?: Record<string, Buffer>;
@@ -732,28 +734,47 @@ describe('drime-audit', () => {
     const replaced = new Set<string>();
     const flakyLeft: Record<string, number> = {};
     const rawTarget = (arg: string) => arg.replace('dbbdrimebase:backups-encrypted/', '');
+    const flakyUsed: Record<string, number> = {};
+    const flakeOut = (kind: keyof NonNullable<typeof options.listFlaky>) => {
+      if ((flakyUsed[kind] ?? 0) < (options.listFlaky?.[kind] ?? 0)) {
+        flakyUsed[kind] = (flakyUsed[kind] ?? 0) + 1;
+        throw failure({ stderr: 'transient' });
+      }
+    };
+    const underSet = (listing: Raw[], dir: string) => (dir ? listing.filter((r) => r.path.startsWith(`${dir}/`)).map((r) => ({ ...r, path: r.path.slice(dir.length + 1) })) : listing);
     const execFileSync = (_c: string, args: string[], opts?: { env?: Record<string, string> }) => {
       calls.push({ args, env: opts?.env || {}, config: { exists: false, mode: 0, size: 0, file: '' } });
       const filesOnly = args.includes('--files-only');
       if (args[0] === 'lsjson' && args[1] === '--stat') {
+        flakeOut('stat');
         const target = rawTarget(args[2]);
         if (!(options.replace && target in options.replace && replaced.has(target))) throw gone();
         return Buffer.from(JSON.stringify({ Path: target, Size: 100, IsDir: false }));
       }
       if (args[0] === 'lsjson' && args[1] === 'dbbdrimebase:') {
         if (options.listFails) throw failure('exit5');
+        flakeOut('top');
         const listing = options.topSequence ? options.topSequence(topListings) : top;
         topListings += 1;
         return Buffer.from(JSON.stringify(listing));
       }
+      if (args[0] === 'lsjson' && args.includes('--encrypted') && !args.includes('-R')) {
+        flakeOut('cryptTop');
+        const firsts = [...new Set(raw.map((r) => r.path.split('/')[0]))];
+        return Buffer.from(JSON.stringify(firsts.map((first) => ({ Path: options.setNames?.[first] ?? `${first}-dec`, EncryptedPath: first, IsDir: true }))));
+      }
       if (args[0] === 'lsjson' && args.includes('--encrypted')) {
+        flakeOut('crypt');
         if (options.strict) throw failure(options.strict);
         if (options.malformedStrict) return Buffer.from('<html>');
-        const entries = raw.filter((r) => !(filesOnly && r.dir)).map((r) => ({ Path: `dec/${r.path}`, EncryptedPath: r.path, IsDir: Boolean(r.dir) }));
+        const set = args[args.length - 1].replace('dbbdrimecrypt:', '');
+        const dir = Object.entries(options.setNames ?? {}).find(([, decrypted]) => decrypted === set)?.[0] ?? '';
+        const entries = underSet(raw, dir).filter((r) => !(filesOnly && r.dir)).map((r) => ({ Path: `dec/${r.path}`, EncryptedPath: r.path, IsDir: Boolean(r.dir) }));
         return Buffer.from(JSON.stringify([...entries, ...(options.cryptDuplicates || []).map((d) => ({ Path: `dup/${d}`, EncryptedPath: d }))]));
       }
       if (args[0] === 'lsjson') {
-        const listing = rawAt(rawListings);
+        flakeOut('raw');
+        const listing = underSet(rawAt(rawListings), args[args.length - 1].replace('dbbdrimebase:backups-encrypted', '').replace(/^\//, ''));
         rawListings += 1;
         return Buffer.from(JSON.stringify(listing.filter((r) => !(filesOnly && r.dir)).map((r) => (r.dir ? { Path: r.path, IsDir: true } : { Path: r.path, Size: r.size ?? 100, ModTime: r.modTime, IsDir: false }))));
       }
@@ -762,6 +783,7 @@ describe('drime-audit', () => {
         return Buffer.from('{}');
       }
       if (args[0] === 'backend') {
+        flakeOut('decode');
         const kind = (options.decodeFails || {})[args[args.length - 1]];
         if (kind) throw failure(kind);
         return Buffer.from('decoded');
@@ -895,8 +917,8 @@ describe('drime-audit', () => {
     };
 
     it('a timed-out or failing strict crypt listing', async () => {
-      await throwsWith({ strict: 'timeout' }, /^strict crypt listing: rclone lsjson failed \(exit unknown\)$/);
-      await throwsWith({ strict: 'exit5' }, /^strict crypt listing: rclone lsjson failed \(exit 5\)$/);
+      await throwsWith({ strict: 'timeout' }, /^strict crypt listing: rclone lsjson failed \(exit unknown\) after 3 attempt\(s\)$/);
+      await throwsWith({ strict: 'exit5' }, /^strict crypt listing: rclone lsjson failed \(exit 5\) after 3 attempt\(s\)$/);
     });
 
     it('malformed crypt listing output', async () => {
@@ -908,7 +930,7 @@ describe('drime-audit', () => {
     });
 
     it('a name decode that fails for a non-decrypt reason', async () => {
-      await throwsWith({ strict: 'decrypt', decodeFails: { 'dirx/filea': 'timeout' } }, /^decoding names: rclone backend failed \(exit unknown\)$/);
+      await throwsWith({ strict: 'decrypt', decodeFails: { 'dirx/filea': 'timeout' } }, /^decoding names: rclone backend failed \(exit unknown\) after 3 attempt\(s\)$/);
     });
 
     describe('header read retry', () => {
@@ -958,7 +980,7 @@ describe('drime-audit', () => {
     });
 
     it('the raw listing failing', async () => {
-      await throwsWith({ listFails: true }, /^listing base remote: rclone lsjson failed \(exit 5\)$/);
+      await throwsWith({ listFails: true }, /^listing base remote: rclone lsjson failed \(exit 5\) after 3 attempt\(s\)$/);
     });
   });
 
@@ -973,16 +995,16 @@ describe('drime-audit', () => {
 
     it('a crypt remote that cannot initialise stops the audit before the recursive listings', async () => {
       const fake = makeAuditRclone({ probe: 'password' });
-      await expect(audit(fake)).rejects.toThrow(/^initialising crypt remote: rclone backend failed \(exit 1\)$/);
+      await expect(audit(fake)).rejects.toThrow(/^initialising crypt remote: rclone backend failed \(exit 1\) after 1 attempt\(s\)$/);
       expect(fake.calls.some((c) => c.args[0] === 'lsjson' && c.args.includes('-R'))).toBe(false);
     });
 
     it('a "failed to decrypt password" strict listing is not a per-name violation', async () => {
-      await throwsWith({ strict: 'password' }, /^strict crypt listing: rclone lsjson failed \(exit 1\)$/);
+      await throwsWith({ strict: 'password' }, /^strict crypt listing: rclone lsjson failed \(exit 1\) after 1 attempt\(s\)$/);
     });
 
     it('a "failed to decrypt password" decode is not a per-name violation', async () => {
-      await throwsWith({ strict: 'decrypt', decodeFails: { 'dirx/filea': 'password' } }, /^decoding names: rclone backend failed \(exit 1\)$/);
+      await throwsWith({ strict: 'decrypt', decodeFails: { 'dirx/filea': 'password' } }, /^decoding names: rclone backend failed \(exit 1\) after 1 attempt\(s\)$/);
     });
   });
 
@@ -1178,6 +1200,139 @@ describe('drime-audit', () => {
     const envFile = writeEnvFile(cwd, { RCLONE_CONFIG_DRIME_ROOT_FOLDER_ID: '9' });
     await expect(drimeAudit({ envFile, runtime: { execFileSync: fake.execFileSync, env: {} } })).rejects.toThrow(/Drime env file/);
     expect(fake.calls).toEqual([]);
+  });
+
+  describe('listing retry', () => {
+    const sleeps: number[] = [];
+    const run = (options: Parameters<typeof makeAuditRclone>[0], paths?: string[]) => {
+      sleeps.length = 0;
+      const fake = makeAuditRclone(options);
+      const { envFile } = setup();
+      const runtime = { execFileSync: fake.execFileSync, execFile: fake.execFile, env: {}, sleepAsync: async (ms: number) => { sleeps.push(ms); } };
+      return { fake, report: drimeAudit({ envFile, paths, runtime } as Parameters<typeof drimeAudit>[0]) };
+    };
+    const strictRaw: Raw[] = [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }, { path: 'dirx/fileb' }];
+
+    it.each([
+      ['top', 'listing base remote', (a: string[]) => a[0] === 'lsjson' && a[1] === 'dbbdrimebase:'],
+      ['raw', 'listing raw objects', (a: string[]) => a[0] === 'lsjson' && a[1] === '-R' && a[2].startsWith('dbbdrimebase:backups')],
+      ['crypt', 'strict crypt listing', (a: string[]) => a.includes('--crypt-strict-names')],
+    ] as const)('listing retry canary: a %s listing that fails once then succeeds is a clean audit', async (kind, _what, isThatListing) => {
+      const { fake, report } = run({ listFlaky: { [kind]: 1 } });
+      const result = await report;
+      expect(result.findings).toEqual([]);
+      expect(fake.calls.filter((c) => isThatListing(c.args)).length).toBeGreaterThanOrEqual(2);
+      expect(sleeps).toEqual([1000]);
+    });
+
+    it.each([
+      ['top', 'listing base remote', (a: string[]) => a[0] === 'lsjson' && a[1] === 'dbbdrimebase:'],
+      ['raw', 'listing raw objects', (a: string[]) => a[0] === 'lsjson' && a[1] === '-R' && a[2].startsWith('dbbdrimebase:backups')],
+      ['crypt', 'strict crypt listing', (a: string[]) => a.includes('--crypt-strict-names')],
+    ] as const)('listing retry canary: a %s listing that fails every attempt is exit 2 after 3 attempts', async (kind, what, isThatListing) => {
+      const { fake, report } = run({ listFlaky: { [kind]: 99 } });
+      await expect(report).rejects.toThrow(new RegExp(`^${what}: rclone lsjson failed \\(exit 1\\) after 3 attempt\\(s\\)$`));
+      expect(fake.calls.filter((c) => isThatListing(c.args))).toHaveLength(3);
+      expect(sleeps).toEqual([1000, 3000]);
+    });
+
+    it('listing retry canary: a decode that fails once then succeeds still names the undecryptable file', async () => {
+      const { report } = run({ raw: strictRaw, strict: 'decrypt', decodeFails: { 'dirx/fileb': 'decrypt' }, listFlaky: { decode: 1 } });
+      expect((await report).findings.map((f) => [f.kind, f.path])).toEqual([['undecryptable', 'drime:backups-encrypted/dirx/fileb']]);
+      expect(sleeps).toEqual([1000]);
+    });
+
+    it('listing retry canary: a stat that fails once then succeeds keeps the re-list path', async () => {
+      const { fake, report } = run({ raw: [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }], replace: { 'dirx/filea': MAGIC }, listFlaky: { stat: 1 } });
+      expect((await report).findings).toEqual([]);
+      expect(fake.calls.filter((c) => c.args[1] === '--stat')).toHaveLength(2);
+      expect(sleeps).toEqual([1000]);
+    });
+
+    it('listing retry canary: a name that does not decrypt is deterministic and never retried', async () => {
+      const { report } = run({ raw: strictRaw, strict: 'decrypt', decodeFails: { 'dirx/fileb': 'decrypt' } });
+      await report;
+      expect(sleeps).toEqual([]);
+    });
+  });
+
+  describe('--path scope', () => {
+    const raw: Raw[] = [
+      { path: 'encA', dir: true }, { path: 'encA/f1' }, { path: 'encA/f2' },
+      { path: 'encB', dir: true }, { path: 'encB/g1', head: Buffer.from('SQLite f') },
+    ];
+    const setNames = { encA: 'cairn', encB: 'savoro' };
+    const scoped = (options: Parameters<typeof makeAuditRclone>[0], paths: string[]) => {
+      const fake = makeAuditRclone({ raw, setNames, ...options });
+      const { envFile } = setup();
+      const runtime = { execFileSync: fake.execFileSync, execFile: fake.execFile, env: {}, sleepAsync: async () => {} };
+      return { fake, report: drimeAudit({ envFile, paths, runtime } as Parameters<typeof drimeAudit>[0]) };
+    };
+    const catTargets = (fake: ReturnType<typeof makeAuditRclone>) => fake.calls.filter((c) => c.args[0] === 'cat').map((c) => c.args[3]);
+
+    it('scope canary: --path cairn reads and lists only cairn, and a bad set elsewhere is not its verdict', async () => {
+      const { fake, report } = scoped({}, ['cairn']);
+      const result = await report;
+      expect(result).toMatchObject({ objects: 2, findings: [], scope: ['cairn'] });
+      expect(catTargets(fake).sort()).toEqual(['dbbdrimebase:backups-encrypted/encA/f1', 'dbbdrimebase:backups-encrypted/encA/f2']);
+      const argv = JSON.stringify(fake.calls.map((c) => c.args));
+      expect(argv).not.toContain('encB');
+      expect(argv).not.toContain('savoro');
+      expect(fake.calls.filter((c) => c.args.includes('-R') && !c.args.includes('--encrypted')).every((c) => c.args[2] === 'dbbdrimebase:backups-encrypted/encA')).toBe(true);
+      expect(fake.calls.filter((c) => c.args.includes('--crypt-strict-names')).map((c) => c.args[c.args.length - 1])).toEqual(['dbbdrimecrypt:cairn']);
+    });
+
+    it('scope canary: without --path the same store reports the other set\'s plaintext', async () => {
+      const { report } = scoped({}, []);
+      const result = await report;
+      expect(result.findings.map((f) => f.path)).toEqual(['drime:backups-encrypted/encB/g1']);
+      expect('scope' in result).toBe(false);
+    });
+
+    it('scope canary: a plaintext file inside the chosen set is a finding', async () => {
+      const { report } = scoped({}, ['savoro']);
+      expect((await report).findings.map((f) => [f.kind, f.path])).toEqual([['not-crypt-format', 'drime:backups-encrypted/encB/g1']]);
+    });
+
+    it('scope canary: the top-level namespace check still runs and a plaintext top-level file is a finding', async () => {
+      const top = [{ Path: 'backups-encrypted', IsDir: true }, { Path: 'notes.txt', IsDir: false }];
+      const { fake, report } = scoped({ top }, ['cairn']);
+      expect((await report).findings).toEqual([{ kind: 'unexpected-top-level', path: 'drime:notes.txt', detail: 'not the crypt root' }]);
+      expect(fake.calls.some((c) => c.args[0] === 'lsjson' && c.args[1] === 'dbbdrimebase:')).toBe(true);
+    });
+
+    it('scope canary: an unknown set is exit 2 naming it, with no header read', async () => {
+      const { fake, report } = scoped({}, ['cairn', 'nope']);
+      await expect(report).rejects.toThrow(/^set nope not found in the crypt root$/);
+      expect(catTargets(fake)).toEqual([]);
+    });
+
+    it.each(['', '..', '.', 'a/b', 'cairn/', '/cairn', 'a:b', 'a\\b'])('scope canary: invalid set name %j is refused before any rclone call', async (name) => {
+      const { fake, report } = scoped({}, [name]);
+      await expect(report).rejects.toThrow(/^Invalid --path /);
+      expect(fake.calls).toEqual([]);
+    });
+
+    itOnPosix('the CLI repeats --path, names the scope in the summary and in --json', async () => {
+      const b64 = (text: string) => Buffer.from(text).toString('base64');
+      const rules = [
+        { match: 'lsjson dbbdrimebase:', stdoutBase64: b64('[{"Path":"backups-encrypted","IsDir":true}]') },
+        { match: 'lsjson --encrypted dbbdrimecrypt:', stdoutBase64: b64('[{"Path":"cairn","EncryptedPath":"encA","IsDir":true},{"Path":"savoro","EncryptedPath":"encB","IsDir":true}]') },
+        { match: 'lsjson -R dbbdrimebase:backups-encrypted/encA', stdoutBase64: b64('[{"Path":"f1","Size":100,"IsDir":false}]') },
+        { match: 'lsjson -R dbbdrimebase:backups-encrypted/encB', stdoutBase64: b64('[{"Path":"g1","Size":100,"IsDir":false}]') },
+        { match: 'lsjson -R --encrypted --crypt-strict-names dbbdrimecrypt:cairn', stdoutBase64: b64('[{"Path":"f1","EncryptedPath":"f1","IsDir":false}]') },
+        { match: 'lsjson -R --encrypted --crypt-strict-names dbbdrimecrypt:savoro', stdoutBase64: b64('[{"Path":"g1","EncryptedPath":"g1","IsDir":false}]') },
+        { match: 'cat', stdoutBase64: MAGIC.toString('base64') },
+      ];
+      const { envFile } = setup();
+      const bin = installFakeRclone(rules);
+      const text = await cli(bin, makeTempDir(), ['drime-audit', '--env-file', envFile, '--path', 'cairn', '--path', 'savoro']);
+      expect(text.exitCode).toBe(0);
+      expect(text.out).toContain('drime-audit: clean (scope: cairn, savoro), 2 object(s) checked');
+      vi.restoreAllMocks();
+      const json = await cli(bin, makeTempDir(), ['drime-audit', '--env-file', envFile, '--path', 'cairn', '--json']);
+      expect(JSON.parse(json.out)).toMatchObject({ status: 'clean', objects: 1, scope: ['cairn'] });
+    });
   });
 
   describe('exit codes through runCli', () => {

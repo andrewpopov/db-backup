@@ -421,7 +421,7 @@ target, or an unresolvable remote is refused. Use a `drime` destination.
 
 ```bash
 db-backup drime-audit [--env-file <path>] [--base-remote drime] [--crypt-remote drimecrypt] \
-  [--concurrency 8] [--max-changed 50]
+  [--concurrency 8] [--max-changed 50] [--path <set> ...]
 ```
 
 `drime-audit` checks that the raw top level holds only the crypt root, that
@@ -440,10 +440,25 @@ is refused rather than parsed truncated). `--json` prints the report.
   children at once, all through the same hermetic context. Every listed object is
   checked exactly once or the audit fails closed (exit 2); a read failure names
   the raw path (an encrypted name, safe to print) and nothing else from the child.
-- **Transient read failures are retried.** A header read that fails with any exit
-  other than not-found (3 or 4) is retried up to 3 attempts in total, after 1 s
-  then 3 s; a read that returns bytes is never retried, so a wrong header is a
-  finding at once. Only the last failure exits 2, and it says how many attempts ran.
+- **Transient failures are retried.** Every rclone read the audit runs (header
+  reads, the top-level, raw and crypt listings, the re-list stat and the name
+  decode) that fails is retried up to 3 attempts in total, after 1 s then 3 s; a
+  read that returns bytes is never retried, so a wrong header is a finding at
+  once. Not retried: not-found (exit 3 or 4, which keeps its re-stat meaning), a
+  listing over the size limit, a name that does not decrypt and a malformed
+  credential. Only the last failure exits 2, and it says how many attempts ran.
+- **`--path <set>` scopes the audit.** Repeat it to audit only those decrypted
+  top-level sets inside the crypt root (for example `--path cairn --path
+  savoro`), so a small, quiet set gets a verdict that does not depend on a busy
+  subtree another tool is uploading into. Each set is mapped to its encrypted
+  directory through the crypt remote's top-level listing; the raw listing, the
+  crypt listing, the header reads and the closing passes read only those
+  directories. The raw top-level namespace check still runs in full. A set that
+  does not exist exits 2 naming it, and a set name must be one path component
+  (no `/`, `..`, `:` or empty), refused before rclone runs. The summary line
+  reads `drime-audit: clean (scope: cairn), N object(s) checked, ...` and
+  `--json` carries `scope` (`null` without `--path`). Without `--path` the whole
+  crypt root is audited, as before.
 - **A store that changes under the audit.** If a header read finds the object
   gone (rclone exit 3 or 4), that path is re-listed. Still gone: it is recorded
   as `changedDuringAudit` (printed as `changed-during-audit: <path>`, counted in
