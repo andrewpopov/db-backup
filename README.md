@@ -420,7 +420,8 @@ combine, chunker, hasher, compress, crypt, cache), an inline connection-string
 target, or an unresolvable remote is refused. Use a `drime` destination.
 
 ```bash
-db-backup drime-audit [--env-file <path>] [--base-remote drime] [--crypt-remote drimecrypt]
+db-backup drime-audit [--env-file <path>] [--base-remote drime] [--crypt-remote drimecrypt] \
+  [--concurrency 8] [--max-changed 50]
 ```
 
 `drime-audit` checks that the raw top level holds only the crypt root, that
@@ -432,6 +433,31 @@ an ambiguous inventory is never reported clean. Exit 0 clean, 1 a demonstrated
 violation (each finding names the raw path), 2 the audit could not complete
 (transport, timeout, malformed output, or a listing larger than 256 MiB, which
 is refused rather than parsed truncated). `--json` prints the report.
+
+- **Header reads run in a pool.** rclone's `cat --count` limits the bytes of the
+  whole call, not of each object, so one object per call is the only way to read
+  exact heads. `--concurrency <n>` (default 8, 1 to 64) runs that many `rclone cat`
+  children at once, all through the same hermetic context. Every listed object is
+  checked exactly once or the audit fails closed (exit 2); a read failure names
+  the raw path (an encrypted name, safe to print) and nothing else from the child.
+- **A store that changes under the audit.** If a header read finds the object
+  gone (rclone exit 3 or 4), that path is re-listed. Still gone: it is recorded
+  as `changedDuringAudit` (printed as `changed-during-audit: <path>`, counted in
+  the summary line, not a finding, and not counted as checked). Replaced: the new
+  object is read once. More than `--max-changed <n>` (default 50) such objects
+  exits 2 with `store changed too much during audit`.
+- **Closing consistency pass.** After the header reads, the raw store is listed
+  again and compared with the first listing by path, size, modification time and
+  ID. New or changed objects (a plaintext file written at a new path, or one
+  replaced after its header was read) get the name decode and the header read;
+  objects removed since the first listing count in `changedDuringAudit`. The
+  listing is repeated until a pass finds nothing new, at most 3 times, and the
+  changes count against `--max-changed`; a store still changing after that exits 2.
+  Each pass also re-lists the raw top level and repeats the namespace check, so a
+  plaintext file dropped beside the crypt root mid-audit is a finding. Only a
+  stable final listing whose every object was checked reports clean, so a clean
+  run takes exactly one extra raw and one extra top-level listing. The summary line reads
+  `drime-audit: clean, N object(s) checked, M changed during audit`.
 
 ### Native S3 remote (no rclone) — AWS S3 or Cloudflare R2
 

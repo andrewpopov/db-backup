@@ -12,7 +12,7 @@ const itOnPosix = process.platform === 'win32' ? it.skip : it;
 const { runBackupJob, runBackupJobAsync, runCli, normalizeDestination, uploadBackupToRemote, normalizeRuntime } = dbBackup;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const drimeModule = require('../drime.js') as {
-  drimeAudit: (o: Record<string, unknown>) => { objects: number; findings: { kind: string; path: string; detail: string }[] };
+  drimeAudit: (o: Record<string, unknown>) => Promise<{ objects: number; findings: { kind: string; path: string; detail: string }[]; changedDuringAudit: string[] }>;
   runDrimeOperation: (dest: unknown, runtime: unknown, operation: unknown) => unknown;
 };
 const { drimeAudit } = drimeModule;
@@ -688,7 +688,7 @@ describe('generic rclone destinations never reach Drime unencrypted', () => {
 });
 
 describe('drime-audit', () => {
-  interface Raw { path: string; size?: number; head?: Buffer; dir?: boolean }
+  interface Raw { path: string; size?: number; head?: Buffer; dir?: boolean; modTime?: string }
   type Failure = 'decrypt' | 'timeout' | 'exit5' | 'password' | 'isfile' | { stderr: string };
 
   function failure(kind: Failure) {
@@ -715,16 +715,34 @@ describe('drime-audit', () => {
     catFails?: string[];
     catShort?: boolean;
     listFails?: boolean;
+    latencyMs?: number;
+    vanish?: string[];
+    replace?: Record<string, Buffer>;
+    rawSequence?: (listing: number) => Raw[];
+    topSequence?: (listing: number) => { Path: string; IsDir: boolean }[];
   } = {}) {
     const top = options.top || [{ Path: 'backups-encrypted', IsDir: true }];
-    const raw = options.raw || [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }, { path: 'dirx/fileb' }];
+    const rawAt = (listing: number): Raw[] => (options.rawSequence ? options.rawSequence(listing) : options.raw || [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }, { path: 'dirx/fileb' }]);
+    const raw = rawAt(0);
+    let rawListings = 0;
+    let topListings = 0;
     const calls: Call[] = [];
+    const gone = () => Object.assign(new Error('rclone: not found'), { status: 3, stderr: Buffer.from('directory not found') });
+    const replaced = new Set<string>();
+    const rawTarget = (arg: string) => arg.replace('dbbdrimebase:backups-encrypted/', '');
     const execFileSync = (_c: string, args: string[], opts?: { env?: Record<string, string> }) => {
       calls.push({ args, env: opts?.env || {}, config: { exists: false, mode: 0, size: 0, file: '' } });
       const filesOnly = args.includes('--files-only');
+      if (args[0] === 'lsjson' && args[1] === '--stat') {
+        const target = rawTarget(args[2]);
+        if (!(options.replace && target in options.replace && replaced.has(target))) throw gone();
+        return Buffer.from(JSON.stringify({ Path: target, Size: 100, IsDir: false }));
+      }
       if (args[0] === 'lsjson' && args[1] === 'dbbdrimebase:') {
         if (options.listFails) throw failure('exit5');
-        return Buffer.from(JSON.stringify(top));
+        const listing = options.topSequence ? options.topSequence(topListings) : top;
+        topListings += 1;
+        return Buffer.from(JSON.stringify(listing));
       }
       if (args[0] === 'lsjson' && args.includes('--encrypted')) {
         if (options.strict) throw failure(options.strict);
@@ -733,7 +751,9 @@ describe('drime-audit', () => {
         return Buffer.from(JSON.stringify([...entries, ...(options.cryptDuplicates || []).map((d) => ({ Path: `dup/${d}`, EncryptedPath: d }))]));
       }
       if (args[0] === 'lsjson') {
-        return Buffer.from(JSON.stringify(raw.filter((r) => !(filesOnly && r.dir)).map((r) => (r.dir ? { Path: r.path, IsDir: true } : { Path: r.path, Size: r.size ?? 100, IsDir: false }))));
+        const listing = rawAt(rawListings);
+        rawListings += 1;
+        return Buffer.from(JSON.stringify(listing.filter((r) => !(filesOnly && r.dir)).map((r) => (r.dir ? { Path: r.path, IsDir: true } : { Path: r.path, Size: r.size ?? 100, ModTime: r.modTime, IsDir: false }))));
       }
       if (args[0] === 'backend' && args[1] === 'features') {
         if (options.probe) throw failure(options.probe);
@@ -745,44 +765,67 @@ describe('drime-audit', () => {
         return Buffer.from('decoded');
       }
       if (args[0] === 'cat') {
-        const target = args[3].replace('dbbdrimebase:backups-encrypted/', '');
+        const target = rawTarget(args[3]);
+        if ((options.vanish || []).includes(target)) throw gone();
+        if (options.replace && target in options.replace) {
+          if (!replaced.has(target)) {
+            replaced.add(target);
+            throw gone();
+          }
+          return options.replace[target];
+        }
         if ((options.catFails || []).includes(target)) throw failure('timeout');
         if (options.catShort) return Buffer.from('RCL');
-        return Buffer.from(raw.find((r) => r.path === target && !r.dir)?.head ?? MAGIC);
+        return Buffer.from(rawAt(Math.max(rawListings - 1, 0)).find((r) => r.path === target && !r.dir)?.head ?? MAGIC);
       }
       throw new Error(`unexpected ${args.join(' ')}`);
     };
-    return { calls, execFileSync };
+    const concurrency = { active: 0, max: 0 };
+    const execFile = async (command: string, args: string[], opts?: { env?: Record<string, string> }) => {
+      concurrency.active += 1;
+      concurrency.max = Math.max(concurrency.max, concurrency.active);
+      try {
+        if (options.latencyMs && args[0] === 'cat') await new Promise((resolve) => setTimeout(resolve, options.latencyMs));
+        return execFileSync(command, args, opts);
+      } finally {
+        concurrency.active -= 1;
+      }
+    };
+    return { calls, execFileSync, execFile, concurrency, rawListings: () => rawListings, topListings: () => topListings };
   }
 
-  const audit = (fake: ReturnType<typeof makeAuditRclone>, env: Record<string, string | undefined> = {}) => {
+  const audit = (
+    fake: Pick<ReturnType<typeof makeAuditRclone>, 'execFileSync'> & { execFile?: ReturnType<typeof makeAuditRclone>['execFile'] },
+    env: Record<string, string | undefined> = {},
+    limits: { concurrency?: number; maxChanged?: number } = {},
+  ) => {
     const { envFile } = setup();
-    return drimeAudit({ envFile, runtime: { execFileSync: fake.execFileSync, env } });
+    return drimeAudit({ envFile, ...limits, runtime: { execFileSync: fake.execFileSync, execFile: fake.execFile, env } });
   };
   const kinds = (report: { findings: { kind: string }[] }) => report.findings.map((f) => f.kind);
 
-  it('a clean store has no findings and reads the first 8 bytes of every raw file only', () => {
+  it('a clean store has no findings and reads the first 8 bytes of every raw file only', async () => {
     const fake = makeAuditRclone();
-    const report = audit(fake, { PATH: '/usr/bin', RCLONE_CONFIG: '/evil', RCLONE_LOG_FILE: '/evil' });
-    expect(report).toEqual({ objects: 2, findings: [] });
+    const report = await audit(fake, { PATH: '/usr/bin', RCLONE_CONFIG: '/evil', RCLONE_LOG_FILE: '/evil' });
+    expect(report).toEqual({ objects: 2, findings: [], changedDuringAudit: [] });
     const cats = fake.calls.filter((c) => c.args[0] === 'cat');
     expect(cats.map((c) => c.args.slice(0, 3))).toEqual([['cat', '--count', '8'], ['cat', '--count', '8']]);
     expect(fake.calls.every((c) => c.env.RCLONE_CONFIG !== '/evil' && c.env.RCLONE_LOG_FILE === undefined)).toBe(true);
     expect(fake.calls.some((c) => c.args.includes('--crypt-strict-names'))).toBe(true);
   });
 
-  it('flags anything at the raw top level other than the crypt root', () => {
-    const report = audit(makeAuditRclone({ top: [{ Path: 'backups-encrypted', IsDir: true }, { Path: 'plaintext-folder', IsDir: true }] }));
+  it('flags anything at the raw top level other than the crypt root', async () => {
+    const report = await audit(makeAuditRclone({ top: [{ Path: 'backups-encrypted', IsDir: true }, { Path: 'plaintext-folder', IsDir: true }] }));
     expect(report.findings).toEqual([{ kind: 'unexpected-top-level', path: 'drime:plaintext-folder', detail: 'not the crypt root' }]);
   });
 
-  it('names the raw path of a file whose name does not decrypt', () => {
-    const report = audit(makeAuditRclone({ strict: 'decrypt', decodeFails: { 'dirx/fileb': 'decrypt' } }));
+  it('names the raw path of a file whose name does not decrypt', async () => {
+    const report = await audit(makeAuditRclone({ strict: 'decrypt', decodeFails: { 'dirx/fileb': 'decrypt' } }));
     expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['undecryptable', 'drime:backups-encrypted/dirx/fileb']]);
   });
 
-  it('names an undecryptable EMPTY directory by its raw path (directories are inventoried)', () => {
-    const report = audit(makeAuditRclone({
+  it('names an undecryptable EMPTY directory by its raw path (directories are inventoried)', async () => {
+    const report = await audit(makeAuditRclone({
       raw: [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }, { path: 'emptybad', dir: true }],
       strict: 'decrypt',
       decodeFails: { emptybad: 'decrypt' },
@@ -790,109 +833,109 @@ describe('drime-audit', () => {
     expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['undecryptable', 'drime:backups-encrypted/emptybad']]);
   });
 
-  it('flags an empty directory the crypt listing does not know', () => {
+  it('flags an empty directory the crypt listing does not know', async () => {
     const fake = makeAuditRclone({ raw: [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }] });
     const original = fake.execFileSync;
     const trimmed = (c: string, a: string[], o?: { env?: Record<string, string> }) => {
       const out = original(c, a, o);
       return a.includes('--encrypted') ? Buffer.from(JSON.stringify(JSON.parse(String(out)).filter((e: { IsDir: boolean }) => !e.IsDir))) : out;
     };
-    const report = audit({ calls: fake.calls, execFileSync: trimmed });
+    const report = await audit({ execFileSync: trimmed });
     expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['undecryptable', 'drime:backups-encrypted/dirx']]);
   });
 
-  it('flags plaintext hiding under a validly encrypted name (magic header check)', () => {
-    const report = audit(makeAuditRclone({ raw: [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }, { path: 'dirx/fileb', head: Buffer.from('SQLite f') }] }));
+  it('flags plaintext hiding under a validly encrypted name (magic header check)', async () => {
+    const report = await audit(makeAuditRclone({ raw: [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }, { path: 'dirx/fileb', head: Buffer.from('SQLite f') }] }));
     expect(report.findings).toEqual([{ kind: 'not-crypt-format', path: 'drime:backups-encrypted/dirx/fileb', detail: 'missing rclone crypt header' }]);
   });
 
-  it('flags files too small to be crypt files', () => {
-    const report = audit(makeAuditRclone({ raw: [{ path: 'tiny', size: 5 }] }));
+  it('flags files too small to be crypt files', async () => {
+    const report = await audit(makeAuditRclone({ raw: [{ path: 'tiny', size: 5 }] }));
     expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['not-crypt-format', 'drime:backups-encrypted/tiny']]);
   });
 
   describe('an ambiguous inventory is never clean (Drime allows duplicate names)', () => {
-    it('two raw files at one path', () => {
+    it('two raw files at one path', async () => {
       const fake = makeAuditRclone({ raw: [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }, { path: 'dirx/filea', head: Buffer.from('SQLite f') }] });
-      const report = audit(fake);
+      const report = await audit(fake);
       expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['ambiguous-path', 'drime:backups-encrypted/dirx/filea']]);
       expect(fake.calls.filter((c) => c.args[0] === 'cat')).toEqual([]);
     });
 
-    it('a file and a directory at one path', () => {
-      const report = audit(makeAuditRclone({ raw: [{ path: 'x', dir: true }, { path: 'x' }] }));
+    it('a file and a directory at one path', async () => {
+      const report = await audit(makeAuditRclone({ raw: [{ path: 'x', dir: true }, { path: 'x' }] }));
       expect(kinds(report)).toContain('ambiguous-path');
     });
 
-    it('a duplicated or non-directory crypt root', () => {
-      expect(kinds(audit(makeAuditRclone({ top: [{ Path: 'backups-encrypted', IsDir: true }, { Path: 'backups-encrypted', IsDir: true }] })))).toContain('ambiguous-path');
+    it('a duplicated or non-directory crypt root', async () => {
+      expect(kinds(await audit(makeAuditRclone({ top: [{ Path: 'backups-encrypted', IsDir: true }, { Path: 'backups-encrypted', IsDir: true }] })))).toContain('ambiguous-path');
       const fileRoot = makeAuditRclone({ top: [{ Path: 'backups-encrypted', IsDir: false }], probe: 'isfile' });
-      expect(audit(fileRoot).findings.map((f) => [f.kind, f.path])).toEqual([['ambiguous-path', 'drime:backups-encrypted']]);
+      expect((await audit(fileRoot)).findings.map((f) => [f.kind, f.path])).toEqual([['ambiguous-path', 'drime:backups-encrypted']]);
       expect(fileRoot.calls.some((c) => c.args[0] === 'backend' && c.args[1] === 'features')).toBe(false);
     });
 
-    it('two crypt entries mapping to one raw path', () => {
-      const report = audit(makeAuditRclone({ cryptDuplicates: ['dirx/filea'] }));
+    it('two crypt entries mapping to one raw path', async () => {
+      const report = await audit(makeAuditRclone({ cryptDuplicates: ['dirx/filea'] }));
       expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['ambiguous-path', 'drime:backups-encrypted/dirx/filea']]);
     });
   });
 
   describe('inability to complete is an error (exit 2), not a finding', () => {
-    const throwsWith = (options: Parameters<typeof makeAuditRclone>[0], pattern: RegExp) => {
+    const throwsWith = async (options: Parameters<typeof makeAuditRclone>[0], pattern: RegExp) => {
       let message = '';
-      try { audit(makeAuditRclone(options)); } catch (error) { message = (error as Error).message; }
+      try { await audit(makeAuditRclone(options)); } catch (error) { message = (error as Error).message; }
       expect(message).toMatch(pattern);
       expectNoSecrets(message);
     };
 
-    it('a timed-out or failing strict crypt listing', () => {
-      throwsWith({ strict: 'timeout' }, /^strict crypt listing: rclone lsjson failed \(exit unknown\)$/);
-      throwsWith({ strict: 'exit5' }, /^strict crypt listing: rclone lsjson failed \(exit 5\)$/);
+    it('a timed-out or failing strict crypt listing', async () => {
+      await throwsWith({ strict: 'timeout' }, /^strict crypt listing: rclone lsjson failed \(exit unknown\)$/);
+      await throwsWith({ strict: 'exit5' }, /^strict crypt listing: rclone lsjson failed \(exit 5\)$/);
     });
 
-    it('malformed crypt listing output', () => {
-      throwsWith({ malformedStrict: true }, /could not parse crypt listing/);
+    it('malformed crypt listing output', async () => {
+      await throwsWith({ malformedStrict: true }, /could not parse crypt listing/);
     });
 
-    it('a decrypt failure no name can be blamed for', () => {
-      throwsWith({ strict: 'decrypt' }, /no undecryptable name could be identified/);
+    it('a decrypt failure no name can be blamed for', async () => {
+      await throwsWith({ strict: 'decrypt' }, /no undecryptable name could be identified/);
     });
 
-    it('a name decode that fails for a non-decrypt reason', () => {
-      throwsWith({ strict: 'decrypt', decodeFails: { 'dirx/filea': 'timeout' } }, /^decoding names: rclone backend failed \(exit unknown\)$/);
+    it('a name decode that fails for a non-decrypt reason', async () => {
+      await throwsWith({ strict: 'decrypt', decodeFails: { 'dirx/filea': 'timeout' } }, /^decoding names: rclone backend failed \(exit unknown\)$/);
     });
 
-    it('a header read that fails or returns too few bytes', () => {
-      throwsWith({ catFails: ['dirx/filea'] }, /^reading object header: rclone cat failed \(exit unknown\)$/);
-      throwsWith({ catShort: true }, /fewer bytes than requested/);
+    it('a header read that fails or returns too few bytes', async () => {
+      await throwsWith({ catFails: ['dirx/filea'] }, /^reading object header of drime:backups-encrypted\/dirx\/filea: rclone cat failed \(exit unknown\)$/);
+      await throwsWith({ catShort: true }, /fewer bytes than requested/);
     });
 
-    it('the raw listing failing', () => {
-      throwsWith({ listFails: true }, /^listing base remote: rclone lsjson failed \(exit 5\)$/);
+    it('the raw listing failing', async () => {
+      await throwsWith({ listFails: true }, /^listing base remote: rclone lsjson failed \(exit 5\)$/);
     });
   });
 
   describe('credential and crypt-initialisation failures are errors, never findings (PKG-304 review 6b)', () => {
-    const throwsWith = (options: Parameters<typeof makeAuditRclone>[0], pattern: RegExp) => {
+    const throwsWith = async (options: Parameters<typeof makeAuditRclone>[0], pattern: RegExp) => {
       let message = '';
       let report: unknown = null;
-      try { report = audit(makeAuditRclone(options)); } catch (error) { message = (error as Error).message; }
+      try { report = await audit(makeAuditRclone(options)); } catch (error) { message = (error as Error).message; }
       expect(report).toBeNull();
       expect(message).toMatch(pattern);
     };
 
-    it('a crypt remote that cannot initialise stops the audit before the recursive listings', () => {
+    it('a crypt remote that cannot initialise stops the audit before the recursive listings', async () => {
       const fake = makeAuditRclone({ probe: 'password' });
-      expect(() => audit(fake)).toThrow(/^initialising crypt remote: rclone backend failed \(exit 1\)$/);
+      await expect(audit(fake)).rejects.toThrow(/^initialising crypt remote: rclone backend failed \(exit 1\)$/);
       expect(fake.calls.some((c) => c.args[0] === 'lsjson' && c.args.includes('-R'))).toBe(false);
     });
 
-    it('a "failed to decrypt password" strict listing is not a per-name violation', () => {
-      throwsWith({ strict: 'password' }, /^strict crypt listing: rclone lsjson failed \(exit 1\)$/);
+    it('a "failed to decrypt password" strict listing is not a per-name violation', async () => {
+      await throwsWith({ strict: 'password' }, /^strict crypt listing: rclone lsjson failed \(exit 1\)$/);
     });
 
-    it('a "failed to decrypt password" decode is not a per-name violation', () => {
-      throwsWith({ strict: 'decrypt', decodeFails: { 'dirx/filea': 'password' } }, /^decoding names: rclone backend failed \(exit 1\)$/);
+    it('a "failed to decrypt password" decode is not a per-name violation', async () => {
+      await throwsWith({ strict: 'decrypt', decodeFails: { 'dirx/filea': 'password' } }, /^decoding names: rclone backend failed \(exit 1\)$/);
     });
   });
 
@@ -908,8 +951,8 @@ describe('drime-audit', () => {
       ['ctl', 'failed to decrypt: ctl: bad decryption - contains control chars'],
     ];
 
-    it.each(MESSAGES)('a directory named %s whose decode says "%s" is a finding', (name, stderr) => {
-      const report = audit(makeAuditRclone({
+    it.each(MESSAGES)('a directory named %s whose decode says "%s" is a finding', async (name, stderr) => {
+      const report = await audit(makeAuditRclone({
         raw: [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }, { path: name, dir: true }],
         strict: 'decrypt',
         decodeFails: { [name]: { stderr: `NOTICE: Failed to backend: command "decode" failed: ${stderr}` } },
@@ -917,31 +960,176 @@ describe('drime-audit', () => {
       expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['undecryptable', `drime:backups-encrypted/${name}`]]);
     });
 
-    it('still treats the password error as an init failure, not a name error', () => {
+    it('still treats the password error as an init failure, not a name error', async () => {
       const bad = { stderr: 'NOTICE: Failed to backend: failed to decrypt password: base64 decode failed when revealing password - is it obscured?' };
-      expect(() => audit(makeAuditRclone({ raw: [{ path: 'dirx', dir: true }], strict: 'decrypt', decodeFails: { dirx: bad } }))).toThrow(/decoding names/);
+      await expect(audit(makeAuditRclone({ raw: [{ path: 'dirx', dir: true }], strict: 'decrypt', decodeFails: { dirx: bad } }))).rejects.toThrow(/decoding names/);
     });
   });
 
   describe('raw names are data, never remotes or flags (PKG-304 review 7b)', () => {
-    it.each(['bad:name', '--unknown-option'])('an empty undecryptable directory named %s is a finding named by raw path', (name) => {
+    it.each(['bad:name', '--unknown-option'])('an empty undecryptable directory named %s is a finding named by raw path', async (name) => {
       const fake = makeAuditRclone({
         raw: [{ path: 'dirx', dir: true }, { path: 'dirx/filea' }, { path: name, dir: true }],
         strict: 'decrypt',
         decodeFails: { [name]: 'decrypt' },
       });
-      const report = audit(fake);
+      const report = await audit(fake);
       expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['undecryptable', `drime:backups-encrypted/${name}`]]);
       const decode = fake.calls.find((c) => c.args[0] === 'backend' && c.args[1] === 'decode' && c.args.at(-1) === name)!;
       expect(decode.args).toEqual(['backend', 'decode', 'dbbdrimecrypt:', '--', name]);
     });
   });
 
-  it('refuses a bad env file before touching rclone', () => {
+  describe('header reads run in a bounded pool and the store may change under them (PKG-310)', () => {
+    const manyFiles = (count: number): Raw[] => [{ path: 'd', dir: true }, ...Array.from({ length: count }, (_v, i) => ({ path: `d/f${i}` }))];
+    const catPaths = (fake: ReturnType<typeof makeAuditRclone>) => fake.calls.filter((c) => c.args[0] === 'cat').map((c) => c.args[3].replace('dbbdrimebase:backups-encrypted/', ''));
+
+    it('reads headers concurrently, never more than the configured bound', async () => {
+      const fake = makeAuditRclone({ raw: manyFiles(60), latencyMs: 10 });
+      const report = await audit(fake, {}, { concurrency: 4 });
+      expect(report.findings).toEqual([]);
+      expect(fake.concurrency.max).toBe(4);
+    });
+
+    it('a pool of 8 is several times faster than one at a time on a large listing', async () => {
+      const timed = async (concurrency: number) => {
+        const fake = makeAuditRclone({ raw: manyFiles(160), latencyMs: 10 });
+        const started = Date.now();
+        await audit(fake, {}, { concurrency });
+        return Date.now() - started;
+      };
+      const serial = await timed(1);
+      const pooled = await timed(8);
+      console.info(`drime-audit header check, 160 objects at 10 ms each: concurrency 1 ${serial} ms, concurrency 8 ${pooled} ms (${(serial / pooled).toFixed(1)}x)`);
+      expect(serial / pooled).toBeGreaterThan(3);
+    });
+
+    it('checks every listed object exactly once, so none can be reported clean unread', async () => {
+      const fake = makeAuditRclone({ raw: manyFiles(75), latencyMs: 1 });
+      const report = await audit(fake, {}, { concurrency: 8 });
+      expect(report.objects).toBe(75);
+      expect([...catPaths(fake)].sort()).toEqual(Array.from({ length: 75 }, (_v, i) => `d/f${i}`).sort());
+    });
+
+    it('a failed read among many is exit 2 naming its raw path, never a clean report', async () => {
+      const fake = makeAuditRclone({ raw: manyFiles(40), latencyMs: 1, catFails: ['d/f33'] });
+      const failure = await audit(fake, {}, { concurrency: 8 }).then(() => null, (error: Error) => error);
+      expect(failure?.message).toBe('reading object header of drime:backups-encrypted/d/f33: rclone cat failed (exit unknown)');
+      expectNoSecrets(failure?.message || '');
+    });
+
+    it('still catches a plaintext object among many concurrent reads', async () => {
+      const raw = manyFiles(40).map((entry) => (entry.path === 'd/f27' ? { ...entry, head: Buffer.from('SQLite f') } : entry));
+      const report = await audit(makeAuditRclone({ raw, latencyMs: 1 }), {}, { concurrency: 8 });
+      expect(report.findings).toEqual([{ kind: 'not-crypt-format', path: 'drime:backups-encrypted/d/f27', detail: 'missing rclone crypt header' }]);
+    });
+
+    it('an object that vanishes mid-audit is recorded as changed-during-audit, not fatal and not counted as checked', async () => {
+      const fake = makeAuditRclone({ raw: manyFiles(10), vanish: ['d/f4'] });
+      const report = await audit(fake);
+      expect(report).toEqual({ objects: 9, findings: [], changedDuringAudit: ['drime:backups-encrypted/d/f4'] });
+      expect(fake.calls.some((c) => c.args[0] === 'lsjson' && c.args[1] === '--stat' && c.args[2] === 'dbbdrimebase:backups-encrypted/d/f4')).toBe(true);
+    });
+
+    it('an object replaced mid-audit is re-read once, and the new bytes are judged', async () => {
+      const fake = makeAuditRclone({ raw: manyFiles(5), replace: { 'd/f2': Buffer.from('SQLite f') } });
+      const report = await audit(fake);
+      expect(report.changedDuringAudit).toEqual([]);
+      expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['not-crypt-format', 'drime:backups-encrypted/d/f2']]);
+      expect(catPaths(fake).filter((p) => p === 'd/f2')).toHaveLength(2);
+    });
+
+    it('a store that changes past the bound is exit 2, not a report', async () => {
+      const fake = makeAuditRclone({ raw: manyFiles(10), vanish: ['d/f1', 'd/f2', 'd/f3'] });
+      await expect(audit(fake, {}, { maxChanged: 2 })).rejects.toThrow(/^store changed too much during audit \(more than 2 objects changed\)$/);
+      expect((await audit(makeAuditRclone({ raw: manyFiles(10), vanish: ['d/f1', 'd/f2'] }), {}, { maxChanged: 2 })).changedDuringAudit).toHaveLength(2);
+    });
+
+    it('refuses an out-of-range concurrency before touching rclone', async () => {
+      const fake = makeAuditRclone();
+      await expect(audit(fake, {}, { concurrency: 0 })).rejects.toThrow(/concurrency/);
+      await expect(audit(fake, {}, { concurrency: 65 })).rejects.toThrow(/concurrency/);
+      expect(fake.calls).toEqual([]);
+    });
+
+    it('the CLI summary line reports the changed count and exits 0', async () => {
+      const { envFile } = setup();
+      const bin = installFakeRclone([
+        { match: 'lsjson dbbdrimebase:', stdoutBase64: Buffer.from('[{"Path":"backups-encrypted","IsDir":true}]').toString('base64') },
+        { match: 'lsjson -R dbbdrimebase:', stdoutBase64: Buffer.from('[{"Path":"gone","Size":100,"IsDir":false}]').toString('base64') },
+        { match: 'lsjson -R --encrypted', stdoutBase64: Buffer.from('[{"Path":"dec","EncryptedPath":"gone","IsDir":false}]').toString('base64') },
+        { match: 'cat', exit: 3, stderr: 'directory not found' },
+        { match: 'lsjson --stat', exit: 3, stderr: 'directory not found' },
+      ]);
+      const { exitCode, out } = await cli(bin, makeTempDir(), ['drime-audit', '--env-file', envFile, '--concurrency', '2']);
+      expect(exitCode).toBe(0);
+      expect(out).toContain('drime-audit: clean, 0 object(s) checked, 1 changed during audit');
+      expect(out).toContain('changed-during-audit: drime:backups-encrypted/gone');
+    });
+  });
+
+  describe('a closing consistency pass makes only a stable, fully checked store clean (PKG-310 review)', () => {
+    const base: Raw[] = [{ path: 'd', dir: true }, { path: 'd/f1', modTime: 't1' }, { path: 'd/f2', modTime: 't1' }];
+    const PLAIN = Buffer.from('SQLite f');
+
+    it('a stable store needs exactly one extra raw listing', async () => {
+      const fake = makeAuditRclone({ raw: base });
+      const report = await audit(fake);
+      expect(report).toEqual({ objects: 2, findings: [], changedDuringAudit: [] });
+      expect(fake.rawListings()).toBe(2);
+      expect(fake.topListings()).toBe(2);
+    });
+
+    it('a plaintext file appearing at the top level after the first listing is a finding', async () => {
+      const root = { Path: 'backups-encrypted', IsDir: true };
+      const fake = makeAuditRclone({ raw: base, topSequence: (n) => (n === 0 ? [root] : [root, { Path: 'plain.db', IsDir: false }]) });
+      const report = await audit(fake);
+      expect(report.findings).toEqual([{ kind: 'unexpected-top-level', path: 'drime:plain.db', detail: 'not the crypt root' }]);
+      expect(fake.topListings()).toBe(3);
+    });
+
+    it('a plaintext object appearing at a new path mid-audit is caught', async () => {
+      const fake = makeAuditRclone({ rawSequence: (n) => (n === 0 ? base : [...base, { path: 'd/new', modTime: 't2', head: PLAIN }]) });
+      const report = await audit(fake);
+      expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['not-crypt-format', 'drime:backups-encrypted/d/new']]);
+      expect(report.objects).toBe(3);
+      expect(fake.rawListings()).toBe(3);
+    });
+
+    it('a new path is also name-checked through the decode path', async () => {
+      const fake = makeAuditRclone({
+        rawSequence: (n) => (n === 0 ? base : [...base, { path: 'd/badname', modTime: 't2' }]),
+        decodeFails: { 'd/badname': 'decrypt' },
+      });
+      const report = await audit(fake);
+      expect(report.findings.map((f) => [f.kind, f.path])).toContainEqual(['undecryptable', 'drime:backups-encrypted/d/badname']);
+    });
+
+    it('an object replaced with plaintext after its header was read is caught', async () => {
+      const fake = makeAuditRclone({
+        rawSequence: (n) => (n === 0 ? base : base.map((r) => (r.path === 'd/f1' ? { ...r, modTime: 't2', head: PLAIN } : r))),
+      });
+      const report = await audit(fake);
+      expect(report.findings.map((f) => [f.kind, f.path])).toEqual([['not-crypt-format', 'drime:backups-encrypted/d/f1']]);
+    });
+
+    it('an object removed after the first listing is counted as changed, not checked', async () => {
+      const report = await audit(makeAuditRclone({ rawSequence: (n) => (n === 0 ? base : base.filter((r) => r.path !== 'd/f1')) }));
+      expect(report).toEqual({ objects: 1, findings: [], changedDuringAudit: ['drime:backups-encrypted/d/f1'] });
+    });
+
+    it('a store that never stabilises is exit 2, not a report', async () => {
+      const fake = makeAuditRclone({ rawSequence: (n) => [...base, { path: `d/n${n}`, modTime: `t${n}` }] });
+      await expect(audit(fake, {}, { maxChanged: 100 })).rejects.toThrow(/^store changed too much during audit \(still changing after 3 re-listings\)$/);
+      expect(fake.rawListings()).toBe(4);
+    });
+  });
+
+  it('refuses a bad env file before touching rclone', async () => {
     const { cwd } = setup();
     const fake = makeAuditRclone();
     const envFile = writeEnvFile(cwd, { RCLONE_CONFIG_DRIME_ROOT_FOLDER_ID: '9' });
-    expect(() => drimeAudit({ envFile, runtime: { execFileSync: fake.execFileSync, env: {} } })).toThrow(/Drime env file/);
+    await expect(drimeAudit({ envFile, runtime: { execFileSync: fake.execFileSync, env: {} } })).rejects.toThrow(/Drime env file/);
     expect(fake.calls).toEqual([]);
   });
 
@@ -1519,10 +1707,10 @@ describe('audit listings above the default exec buffer (PKG-307 item 4)', () => 
     return { runtime: { execFileSync, env: {} as Record<string, string | undefined> } };
   }
 
-  it('audits completely a store whose recursive listing is over 1 MiB', () => {
+  it('audits completely a store whose recursive listing is over 1 MiB', async () => {
     const { runtime } = bigAuditRuntime(6000);
     const { envFile } = setup();
-    const report = drimeAudit({ envFile, runtime });
+    const report = await drimeAudit({ envFile, runtime });
     expect(report.objects).toBe(6000);
     expect(report.findings).toEqual([]);
   });
@@ -1538,7 +1726,7 @@ describe('audit listings above the default exec buffer (PKG-307 item 4)', () => 
       if (args[0] === 'backend') return Buffer.from('{}');
       throw Object.assign(new Error('spawnSync rclone ENOBUFS'), { code: 'ENOBUFS', status: null });
     };
-    expect(() => drimeAudit({ envFile, runtime: { execFileSync: overflow, env: {} } })).toThrow(/output exceeded the \d+-byte listing limit/);
+    await expect(drimeAudit({ envFile, runtime: { execFileSync: overflow, env: {} } })).rejects.toThrow(/output exceeded the \d+-byte listing limit/);
     void out;
   });
 });

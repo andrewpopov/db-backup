@@ -2,7 +2,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFileSync, execFile } = require('child_process');
 const zlib = require('zlib');
 const { config: loadDotenv, parse: parseDotenv } = require('dotenv');
 // Suppression ONLY — never alert-kit's transport. notifyAlert below stays synchronous
@@ -205,6 +205,8 @@ function parseArgs(argv) {
     drimeEnvFile: null,
     drimeBaseRemote: null,
     drimeCryptRemote: null,
+    drimeConcurrency: null,
+    drimeMaxChanged: null,
   };
 
   const commandArg = argv[0];
@@ -425,6 +427,19 @@ function parseArgs(argv) {
       const value = argv[index + 1];
       if (!value) throw new Error(`Missing value for ${arg}`);
       options[drimeFlags[arg]] = value;
+      index += 1;
+      continue;
+    }
+
+    const drimeAuditLimitFlags = {
+      '--concurrency': ['drimeConcurrency', 1],
+      '--max-changed': ['drimeMaxChanged', 0],
+    };
+    if (drimeAuditLimitFlags[arg]) {
+      const [key, minimum] = drimeAuditLimitFlags[arg];
+      const value = strictNonNegativeInt(argv[index + 1]);
+      if (value === null || value < minimum) throw new Error(`${arg} must be an integer >= ${minimum}`);
+      options[key] = value;
       index += 1;
       continue;
     }
@@ -796,6 +811,24 @@ function resolveCommandTimeoutMs(value, env = process.env) {
   );
 }
 
+// Async twin of execFileSync for callers that fan children out: resolves the
+// stdout Buffer, rejects with { status, code, stderr } like execFileSync's error.
+function execFileBuffer(command, args, options) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(command, args, { encoding: 'buffer', ...options }, (error, stdout, stderr) => {
+      if (!error) return resolve(stdout);
+      return reject(
+        Object.assign(new Error(`${command} failed`), {
+          status: typeof error.code === 'number' ? error.code : null,
+          code: typeof error.code === 'string' ? error.code : null,
+          stderr,
+        }),
+      );
+    });
+    if (child.stdin) child.stdin.end();
+  });
+}
+
 function normalizeRuntime(runtime = {}) {
   const baseCommand = runtime.execFileSync || execFileSync;
   const commandTimeoutMs = resolveCommandTimeoutMs(runtime.commandTimeoutMs);
@@ -805,8 +838,13 @@ function normalizeRuntime(runtime = {}) {
   const runCommand = (command, args, options = {}) =>
     baseCommand(command, args, { timeout: commandTimeoutMs, killSignal: 'SIGKILL', ...options });
 
+  const baseAsyncCommand = runtime.execFile || execFileBuffer;
+  const runAsyncCommand = (command, args, options = {}) =>
+    baseAsyncCommand(command, args, { timeout: commandTimeoutMs, killSignal: 'SIGKILL', ...options });
+
   return {
     execFileSync: runCommand,
+    execFile: runAsyncCommand,
     commandExists: runtime.commandExists || ((command) => commandExists(command, runCommand)),
     sleep: runtime.sleep || sleep,
     now: runtime.now || (() => new Date()),
@@ -4230,7 +4268,8 @@ Commands:
   drime-audit             Audit the Drime store: only the crypt root at the top level,
                           every object name decrypts, every object starts with the
                           rclone crypt header. Proves rclone-crypt format, NOT that a
-                          backup restores. Exit 0 clean, 1 findings, 2 cannot audit.
+                          backup restores. Exit 0 clean, 1 findings, 2 cannot audit
+                          (including a store that changed too much during the audit).
 
 Options:
   --prod                  Use production env files (.env + .env.production)
@@ -4249,7 +4288,9 @@ Options:
                           /etc/db-backup/drime.env.
   --env-file <path>       (command: drime-audit) Drime env file; also --base-remote
                           <name> (default drime) and --crypt-remote <name> (default
-                          drimecrypt)
+                          drimecrypt); --concurrency <n> (default 8, max 64) parallel
+                          header reads; --max-changed <n> (default 50) objects that
+                          may vanish or be replaced mid-audit before exit 2
   --output-dir <path>     [legacy] Backup directory (default: backups/database)
   --retain-daily <n>      GFS: keep the N most-recent backups
   --retain-weekly <n>     GFS: keep one backup per week, for N weeks
@@ -4339,13 +4380,15 @@ Options:
 }
 
 // Exit 0 clean, 1 findings, 2 cannot audit.
-function runDrimeAuditCommand(options) {
+async function runDrimeAuditCommand(options) {
   let report;
   try {
-    report = drimeAudit({
+    report = await drimeAudit({
       envFile: options.drimeEnvFile,
       baseRemote: options.drimeBaseRemote,
       cryptRemote: options.drimeCryptRemote,
+      concurrency: options.drimeConcurrency ?? undefined,
+      maxChanged: options.drimeMaxChanged ?? undefined,
       runtime: normalizeRuntime({ commandTimeoutMs: options.commandTimeoutMs }),
     });
   } catch (error) {
@@ -4358,7 +4401,12 @@ function runDrimeAuditCommand(options) {
   if (options.json) {
     console.log(JSON.stringify({ status, ...report }, null, 2));
   } else {
-    console.log(`[db-backup] drime-audit: ${status}, ${report.objects} object(s) checked`);
+    console.log(
+      `[db-backup] drime-audit: ${status}, ${report.objects} object(s) checked, ${report.changedDuringAudit.length} changed during audit`,
+    );
+    for (const changedPath of report.changedDuringAudit) {
+      console.error(`[db-backup] changed-during-audit: ${changedPath}`);
+    }
     for (const finding of report.findings) {
       console.error(`[db-backup] FINDING ${finding.kind}: ${finding.path} (${finding.detail})`);
     }
@@ -4554,7 +4602,7 @@ async function runParsedCli(options) {
   }
 
   if (options.command === 'drime-audit') {
-    runDrimeAuditCommand(options);
+    await runDrimeAuditCommand(options);
     return;
   }
 
