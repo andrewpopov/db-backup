@@ -40,7 +40,7 @@ const {
 } = require('./s3-remote');
 const { installSchedule, validateSchedule, renderScheduleBlock } = require('./schedule');
 const { replaceCrontabBlock } = require('./crontab');
-const { planFlatRemoteRetention } = require('./remote-retention');
+const { planFlatRemoteRetention, ambiguousRemoteNames } = require('./remote-retention');
 const {
   normalizeDrimeDestination,
   loadDrimeContext,
@@ -50,6 +50,7 @@ const {
   overCapOutcome,
   assertGenericRcloneTarget,
   drimeAudit,
+  LISTING_MAX_BYTES,
 } = require('./drime');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -3120,6 +3121,7 @@ function runRclone(remote, runtime, operation) {
   return runtime.execFileSync('rclone', buildRcloneArgs(operation, remote.target), {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: rcloneEnv(remote),
+    ...(operation.op === 'list' ? { maxBuffer: LISTING_MAX_BYTES } : {}),
   });
 }
 
@@ -3267,8 +3269,6 @@ function replicateBackupToLocal(entry, destination, runtime, seenLocalPaths) {
 // manifest, a manually-nested layout).
 function remoteBackupEntries(names, namePrefix) {
   return names
-    .map((name) => name.trim())
-    .filter(Boolean)
     .map((name) => {
       const parsed = parseBackupFileName(name, namePrefix);
       if (!parsed) return null;
@@ -3283,15 +3283,27 @@ function remoteBackupEntries(names, namePrefix) {
 // A prune failure is a cleanup miss, not a data-safety issue: warn and carry on.
 // `overKeep` is how many objects were meant to go but stayed (null: unknown).
 function pruneRemoteBackupsDetailed(remote, protectFileName, runtime, namePrefix = null, policy = null, now = new Date()) {
-  let listing = '';
+  let listed;
   try {
-    listing = runRclone(remote, runtime, { op: 'list' }).toString();
+    listed = JSON.parse(runRclone(remote, runtime, { op: 'list' }).toString());
+    if (!Array.isArray(listed) || listed.some((entry) => !entry || typeof entry.Path !== 'string' || typeof entry.IsDir !== 'boolean')) {
+      throw new Error('unexpected listing shape');
+    }
   } catch (error) {
     console.warn(`[db-backup] Could not list remote backups for pruning: ${error.message}`);
-    return { deleted: [], failed: true, overKeep: null };
+    return { deleted: [], failed: true, overKeep: null, reason: 'list-failed' };
   }
 
-  const rawEntries = remoteBackupEntries(listing.split(/\r?\n/), namePrefix);
+  const ambiguous = ambiguousRemoteNames(listed.map((entry) => entry.Path));
+  if (ambiguous.length > 0) {
+    console.warn(
+      `[db-backup] Remote listing has ${ambiguous.length} ambiguous name(s) (the same path twice, or a file and a directory); ` +
+        'refusing to prune because a delete by name could remove the copy meant to survive.',
+    );
+    return { deleted: [], failed: true, overKeep: null, reason: 'ambiguous-inventory', ambiguous: ambiguous.length };
+  }
+
+  const rawEntries = remoteBackupEntries(listed.filter((entry) => !entry.IsDir).map((entry) => entry.Path), namePrefix);
   const effectivePolicy =
     policy || { mode: 'keep-last', keepLast: Math.max(1, Number(remote.keep) > 0 ? Number(remote.keep) : DEFAULT_REMOTE_KEEP) };
 
@@ -3301,7 +3313,7 @@ function pruneRemoteBackupsDetailed(remote, protectFileName, runtime, namePrefix
       doomedNames = planFlatRemoteRetention(rawEntries, protectFileName, effectivePolicy.keepLast);
     } catch (error) {
       console.warn(`[db-backup] Retention planning failed for remote backups (leaving them in place): ${error.message}`);
-      return { deleted: [], failed: true, overKeep: null };
+      return { deleted: [], failed: true, overKeep: null, reason: 'planning-failed' };
     }
   } else {
     const entries = rawEntries.some((entry) => entry.fileName === protectFileName)
@@ -3313,7 +3325,7 @@ function pruneRemoteBackupsDetailed(remote, protectFileName, runtime, namePrefix
         .filter((name) => name !== protectFileName);
     } catch (error) {
       console.warn(`[db-backup] Retention planning failed for remote backups (leaving them in place): ${error.message}`);
-      return { deleted: [], failed: true, overKeep: null };
+      return { deleted: [], failed: true, overKeep: null, reason: 'planning-failed' };
     }
   }
 
@@ -3327,17 +3339,16 @@ function pruneRemoteBackupsDetailed(remote, protectFileName, runtime, namePrefix
     }
   }
   const overKeep = doomedNames.length - deleted.length;
-  return { deleted, failed: overKeep > 0, overKeep };
+  return { deleted, failed: overKeep > 0, overKeep, reason: overKeep > 0 ? 'delete-failed' : null };
 }
 
 function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null, policy = null, now = new Date()) {
   return pruneRemoteBackupsDetailed(remote, protectFileName, runtime, namePrefix, policy, now).deleted;
 }
 
-// A Drime prune miss is surfaced distinctly and never fails the run: the new
-// backup is already verified in place.
-function pruneDrimeBackups(distribution, protectFileName, runtime, namePrefix, policy, now) {
-  const { deleted, failed, overKeep } = pruneRemoteBackupsDetailed(
+// A prune miss never fails the run; it is recorded for the retention-failed alert.
+function pruneRcloneRemoteBackups(distribution, protectFileName, runtime, namePrefix, policy, now) {
+  const { deleted, failed, overKeep, reason, ambiguous } = pruneRemoteBackupsDetailed(
     distribution.destination,
     protectFileName,
     runtime,
@@ -3346,11 +3357,12 @@ function pruneDrimeBackups(distribution, protectFileName, runtime, namePrefix, p
     now,
   );
   if (failed) {
+    const { destination } = distribution;
     const over = overKeep === null ? 'an unknown number of objects' : `${overKeep} objects`;
     console.error(
-      `[db-backup] ALERT drime prune failed for ${distribution.destination.path}: ${over} over keep ${distribution.destination.keep}`,
+      `[db-backup] ALERT ${destination.type} prune failed for ${destination.path || destination.target}: ${over} over keep ${destination.keep || 'policy'} (${reason})`,
     );
-    distribution.pruneFailed = { overKeep };
+    distribution.pruneFailed = { overKeep, reason, ...(ambiguous ? { ambiguous } : {}) };
   }
   return deleted;
 }
@@ -3672,6 +3684,47 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
   return { attempted, delivered };
 }
 
+// Alerts use fixed strings and labels only: error.message can carry a command line.
+const PLAIN_REMOTE_NAME = /^([A-Za-z0-9][A-Za-z0-9_-]*):/;
+
+function plainRemoteName(target) {
+  const match = PLAIN_REMOTE_NAME.exec(String(target));
+  return match ? match[1] : null;
+}
+
+// A rejected target (connection string, inline credentials) is never carried into results.
+function failedDestinationOf(destination) {
+  if (destination.type !== 'rclone') return destination;
+  const name = plainRemoteName(destination.target);
+  return name ? { type: 'rclone', target: `${name}:` } : { type: 'rclone' };
+}
+
+function destinationLabel(destination) {
+  if (destination.type === 's3') return `s3:${destination.bucket}`;
+  if (destination.type === 'rclone') {
+    const name = plainRemoteName(destination.target);
+    return name ? `rclone:${name}:` : 'rclone:<rejected target>';
+  }
+  return `${destination.type}:${destination.path}`;
+}
+
+function backupFailureAlert(error) {
+  const results = (error && error.destinationResults) || [];
+  const labels = results
+    .filter((result) => result.uploadFailed || (result.outcome && result.outcome.status === 'skipped-over-cap'))
+    .map((result) => `${destinationLabel(result.destination)} (${result.uploadFailed ? 'upload failed' : 'over its size cap'})`);
+  const detail = labels.length > 0 ? `${labels.join(', ')}. Nothing was pruned or stamped` : 'the backup did not complete; see the job log';
+  return `🔴 db-backup FAILED: ${detail}`;
+}
+
+function retentionFailureAlert(result) {
+  const labels = (result.destinationResults || [])
+    .filter((distribution) => distribution.pruneFailed)
+    .map((distribution) => `${destinationLabel(distribution.destination)} (${distribution.pruneFailed.reason})`);
+  if (labels.length === 0) return null;
+  return `🟠 db-backup: the backup succeeded but retention failed on ${labels.join(', ')}. Old backups were left in place`;
+}
+
 // Retention policy at a destination: local uses the shared plan. A remote with
 // an explicit `keep` gets its own flat count; otherwise it follows GFS or the default count.
 function resolveDestinationPolicy(destination, resolved) {
@@ -3821,14 +3874,32 @@ function failOnOverCapDrime(distributions, created) {
   throw error;
 }
 
-// A later destination failing must not lose what already happened: the
-// accumulated outcomes ride on the error, and an earlier over-cap skip is
-// named in it.
-function keepResultsOnFailure(error, distributions, created) {
-  if (distributions.length > 0) error.destinationResults = distributions;
+function uploadSyncDestination(created, destination, resolved, seenLocalPaths) {
+  if (destination.type === 'drime') return { destination, ...uploadDrimeBackup(created, destination, resolved.runtime), removed: [] };
+  const uploaded =
+    destination.type === 'local'
+      ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
+      : uploadBackupToRemote(created, destination, resolved.runtime);
+  return { destination, uploaded, removed: [] };
+}
+
+// A failed upload is recorded and the loop carries on; the job fails after.
+function recordUploadFailure(uploads, destination, error) {
+  console.error(`[db-backup] upload to ${destinationLabel(destination)} failed`);
+  uploads.failures.push(error);
+  uploads.distributions.push({ destination: failedDestinationOf(destination), uploaded: null, uploadFailed: true, removed: [] });
+}
+
+function failOnUploadFailures({ failures, distributions }, created) {
+  if (failures.length === 0) return;
+  const error =
+    failures.length === 1
+      ? failures[0]
+      : new Error(`${failures.length} destinations failed to upload: ${distributions.filter((d) => d.uploadFailed).map((d) => destinationLabel(d.destination)).join(', ')}`);
+  error.destinationResults = distributions;
   const capMessage = overCapMessage(distributions, created);
   if (capMessage) error.message = `${error.message}; also: ${capMessage}`;
-  return error;
+  throw error;
 }
 
 const S3_SYNC_REFUSAL_MESSAGE =
@@ -3911,26 +3982,17 @@ function runBackupJob(options = {}) {
       // primary re-listed, or a duplicate secondary — is refused rather than
       // silently self-copied. See replicateBackupToLocal.
       const seenLocalPaths = new Set(primaryLocal ? [path.resolve(primaryLocal.path)] : []);
-      const distributions = [];
-      try {
-        for (const destination of resolved.destinations) {
-          if (destination === primaryLocal) continue;
-          distributions.push(
-            destination.type === 'drime'
-              ? { destination, ...uploadDrimeBackup(created, destination, resolved.runtime), removed: [] }
-              : {
-                  destination,
-                  uploaded:
-                    destination.type === 'local'
-                      ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
-                      : uploadBackupToRemote(created, destination, resolved.runtime),
-                  removed: [],
-                },
-          );
+      const uploads = { distributions: [], failures: [] };
+      for (const destination of resolved.destinations) {
+        if (destination === primaryLocal) continue;
+        try {
+          uploads.distributions.push(uploadSyncDestination(created, destination, resolved, seenLocalPaths));
+        } catch (error) {
+          recordUploadFailure(uploads, destination, error);
         }
-      } catch (error) {
-        throw keepResultsOnFailure(error, distributions, created);
       }
+      failOnUploadFailures(uploads, created);
+      const { distributions } = uploads;
       failOnOverCapDrime(distributions, created);
 
       // Retention is applied per destination only after EVERY destination has
@@ -3948,17 +4010,14 @@ function runBackupJob(options = {}) {
           continue;
         }
         const policy = resolveDestinationPolicy(distribution.destination, resolved);
-        distribution.removed =
-          distribution.destination.type === 'drime'
-            ? pruneDrimeBackups(distribution, created.fileName, resolved.runtime, resolved.namePrefix, policy, now)
-            : pruneRemoteBackups(
-                distribution.destination,
-                created.fileName,
-                resolved.runtime,
-                resolved.namePrefix,
-                policy,
-                now,
-              );
+        distribution.removed = pruneRcloneRemoteBackups(
+          distribution,
+          created.fileName,
+          resolved.runtime,
+          resolved.namePrefix,
+          policy,
+          now,
+        );
       }
 
       return finalizeBackupResult(resolved, created, now, distributions);
@@ -4010,8 +4069,7 @@ async function runBackupJobAsync(options = {}) {
 
       // Replicate off-host BEFORE anything is pruned or stamped — see
       // runBackupJob for the full rationale. Uploads run in order (not
-      // parallel) so a failure on destination N leaves destinations after it
-      // untouched, and the ones before it already verified. This also covers
+      // parallel); every destination is attempted even after a failure. This also covers
       // every LOCAL destination beyond the first (the primary/staging one,
       // already on disk at resolved.outputDir) — a local destination that
       // can't be written, or whose copy fails checksum, is exactly as much of
@@ -4020,25 +4078,21 @@ async function runBackupJobAsync(options = {}) {
       // Seeded with the staging/primary destination's resolved path — see
       // runBackupJob for the full rationale.
       const seenLocalPaths = new Set(primaryLocal ? [path.resolve(primaryLocal.path)] : []);
-      const distributions = [];
-      try {
-        for (const destination of resolved.destinations) {
-          if (destination === primaryLocal) continue;
-          if (destination.type === 'drime') {
-            distributions.push({ destination, ...uploadDrimeBackup(created, destination, resolved.runtime), removed: [] });
-            continue;
-          }
-          const uploaded =
-            destination.type === 'local'
-              ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
-              : destination.type === 's3'
-                ? await uploadBackupToS3(created, destination, resolved.runtime)
-                : uploadBackupToRemote(created, destination, resolved.runtime);
-          distributions.push({ destination, uploaded, removed: [] });
+      const uploads = { distributions: [], failures: [] };
+      for (const destination of resolved.destinations) {
+        if (destination === primaryLocal) continue;
+        try {
+          uploads.distributions.push(
+            destination.type === 's3'
+              ? { destination, uploaded: await uploadBackupToS3(created, destination, resolved.runtime), removed: [] }
+              : uploadSyncDestination(created, destination, resolved, seenLocalPaths),
+          );
+        } catch (error) {
+          recordUploadFailure(uploads, destination, error);
         }
-      } catch (error) {
-        throw keepResultsOnFailure(error, distributions, created);
       }
+      failOnUploadFailures(uploads, created);
+      const { distributions } = uploads;
       failOnOverCapDrime(distributions, created);
 
       // Retention is applied per destination only after EVERY destination has
@@ -4066,16 +4120,7 @@ async function runBackupJobAsync(options = {}) {
                 policy,
                 now,
               )
-            : distribution.destination.type === 'drime'
-              ? pruneDrimeBackups(distribution, created.fileName, resolved.runtime, resolved.namePrefix, policy, now)
-              : pruneRemoteBackups(
-                  distribution.destination,
-                  created.fileName,
-                  resolved.runtime,
-                  resolved.namePrefix,
-                  policy,
-                  now,
-                );
+            : pruneRcloneRemoteBackups(distribution, created.fileName, resolved.runtime, resolved.namePrefix, policy, now);
       }
 
       return finalizeBackupResult(resolved, created, now, distributions);
@@ -4201,9 +4246,9 @@ Options:
   --skip-remote           [legacy] Local-only run: no upload, no remote prune
   --dry-run               (command: prune) Print the keep/delete plan with a reason per
                           survivor; delete nothing.
-  --notify-discord <url>  freshness: POST an alert to a Discord webhook on failure
-  --notify-webhook <url>  freshness: POST {"text":...} to a webhook on failure
-  --notify-command <cmd>  freshness: run cmd on failure ($DB_BACKUP_ALERT = message)
+  --notify-discord <url>  freshness/backup: POST an alert to a Discord webhook on failure
+  --notify-webhook <url>  freshness/backup: POST {"text":...} to a webhook on failure
+  --notify-command <cmd>  freshness/backup: run cmd on failure ($DB_BACKUP_ALERT = message)
   --state-file <path>     freshness: alert-suppression state (default:
                           <stamp-file>.alerts.json). Required to suppress in --remote
                           mode, which has no stamp file to derive one from; without it
@@ -4276,8 +4321,38 @@ function runDrimeAuditCommand(options) {
 // runBackupJobAsync at the top level. cli.js (the bin entry) awaits this
 // promise and reports a rejection the same way it used to report a thrown
 // error.
+function notifyOptionsOf(options) {
+  return {
+    notifyDiscord: options.notifyDiscord,
+    notifyWebhook: options.notifyWebhook,
+    notifyCommand: options.notifyCommand,
+    runtime: normalizeRuntime({ commandTimeoutMs: options.resolvedCommandTimeoutMs ?? options.commandTimeoutMs }),
+  };
+}
+
+// Never changes a backup's verdict or replaces its error: no sink means no setup at all.
+function notifyBestEffort(message, options) {
+  if (!options.notifyDiscord && !options.notifyWebhook && !options.notifyCommand) return;
+  try {
+    notifyAlert(message, notifyOptionsOf(options));
+  } catch {
+    console.warn('[db-backup] notification skipped: could not set up the notifier');
+  }
+}
+
+// One notification boundary for `backup`: config resolution, policy validation
+// and the job all fail through here. `--allow-missing` skips return normally.
 async function runCli(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
+  try {
+    await runParsedCli(options);
+  } catch (error) {
+    if (options.command === 'backup') notifyBestEffort(backupFailureAlert(error), options);
+    throw error;
+  }
+}
+
+async function runParsedCli(options) {
 
   if (options.command === 'help') {
     showHelp();
@@ -4556,6 +4631,7 @@ async function runCli(argv = process.argv.slice(2)) {
       : config && config.commandTimeoutSeconds
         ? config.commandTimeoutSeconds * 1000
         : null;
+  options.resolvedCommandTimeoutMs = commandTimeoutMs;
   const stopWritersCommand = options.stopWritersCommand || (config && config.stopWritersCmd) || null;
   const startWritersCommand = options.startWritersCommand || (config && config.startWritersCmd) || null;
   const configDatabaseUrl = !process.env.DATABASE_URL && config && config.databaseUrl ? config.databaseUrl : null;
@@ -4718,6 +4794,9 @@ async function runCli(argv = process.argv.slice(2)) {
     }
     throw error;
   }
+
+  const retentionAlert = retentionFailureAlert(result);
+  if (retentionAlert) notifyBestEffort(retentionAlert, options);
 
   if (options.json) {
     console.log(JSON.stringify(result, null, 2));

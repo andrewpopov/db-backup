@@ -16,4 +16,14 @@ function planFlatRemoteRetention(entries, protectFileName, keep) {
     .map((entry) => entry.fileName);
 }
 
-module.exports = { planFlatRemoteRetention };
+// A path listed twice (two files, or a file and a directory) makes a delete by name ambiguous.
+function ambiguousRemoteNames(names) {
+  const seen = new Set();
+  const ambiguous = new Set();
+  for (const name of names) {
+    (seen.has(name) ? ambiguous : seen).add(name);
+  }
+  return [...ambiguous].sort();
+}
+
+module.exports = { planFlatRemoteRetention, ambiguousRemoteNames };

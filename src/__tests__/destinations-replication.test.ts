@@ -39,6 +39,8 @@ afterEach(() => {
   cleanupTempDirs();
 });
 
+const listing = (names: string[]) => Buffer.from(JSON.stringify(names.map((n) => ({ Path: n, Name: n, IsDir: false }))));
+
 describe('@andrewpopov/db-backup — destinations + off-host replication (rclone, S3/R2)', () => {
   it('uploads off-host and verifies the remote object before pruning or stamping (BWK-131)', () => {
     const cwd = makeTempDir();
@@ -52,12 +54,12 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
       commandExists: (c: string) => c === 'rclone',
       execFileSync: ((cmd: string, args: string[]) => {
         calls.push([cmd, ...args]);
-        if (args[0] === 'lsjson') {
+        if (args[0] === 'lsjson' && args.includes('--stat')) {
           // Report the real local size so verification passes.
           const local = fs.statSync(path.join(outputDir, fs.readdirSync(outputDir).find((f) => f.startsWith('sqlite-backup-') && f.endsWith('.db'))!)).size;
           return Buffer.from(JSON.stringify({ Size: local }));
         }
-        if (args[0] === 'lsf') return Buffer.from('');
+        if (args[0] === 'lsjson') return listing([]);
         return Buffer.from('');
       }) as never,
     });
@@ -72,7 +74,7 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
     expect(verbs).toContain('copyto');
     expect(verbs).toContain('lsjson');
     // Upload+verify must precede any pruning.
-    expect(verbs.indexOf('lsjson')).toBeLessThan(verbs.indexOf('lsf') === -1 ? Infinity : verbs.indexOf('lsf'));
+    expect(verbs.lastIndexOf('lsjson'), 'stat verify first, then the prune listing').toBeGreaterThan(verbs.indexOf('lsjson'));
     expect(result.uploaded).toMatchObject({ target: `offsite:backups/app/${result.created.fileName}` });
     expect(fs.existsSync(stampFile)).toBe(true);
   });
@@ -206,7 +208,7 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
     const runtime = makeRuntime({
       commandExists: (c: string) => c === 'rclone',
       execFileSync: ((_c: string, args: string[]) => {
-        if (args[0] === 'lsjson') {
+        if (args[0] === 'lsjson' && args.includes('--stat')) {
           const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-') && n.endsWith('.db'))!;
           return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
         }
@@ -280,15 +282,13 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
     const runtime = makeRuntime({
       commandExists: (c: string) => c === 'rclone',
       execFileSync: ((_c: string, args: string[]) => {
-        if (args[0] === 'lsjson') {
+        if (args[0] === 'lsjson' && args.includes('--stat')) {
           const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-') && n.endsWith('.db'))!;
           return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
         }
-        if (args[0] === 'lsf') {
+        if (args[0] === 'lsjson') {
           // The just-uploaded object sorts OLDEST here (clock rolled backward).
-          return Buffer.from(
-            ['sqlite-backup-20260709-120000Z.db', 'sqlite-backup-20260708-120000Z.db', 'sqlite-backup-20260705-150000Z.db'].join('\n'),
-          );
+          return listing(['sqlite-backup-20260709-120000Z.db', 'sqlite-backup-20260708-120000Z.db', 'sqlite-backup-20260705-150000Z.db']);
         }
         if (args[0] === 'deletefile') deleted.push(String(args[1]));
         return Buffer.from('');
@@ -372,15 +372,13 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
     const runtime = makeRuntime({
       commandExists: (c: string) => c === 'rclone',
       execFileSync: ((_c: string, args: string[]) => {
-        if (args[0] === 'lsjson') {
+        if (args[0] === 'lsjson' && args.includes('--stat')) {
           const f = fs.readdirSync(outputDir).find((n) => n.startsWith('smarthome-') && n.endsWith('.db'))!;
           return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
         }
-        if (args[0] === 'lsf') {
+        if (args[0] === 'lsjson') {
           // A shared bucket holding two apps' backups.
-          return Buffer.from(
-            ['smarthome-20260101-000000Z.db', 'smarthome-20260102-000000Z.db', 'otherapp-20260101-000000Z.db'].join('\n'),
-          );
+          return listing(['smarthome-20260101-000000Z.db', 'smarthome-20260102-000000Z.db', 'otherapp-20260101-000000Z.db']);
         }
         if (args[0] === 'deletefile') deleted.push(String(args[1]));
         return Buffer.from('');
@@ -812,16 +810,14 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
       commandExists: (c: string) => c === 'rclone',
       execFileSync: ((_c: string, args: string[]) => {
         calls.push(args);
-        if (args[0] === 'lsjson') {
+        if (args[0] === 'lsjson' && args.includes('--stat')) {
           const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-') && n.endsWith('.db'))!;
           return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
         }
-        if (args[0] === 'lsf') {
+        if (args[0] === 'lsjson') {
           // Plenty of "old" objects that WOULD be pruned under keep:1 if
           // pruning ran at all — proves the skip, not just an empty listing.
-          return Buffer.from(
-            ['sqlite-backup-20260709-120000Z.db', 'sqlite-backup-20260708-120000Z.db', 'sqlite-backup-20260705-150000Z.db'].join('\n'),
-          );
+          return listing(['sqlite-backup-20260709-120000Z.db', 'sqlite-backup-20260708-120000Z.db', 'sqlite-backup-20260705-150000Z.db']);
         }
         if (args[0] === 'deletefile') deleted.push(String(args[1]));
         return Buffer.from('');
@@ -834,7 +830,7 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
     });
 
     expect(calls.some((c) => c[0] === 'copyto'), 'upload must still happen').toBe(true);
-    expect(calls.some((c) => c[0] === 'lsf' || c[0] === 'deletefile'), 'must never even list/delete for pruning').toBe(false);
+    expect(calls.some((c) => (c[0] === 'lsjson' && !c.includes('--stat')) || c[0] === 'deletefile'), 'must never even list/delete for pruning').toBe(false);
     expect(deleted).toEqual([]);
   });
 
@@ -848,14 +844,12 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
     const runtime = makeRuntime({
       commandExists: (c: string) => c === 'rclone',
       execFileSync: ((_c: string, args: string[]) => {
-        if (args[0] === 'lsjson') {
+        if (args[0] === 'lsjson' && args.includes('--stat')) {
           const f = fs.readdirSync(outputDir).find((n) => n.startsWith('sqlite-backup-') && n.endsWith('.db'))!;
           return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, f)).size }));
         }
-        if (args[0] === 'lsf') {
-          return Buffer.from(
-            ['sqlite-backup-20260709-120000Z.db', 'sqlite-backup-20260708-120000Z.db', 'sqlite-backup-20260705-150000Z.db'].join('\n'),
-          );
+        if (args[0] === 'lsjson') {
+          return listing(['sqlite-backup-20260709-120000Z.db', 'sqlite-backup-20260708-120000Z.db', 'sqlite-backup-20260705-150000Z.db']);
         }
         if (args[0] === 'deletefile') deleted.push(String(args[1]));
         return Buffer.from('');
@@ -1553,10 +1547,10 @@ describe('@andrewpopov/db-backup — destinations + off-host replication (rclone
       const execFileSync = ((_c: string, args: string[]) => {
         if (args[0] === 'copyto') {
           objects.add(String(args[2]).split('/').pop()!);
-        } else if (args[0] === 'lsjson') {
+        } else if (args[0] === 'lsjson' && args.includes('--stat')) {
           return Buffer.from(JSON.stringify({ Size: fs.statSync(path.join(outputDir, NEW_NAME)).size }));
-        } else if (args[0] === 'lsf') {
-          return Buffer.from([...objects].join('\n'));
+        } else if (args[0] === 'lsjson') {
+          return listing([...objects]);
         } else if (args[0] === 'deletefile') {
           const name = String(args[1]).split('/').pop()!;
           deleted.push(name);

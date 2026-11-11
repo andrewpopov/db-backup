@@ -379,6 +379,8 @@ export interface BackupPlan {
   policy: RetentionPolicy;
 }
 
+export type PruneFailureReason = 'list-failed' | 'ambiguous-inventory' | 'planning-failed' | 'delete-failed';
+
 /** Per-destination upload/prune result — one entry per destination in
  * `BackupOptions.destinations` OTHER than the primary (the first `local`
  * destination, which stages the artifact directly rather than being copied
@@ -390,14 +392,16 @@ export interface BackupPlan {
  * with the single-remote era. */
 export interface BackupDestinationResult {
   destination: BackupDestination;
-  /** Null only for a `drime` destination skipped as over-cap (the run then fails). */
+  /** Null for a `drime` destination skipped as over-cap or any destination whose upload failed (the run then fails). */
   uploaded: BackupUploadResult | null;
+  /** Set only on `error.destinationResults`: this destination's upload threw. */
+  uploadFailed?: boolean;
   /** Filenames pruned at this destination after its verified upload. */
   removed: string[];
   /** `drime` destinations only. */
   outcome?: DrimeOutcome;
-  /** `drime` destinations only: set when pruning missed objects (the run still succeeds). */
-  pruneFailed?: { overKeep: number | null };
+  /** Set when pruning an rclone or `drime` destination missed objects or was refused (the run still succeeds). */
+  pruneFailed?: { overKeep: number | null; reason: PruneFailureReason; ambiguous?: number };
 }
 
 export interface BackupJobResult {
