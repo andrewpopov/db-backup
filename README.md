@@ -358,6 +358,65 @@ db-backup backup --prod \
 The upload, byte-verification, and remote retention described above apply
 unchanged — the remote is opaque to `db-backup`.
 
+### Drime (encrypted primary offsite)
+
+```bash
+db-backup backup --prod --dest drime:app-name --stamp-file /var/lib/app/backups/.last-success
+```
+
+A `drime` destination (`{ type: 'drime', path: 'app-name' }`) stores every
+backup encrypted with rclone crypt (standard file names, encrypted directory
+names, encrypted data). db-backup builds the whole rclone context itself, so
+nothing comes from ambient rclone config:
+
+- Credentials come only from `envFile` (default `/etc/db-backup/drime.env`,
+  override with `envFile` or `--drime-env-file`), read as plain `KEY=VALUE`
+  lines with no shell. It must hold the base remote (`RCLONE_CONFIG_DRIME_TYPE=drime`
+  and `RCLONE_CONFIG_DRIME_ACCESS_TOKEN`, nothing else) and the crypt remote
+  (`RCLONE_CONFIG_DRIMECRYPT_REMOTE=drime:<root>`, `_PASSWORD`, `_PASSWORD2`,
+  optionally `_TYPE=crypt`, `_FILENAME_ENCRYPTION=standard`,
+  `_DIRECTORY_NAME_ENCRYPTION=true`, `_NO_DATA_ENCRYPTION=false`). `<root>` is
+  one non-empty path component. Any other option in either section (for example
+  `root_folder_id`) is refused, as is an unreadable env file, before any backup
+  work. `baseRemote` and `cryptRemote` rename the two remotes (`drime`, `drimecrypt`).
+- Each rclone child runs with an allowlisted environment (`PATH`, `HOME`,
+  `TMPDIR`, `LANG`, `LC_*`); every inherited `RCLONE_*` variable is dropped and
+  `RCLONE_CONFIG` points at an empty private file. The encryption settings are
+  code constants, so a human running plain rclone with the same env file reads
+  and writes the identical layout.
+- A failed rclone call surfaces as `rclone <op> failed (exit N)` only. Child
+  output is never attached to an error, because it can echo credentials.
+- **Size cap.** `maxBytes` (default 5000000000, decimal bytes, positive safe
+  integer) applies to the final local artifact, after optional gpg. Crypt adds
+  `32 + 16 * ceil(bytes / 65536)` bytes, about 0.0244%, so a 5,000,000,000 byte
+  backup is stored as 5,001,220,736 bytes. An over-cap backup is not uploaded to
+  Drime, the other destinations still run, and then the run **fails**: nothing
+  is pruned, no success is stamped, the staged artifact stays, and the error
+  names the set and size. The result carries `{ status: 'skipped-over-cap', size, maxBytes }`.
+- **Retention.** `keep` defaults to 10 and wins over a GFS plan, so exactly 10
+  objects remain, the new one included. A prune failure logs a distinct
+  `ALERT drime prune failed` line and sets `pruneFailed` on the destination
+  result, but does not fail the run.
+
+A generic `rclone` destination refuses to write to Drime: its remote type is
+resolved with `rclone listremotes --long --json` using the same config and
+environment as the upload, and type `drime`, any wrapper type (alias, union,
+combine, chunker, hasher, compress, crypt, cache), an inline connection-string
+target, or an unresolvable remote is refused. Use a `drime` destination.
+
+```bash
+db-backup drime-audit [--env-file <path>] [--base-remote drime] [--crypt-remote drimecrypt]
+```
+
+`drime-audit` checks that the raw top level holds only the crypt root, that
+every raw file and directory name decrypts through the crypt remote (strict
+names), and that every raw file starts with the rclone crypt header
+(`RCLONE\0\0`). It proves rclone-crypt format, not that a backup restores.
+Drime allows duplicate names, so a duplicated path (or crypt root) is a finding:
+an ambiguous inventory is never reported clean. Exit 0 clean, 1 a demonstrated
+violation (each finding names the raw path), 2 the audit could not complete
+(transport, timeout, malformed output). `--json` prints the report.
+
 ### Native S3 remote (no rclone) — AWS S3 or Cloudflare R2
 
 If you'd rather not install and configure `rclone` at all, `--s3-bucket`

@@ -28,20 +28,32 @@ export function makeTempDir() {
   return dir;
 }
 
+export interface FakeRemote { name: string; type: string }
+
+// What the fake `rclone listremotes --long --json` reports. Pass `remotes: null`
+// to let the test's own execFileSync answer it instead.
+export const DEFAULT_TEST_REMOTES: FakeRemote[] = ['offsite', 'r2', 'r'].map((name) => ({ name, type: 's3' }));
+
 export function makeRuntime(overrides: Partial<{
   commandExists: (command: string) => boolean;
-  execFileSync: (command: string, args: string[], options?: unknown) => void;
+  execFileSync: (command: string, args: string[], options?: unknown) => unknown;
   sleep: (ms: number) => void;
   now: () => Date;
   randomId: () => string;
+  env: Record<string, string | undefined>;
+  remotes: FakeRemote[] | null;
 }> = {}) {
+  const { remotes = DEFAULT_TEST_REMOTES, ...rest } = overrides;
   return {
     commandExists: () => false,
-    execFileSync: () => undefined,
     sleep: () => undefined,
     now: () => fixedNow,
     randomId: () => 'fixed-restore-id',
-    ...overrides,
+    ...rest,
+    execFileSync: (command: string, args: string[], options?: unknown) =>
+      remotes && command === 'rclone' && args[0] === 'listremotes'
+        ? Buffer.from(JSON.stringify(remotes))
+        : rest.execFileSync?.(command, args, options),
   };
 }
 
