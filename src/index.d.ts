@@ -547,7 +547,7 @@ export interface InstallScheduleOptions {
 
 export interface InstallScheduleDeps {
   readFile?: (path: string, encoding: 'utf8') => string;
-  exists?: (path: string) => boolean;
+  isDirectory?: (path: string) => boolean;
   getUid?: () => number | undefined;
   read?: () => string;
   write?: (content: string) => void;

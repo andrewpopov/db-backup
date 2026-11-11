@@ -1,7 +1,16 @@
+import { createRequire } from 'module';
 import { describe, expect, it, vi } from 'vitest';
 
 import { dbBackup } from './helpers';
 
+const { readCrontab, planCrontabBlock } = createRequire(import.meta.url)('../crontab.js') as {
+  readCrontab: (run?: (...args: unknown[]) => unknown) => string;
+  planCrontabBlock: (
+    text: string,
+    block: { start: string; end: string; lines: string[] },
+    replacements?: { lines?: string[]; blocks?: Array<{ start: string; end: string }> },
+  ) => { text: string; warnings: string[] };
+};
 const { validateSchedule, renderScheduleBlock, replaceCrontabBlock, installSchedule, runCli } = dbBackup;
 
 const BACKUP_JOB = {
@@ -21,8 +30,8 @@ const SCHEDULE = { name: 'app', cwd: '/srv/app', jobs: [BACKUP_JOB, DRILL_JOB] }
 
 const BLOCK_LINES = [
   '# db-backup:app',
-  "58 0 * * 0 cd '/srv/app' && set -a && . /etc/db-backup/s3.env && set +a && npm run backup >> '/srv/app-backups/backup.log' 2>&1",
-  "30 4 * * 0 cd '/srv/app' && npm run ops:restore-drill -- --latest >> '/srv/app-backups/drill.log' 2>&1",
+  "58 0 * * 0 cd '/srv/app' && ( set -a && . /etc/db-backup/s3.env && set +a && npm run backup ) >> '/srv/app-backups/backup.log' 2>&1",
+  "30 4 * * 0 cd '/srv/app' && ( npm run ops:restore-drill -- --latest ) >> '/srv/app-backups/drill.log' 2>&1",
   '# /db-backup:app',
 ];
 
@@ -85,7 +94,7 @@ function install(
   const run = () =>
     installSchedule(options, {
       readFile: () => JSON.stringify(schedule),
-      exists: () => true,
+      isDirectory: () => true,
       getUid: () => 1000,
       read: crontab.read,
       write: crontab.write,
@@ -113,6 +122,11 @@ describe('validateSchedule', () => {
     ['cron weekday name', withJob({ cron: '0 3 * * sun' }), /jobs\[0\]\.cron/],
     ['empty command', withJob({ command: '  ' }), /jobs\[0\]\.command: must be a non-empty string/],
     ['percent in command', withJob({ command: "date +%F" }), /jobs\[0\]\.command: has an unescaped %/],
+    ['even backslashes before percent', withJob({ command: 'date +\\\\%F' }), /jobs\[0\]\.command: has an unescaped %/],
+    ['word-leading hash', withJob({ command: 'npm run backup # nightly' }), /jobs\[0\]\.command: has a # starting a word/],
+    ['backslash in cwd', { ...SCHEDULE, cwd: '/srv/a\\b' }, /cwd: must not contain a newline, % or backslash/],
+    ['percent in log', withJob({ log: '/var/log/%d.log' }), /jobs\[0\]\.log: must not contain/],
+    ['backslash in log', withJob({ log: '/var/log/a\\b.log' }), /jobs\[0\]\.log: must not contain/],
     ['relative log', withJob({ log: 'backup.log' }), /jobs\[0\]\.log: must be an absolute path/],
     ['missing log', withJob({ log: undefined }), /jobs\[0\]\.log: must be a non-empty string/],
     ['after unknown id', withJob({ after: 'nope' }), /jobs\[0\]\.after: no job with id "nope"/],
@@ -121,8 +135,9 @@ describe('validateSchedule', () => {
     expect(() => validateSchedule(schedule)).toThrow(message);
   });
 
-  it('accepts an escaped percent', () => {
+  it('accepts an escaped percent and a mid-word hash', () => {
     expect(() => validateSchedule(withJob({ command: 'date +\\%F' }))).not.toThrow();
+    expect(() => validateSchedule(withJob({ command: 'echo a#b "$#"' }))).not.toThrow();
   });
 
   it('rejects duplicate ids', () => {
@@ -164,6 +179,8 @@ describe('validateSchedule', () => {
       ['a step in the hour field', '0 */2 * * 0', '0 4 * * 0'],
       ['a day-of-month restriction', '0 3 1 * 0', '0 4 * * 0'],
       ['a month restriction', '0 3 * 1 0', '0 4 * * 0'],
+      ['a full-range day-of-month on the drill', '0 3 * * 0', '0 5 1-31 * 0'],
+      ['a full-range month on the backup', '0 3 * 1-12 0', '0 5 * * 0'],
     ])('refuses rather than guesses with %s', (_label, backupCron, drillCron) => {
       expect(() => validateSchedule(ordered(backupCron, drillCron))).toThrow(/cannot prove the ordering/);
     });
@@ -175,13 +192,18 @@ describe('renderScheduleBlock', () => {
     expect(renderScheduleBlock(SCHEDULE).lines).toEqual(BLOCK_LINES.slice(1, 3));
   });
 
+  it.each(['a || b', 'a; b'])('keeps the cd guard and the log for %s', (command) => {
+    const [line] = renderScheduleBlock({ name: 'app', cwd: '/srv/app', jobs: [{ ...BACKUP_JOB, command }] }).lines;
+    expect(line).toBe(`58 0 * * 0 cd '/srv/app' && ( ${command} ) >> '/srv/app-backups/backup.log' 2>&1`);
+  });
+
   it("escapes a single quote in cwd and log", () => {
     const rendered = renderScheduleBlock({
       name: 'app',
       cwd: "/srv/o'brien",
       jobs: [{ ...BACKUP_JOB, log: "/var/log/it's.log" }],
     });
-    expect(rendered.lines[0]).toContain(`cd '/srv/o'\\''brien' &&`);
+    expect(rendered.lines[0]).toContain(`cd '/srv/o'\\''brien' && (`);
     expect(rendered.lines[0]).toContain(`>> '/var/log/it'\\''s.log' 2>&1`);
   });
 });
@@ -234,9 +256,53 @@ describe('replaceCrontabBlock', () => {
     expect(next.indexOf('# db-backup:app')).toBe(0);
   });
 
-  it('does not match --replace-line against lines inside its own block', () => {
+  it('refuses a --replace-line that matches inside its own block', () => {
     const installed = replaceCrontabBlock(HOST_CRONTAB, block(), { lines: ['db-backup-nightly'] });
-    expect(() => replaceCrontabBlock(installed, block(), { lines: ['npm run backup'] })).toThrow(/matched 0 crontab entry lines/);
+    expect(() => replaceCrontabBlock(installed, block(), { lines: ['npm run backup'] })).toThrow(
+      /matches a line inside block db-backup:app/,
+    );
+  });
+
+  it("refuses a --replace-line that matches inside another app's marked block", () => {
+    const other = ['# db-backup:other', "0 1 * * 0 cd '/srv/other' && ( npm run backup ) >> '/l' 2>&1", '# /db-backup:other'];
+    const text = `${HOST_CRONTAB}${other.join('\n')}\n`;
+    expect(() => replaceCrontabBlock(text, block(), { lines: ['# db-backup-nightly', 'srv/other'] })).toThrow(
+      /matches a line inside block db-backup:other/,
+    );
+  });
+
+  it('refuses a --replace-line that matches inside a generic marked block', () => {
+    expect(() => replaceCrontabBlock(HOST_CRONTAB, block(), { lines: ['run-monitor.sh'] })).toThrow(
+      /matches a line inside block app-monitor-5m/,
+    );
+  });
+
+  it('never matches an environment line, so PATH= survives a matching substring', () => {
+    const next = replaceCrontabBlock(HOST_CRONTAB, block(), { lines: ['db-backup-nightly'] });
+    expect(next).toContain('PATH=/usr/local/bin:/usr/bin:/bin');
+    expect(() => replaceCrontabBlock('PATH=/usr/bin\n', block(), { lines: ['/usr/bin'] })).toThrow(/matched no crontab entry line/);
+  });
+
+  it('treats zero matches as a warning once its block is installed, and an error before', () => {
+    const installed = replaceCrontabBlock(HOST_CRONTAB, block(), { lines: ['db-backup-nightly'] });
+    const replacements = { lines: ['db-backup-nightly'], blocks: OLD_BLOCKS.slice(0, 1) };
+    const plan = planCrontabBlock(installed, block(), replacements);
+    expect(plan.text).toBe(installed);
+    expect(plan.warnings).toHaveLength(2);
+    expect(() => replaceCrontabBlock(HOST_CRONTAB, block(), { lines: ['db-backup-nighlty'] })).toThrow(
+      /matched no crontab entry line and the schedule is not installed yet/,
+    );
+    expect(() => replaceCrontabBlock(HOST_CRONTAB, block(), { blocks: OLD_BLOCKS })).toThrow(
+      /matched no block and the schedule is not installed yet/,
+    );
+  });
+
+  it('still removes a single match and fails on two once its block is installed', () => {
+    const installed = replaceCrontabBlock(HOST_CRONTAB, block(), { lines: ['db-backup-nightly'] });
+    const withLegacy = `${installed}0 3 * * * npm run backup # old-tag\n`;
+    expect(replaceCrontabBlock(withLegacy, block(), { lines: ['old-tag'] })).toBe(installed);
+    const twice = `${withLegacy}0 4 * * * npm run backup # old-tag\n`;
+    expect(() => replaceCrontabBlock(twice, block(), { lines: ['old-tag'] })).toThrow(/matched 2 crontab entry lines, expected at most 1/);
   });
 
   describe('fails closed', () => {
@@ -274,16 +340,16 @@ describe('replaceCrontabBlock', () => {
     });
 
     it('on a --replace-line matching no line', () => {
-      expect(closeTo(HOST_CRONTAB, { lines: ['no-such-job'] })).toThrow(/matched 0 crontab entry lines, expected exactly 1/);
+      expect(closeTo(HOST_CRONTAB, { lines: ['no-such-job'] })).toThrow(/matched no crontab entry line/);
     });
 
     it('on a --replace-line matching two lines', () => {
       const text = '0 3 * * * npm run backup\n0 4 * * * npm run backup\n';
-      expect(closeTo(text, { lines: ['npm run backup'] })).toThrow(/matched 2 crontab entry lines, expected exactly 1/);
+      expect(closeTo(text, { lines: ['npm run backup'] })).toThrow(/matched 2 crontab entry lines, expected at most 1/);
     });
 
     it('on a --replace-line that only matches a comment', () => {
-      expect(closeTo('# npm run backup\n', { lines: ['npm run backup'] })).toThrow(/matched 0/);
+      expect(closeTo('# npm run backup\n', { lines: ['npm run backup'] })).toThrow(/matched no crontab entry line/);
     });
 
     it('on two --replace-line values naming the same line', () => {
@@ -316,7 +382,7 @@ describe('installSchedule', () => {
     run();
     const rerun = installSchedule({}, {
       readFile: () => JSON.stringify(SCHEDULE),
-      exists: () => true,
+      isDirectory: () => true,
       getUid: () => 1000,
       read: crontab.read,
       write: crontab.write,
@@ -345,7 +411,7 @@ describe('installSchedule', () => {
     expect(() =>
       installSchedule({}, {
         readFile: () => JSON.stringify(SCHEDULE),
-        exists: () => true,
+        isDirectory: () => true,
         getUid: () => 1000,
         read: crontab.read,
         write: () => undefined,
@@ -361,12 +427,57 @@ describe('installSchedule', () => {
   });
 
   it('refuses a real install when cwd is missing, and only warns on a dry run', () => {
-    const missing = { exists: () => false };
+    const missing = { isDirectory: (directory: string) => directory !== '/srv/app' };
     const real = install('', {}, missing);
-    expect(real.run).toThrow(/cwd \/srv\/app does not exist/);
+    expect(real.run).toThrow(/cwd \/srv\/app is not an existing directory/);
     expect(real.crontab.state.writes).toEqual([]);
     const dry = install('', { dryRun: true }, missing).run();
-    expect(dry.warnings).toEqual(['cwd /srv/app does not exist']);
+    expect(dry.warnings).toEqual(['cwd /srv/app is not an existing directory']);
+  });
+
+  it('refuses a real install when a log directory is missing, and only warns on a dry run', () => {
+    const missing = { isDirectory: (directory: string) => directory !== '/srv/app-backups' };
+    const real = install('', {}, missing);
+    expect(real.run).toThrow(/log directory \/srv\/app-backups is not an existing directory/);
+    expect(real.crontab.state.writes).toEqual([]);
+    const dry = install('', { dryRun: true }, missing).run();
+    expect(dry.warnings).toEqual(['log directory /srv/app-backups is not an existing directory']);
+  });
+
+  it('keeps --replace-line and --replace-block in the hook: the rerun is a no-op that writes nothing', () => {
+    const options = { replaceLines: ['db-backup-nightly'], replaceBlocks: OLD_BLOCKS };
+    const crontab = fakeCrontab(`${HOST_CRONTAB}${TOWERPOWER_CRONTAB}`);
+    const deps = {
+      readFile: () => JSON.stringify(SCHEDULE),
+      isDirectory: () => true,
+      getUid: () => 1000,
+      read: crontab.read,
+      write: crontab.write,
+    };
+    expect(installSchedule(options, deps)).toMatchObject({ changed: true, written: true });
+    const rerun = installSchedule(options, deps);
+    expect(rerun).toMatchObject({ changed: false, written: false });
+    expect(rerun.warnings).toHaveLength(3);
+    expect(crontab.state.writes).toHaveLength(1);
+  });
+
+  it('refuses to write when the crontab changed after it was planned against', () => {
+    const crontab = fakeCrontab(HOST_CRONTAB);
+    let reads = 0;
+    const racing = () => {
+      reads += 1;
+      return reads === 1 ? HOST_CRONTAB : `${HOST_CRONTAB}0 9 * * * someone-else\n`;
+    };
+    const run = () =>
+      installSchedule({}, {
+        readFile: () => JSON.stringify(SCHEDULE),
+        isDirectory: () => true,
+        getUid: () => 1000,
+        read: racing,
+        write: crontab.write,
+      });
+    expect(run).toThrow(/crontab changed while the new schedule was being planned/);
+    expect(crontab.state.writes).toEqual([]);
   });
 
   describe('timezone lines', () => {
@@ -412,5 +523,40 @@ describe('install-schedule CLI', () => {
   it('requires two different markers for --replace-block', async () => {
     await expect(runCli(['install-schedule', '--replace-block', '# only'])).rejects.toThrow(/--replace-block requires/);
     await expect(runCli(['install-schedule', '--replace-block', 'a=a'])).rejects.toThrow(/--replace-block requires/);
+  });
+});
+
+describe('readCrontab', () => {
+  const failing = (fields: Record<string, unknown>) => () => {
+    throw Object.assign(new Error('Command failed'), fields);
+  };
+
+  it('returns the text crontab -l prints', () => {
+    expect(readCrontab(() => HOST_CRONTAB)).toBe(HOST_CRONTAB);
+  });
+
+  it('treats exit 1 with "no crontab for x" as empty', () => {
+    expect(readCrontab(failing({ status: 1, stderr: 'no crontab for app\n' }))).toBe('');
+  });
+
+  it('throws on exit 1 with "not allowed"', () => {
+    expect(() => readCrontab(failing({ status: 1, stderr: 'You (app) are not allowed to use this program (crontab)\n' }))).toThrow(
+      /Command failed/,
+    );
+  });
+
+  it('throws when the crontab binary is missing', () => {
+    expect(() => readCrontab(failing({ code: 'ENOENT', errno: -2 }))).toThrow(/Command failed/);
+  });
+
+  it.each([
+    ['a literal \\r at the end of a line', '0 3 * * * x\\r\n'],
+    ['a literal \\b', '0 3 * * * grep \\bfoo\n'],
+  ])('refuses %s', (_label, text) => {
+    expect(() => readCrontab(() => text)).toThrow('crontab contains escaped control characters; fix by hand');
+  });
+
+  it('keeps a real carriage return as ordinary text rather than normalising it', () => {
+    expect(readCrontab(() => '0 3 * * * x\r\n')).toBe('0 3 * * * x\r\n');
   });
 });

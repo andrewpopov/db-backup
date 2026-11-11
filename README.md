@@ -737,13 +737,13 @@ The block it writes:
 
 ```
 # db-backup:myapp
-58 0 * * 0 cd '/srv/myapp' && set -a && . /etc/db-backup/s3.env && set +a && npm run backup >> '/srv/myapp-backups/backup.log' 2>&1
-30 4 * * 0 cd '/srv/myapp' && npm run ops:restore-drill -- --latest >> '/srv/myapp-backups/drill.log' 2>&1
+58 0 * * 0 cd '/srv/myapp' && ( set -a && . /etc/db-backup/s3.env && set +a && npm run backup ) >> '/srv/myapp-backups/backup.log' 2>&1
+30 4 * * 0 cd '/srv/myapp' && ( npm run ops:restore-drill -- --latest ) >> '/srv/myapp-backups/drill.log' 2>&1
 # /db-backup:myapp
 ```
 
-`cwd` and `log` are shell-quoted. `command` is free-form shell and the log redirect attaches to its
-last command. Job `id`s are the stable identity; extra jobs (a freshness check, a status line) are just more jobs.
+`cwd` and `log` are shell-quoted. `command` is free-form shell, run in a subshell so `a || b` and `a; b`
+keep the `cd` guard and the log redirect. Job `id`s are the stable identity; extra jobs (a freshness check, a status line) are just more jobs.
 
 ```bash
 db-backup install-schedule [--config <path>] [--dry-run] [--json] [--strict] \
@@ -752,19 +752,21 @@ db-backup install-schedule [--config <path>] [--dry-run] [--json] [--strict] \
 
 Validation fails with a message naming the field:
 
-- `name` matches `[a-z0-9-]+` and `cwd` is absolute.
+- `name` matches `[a-z0-9-]+`; `cwd` and each `log` are absolute and contain no `%` or backslash.
 - Each job has a unique `id`, a 5-field cron (digits, `*`, `,`, `-`, `/`; no `@` shortcuts or names), a non-empty `command` and an absolute `log`.
-- An unescaped `%` in `command` is refused (cron turns it into a newline); write `\%`.
-- `after: <id>` requires the job to run strictly later than that job on every day both run. This is proven for a fixed minute and hour with day-of-week sets compared; a range or step in the minute or hour, or a day-of-month or month restriction, is refused rather than guessed.
+- An unescaped `%` in `command` is refused (cron turns it into a newline); write `\%`. A `%` counts as escaped only after an odd number of backslashes. A `#` that starts a word in `command` is refused (cron would drop the rest of the line).
+- `after: <id>` requires the job to run strictly later than that job on every day both run. This is proven for a fixed minute and hour with day-of-week sets compared; a range or step in the minute or hour is refused rather than guessed. Both jobs must also use a literal `*` for day-of-month and month, because cron ORs day-of-month with day-of-week unless the field is a literal `*`.
 - Unknown keys are refused, so a typo like `afer` cannot silently drop a guard.
 
 Guards:
 
 - Refuses to run as root. Run it as the app's service user: the crontab it edits is the invoking user's.
-- A real install refuses when `cwd` does not exist; `--dry-run` only warns.
+- A real install refuses when `cwd` is not a directory or a job's log directory does not exist; `--dry-run` only warns.
+- Refuses to read a crontab where a line ends in a literal `\r` or contains a literal `\b` (Debian `crontab -l` prints control characters that way): `crontab contains escaped control characters; fix by hand`.
+- Refuses to write if the crontab changed between planning and writing.
 - Exactly one `# db-backup:<name>` / `# /db-backup:<name>` pair is replaced in place. A duplicate, unpaired, nested or overlapping marker fails with nothing written.
-- `--replace-line <substring>` removes the old unmarked host line. It must match exactly one non-comment line outside any managed block, or the command fails.
-- `--replace-block <start>=<end>` removes an old marked block. It must match exactly one well-formed pair.
+- `--replace-line <substring>` removes the old unmarked host line. Comment lines and environment lines (`PATH=...`) never match. A match inside any marked block (`# db-backup:<id>` pairs and any other `# X` ... `# /X` pair) fails, so use a distinctive tag. Two or more matches always fail. Zero matches fails until the schedule's own block is installed, which catches a typo on the first migration; after that it is a no-op recorded in `warnings`, so the flag can stay in the deploy hook.
+- `--replace-block <start>=<end>` removes an old marked block. It must match exactly one well-formed pair; zero matches follows the same rule as `--replace-line`.
 - The new block takes the position of the FIRST removed item (a legacy line or block, or the existing block), so it does not inherit a `SHELL=` or `PATH=` set further down. With nothing removed it is appended.
 - A `TZ=` or `CRON_TZ=` line in the crontab produces a warning, because Debian cron ignores both on this fleet and the schedule runs in host local time. `--strict` makes it a failure.
 - `--dry-run` prints a unified-style diff and writes nothing. A real run writes with `crontab -`, re-reads the crontab and verifies it. A rerun with no change prints `unchanged` and does not write.
@@ -777,8 +779,9 @@ To install on every deploy with `@andrewpopov/deploy-kit`, add a post-deploy che
 { "command": "npx db-backup install-schedule", "onFailure": "remain-active" }
 ```
 
-The first deploy on a host that already has the old line or blocks passes `--replace-line` or
-`--replace-block` once (preview with `--dry-run` first), for example
+A host that already has the old line or blocks passes `--replace-line` or `--replace-block` in that same
+command and keeps it there: once migrated, the flag is a no-op. Pick a distinctive tag from the old line
+(preview with `--dry-run` first), for example
 `npx db-backup install-schedule --replace-line '# db-backup-nightly'`.
 
 The `cron` command and `buildDailyCronEntry` are **deprecated**: they print a daily entry for you to

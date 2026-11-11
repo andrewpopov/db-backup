@@ -1,9 +1,9 @@
 const { execFileSync } = require('child_process');
 
+const ENV_LINE = /^\s*[A-Za-z_][A-Za-z0-9_]*\s*=/;
+
 function normalizeCrontab(text) {
-  return String(text || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\n*$/, '\n');
+  return String(text || '').replace(/\n*$/, '\n');
 }
 
 function splitLines(text) {
@@ -16,12 +16,17 @@ function indexesOf(lines, marker) {
   return lines.reduce((found, line, index) => (line.trim() === marker ? [...found, index] : found), []);
 }
 
-function isEntryLine(line) {
+function isReplaceableLine(line) {
   const trimmed = line.trim();
-  return trimmed !== '' && !trimmed.startsWith('#');
+  return trimmed !== '' && !trimmed.startsWith('#') && !ENV_LINE.test(trimmed);
 }
 
-function locatePair(lines, start, end, owner, { required }) {
+function markerText(line) {
+  const trimmed = line.trim();
+  return trimmed.startsWith('#') ? trimmed.slice(1).trim() : null;
+}
+
+function locatePair(lines, start, end, owner) {
   const starts = indexesOf(lines, start);
   const ends = indexesOf(lines, end);
   if (starts.length > 1 || ends.length > 1) {
@@ -30,12 +35,25 @@ function locatePair(lines, start, end, owner, { required }) {
   if (starts.length !== ends.length) {
     throw new Error(`${owner} start and end markers (${start}) do not pair; refusing to alter crontab`);
   }
-  if (starts.length === 0) {
-    if (required) throw new Error(`${owner} matched no block (${start} ... ${end}); refusing to alter crontab`);
-    return null;
-  }
+  if (starts.length === 0) return null;
   if (ends[0] <= starts[0]) throw new Error(`${end} appears before ${start}; refusing to alter crontab`);
   return { owner, start: starts[0], end: ends[0] };
+}
+
+function markedRanges(lines) {
+  const ranges = [];
+  lines.forEach((line, end) => {
+    const text = markerText(line);
+    if (!text || !text.startsWith('/') || text.length === 1) return;
+    const name = text.slice(1).trim();
+    for (let start = end - 1; start >= 0; start -= 1) {
+      if (markerText(lines[start]) === name) {
+        ranges.push({ owner: name, start, end });
+        break;
+      }
+    }
+  });
+  return ranges;
 }
 
 function assertNoOverlap(ranges) {
@@ -50,60 +68,76 @@ function assertNoOverlap(ranges) {
   }
 }
 
+function insideRange(index, range) {
+  return index >= range.start && index <= range.end;
+}
+
 function insideAny(index, ranges) {
-  return ranges.some((range) => index >= range.start && index <= range.end);
+  return ranges.some((range) => insideRange(index, range));
+}
+
+function locateReplacedLine(lines, substring, ranges, ownBlockPresent, warnings) {
+  const matches = lines.flatMap((line, index) =>
+    isReplaceableLine(line) && line.includes(substring) ? [index] : [],
+  );
+  const flag = `--replace-line ${JSON.stringify(substring)}`;
+  for (const index of matches) {
+    const enclosing = ranges.find((range) => insideRange(index, range));
+    if (enclosing) throw new Error(`${flag} matches a line inside block ${enclosing.owner}; use a more distinctive substring; refusing to alter crontab`);
+  }
+  if (matches.length > 1) throw new Error(`${flag} matched ${matches.length} crontab entry lines, expected at most 1; refusing to alter crontab`);
+  if (matches.length === 0) {
+    if (!ownBlockPresent) throw new Error(`${flag} matched no crontab entry line and the schedule is not installed yet; check for a typo; refusing to alter crontab`);
+    warnings.push(`${flag} matched no line (already migrated)`);
+    return null;
+  }
+  return matches[0];
 }
 
 /**
- * Pure: returns `currentText` with `block` ({ start, end, lines }) in place of its own marked pair, the
- * `replacements.blocks` pairs and the `replacements.lines` entries, at the first removed item's position.
- * Duplicate, unpaired, nested or overlapping markers, and any replacement that does not match exactly one, throw.
+ * Pure: `{ text, warnings }` for `currentText` with `block` ({ start, end, lines }) in place of its own marked
+ * pair, the `replacements.blocks` pairs and the `replacements.lines` entries, at the first removed item's position.
+ * A replacement matching nothing is a warning once the block is installed and an error before; matching more than one,
+ * or a line inside any marked block, always throws, as do duplicate, unpaired, nested or overlapping markers.
  */
-function replaceCrontabBlock(currentText, block, replacements = {}) {
+function planCrontabBlock(currentText, block, replacements = {}) {
   const lines = splitLines(currentText);
-  const replaceBlocks = replacements.blocks || [];
-  const replaceLines = replacements.lines || [];
+  const warnings = [];
+  const own = locatePair(lines, block.start, block.end, block.start);
 
-  const own = locatePair(lines, block.start, block.end, block.start, { required: false });
-  const removedBlocks = replaceBlocks.map((marker) =>
-    locatePair(lines, marker.start, marker.end, `--replace-block ${marker.start}`, { required: true }),
-  );
+  const removedBlocks = (replacements.blocks || []).flatMap((marker) => {
+    const range = locatePair(lines, marker.start, marker.end, `--replace-block ${marker.start}`);
+    if (range) return [range];
+    if (!own) throw new Error(`--replace-block ${marker.start} matched no block and the schedule is not installed yet; check for a typo; refusing to alter crontab`);
+    warnings.push(`--replace-block ${marker.start} matched no block (already migrated)`);
+    return [];
+  });
   const blockRanges = [...(own ? [own] : []), ...removedBlocks];
   assertNoOverlap(blockRanges);
 
   if (own) {
     const nested = lines.findIndex(
-      (line, index) =>
-        index > own.start && index < own.end && /^#\s*\/?db-backup:/.test(line.trim()),
+      (line, index) => index > own.start && index < own.end && /^#\s*\/?db-backup:/.test(line.trim()),
     );
     if (nested !== -1) {
       throw new Error(`${block.start} block contains another db-backup marker (${lines[nested].trim()}); refusing to alter crontab`);
     }
   }
 
-  const removedLineIndexes = replaceLines.map((substring) => {
-    const matches = lines.flatMap((line, index) =>
-      isEntryLine(line) && !insideAny(index, blockRanges) && line.includes(substring) ? [index] : [],
-    );
-    if (matches.length !== 1) {
-      throw new Error(
-        `--replace-line ${JSON.stringify(substring)} matched ${matches.length} crontab entry lines, expected exactly 1; refusing to alter crontab`,
-      );
-    }
-    return matches[0];
+  const ranges = markedRanges(lines);
+  const removedLineIndexes = (replacements.lines || []).flatMap((substring) => {
+    const index = locateReplacedLine(lines, substring, ranges, Boolean(own), warnings);
+    return index === null ? [] : [index];
   });
   if (new Set(removedLineIndexes).size !== removedLineIndexes.length) {
     throw new Error('two --replace-line values matched the same crontab line; refusing to alter crontab');
   }
 
-  const removedRanges = [
-    ...blockRanges,
-    ...removedLineIndexes.map((index) => ({ start: index, end: index })),
-  ];
+  const removedRanges = [...blockRanges, ...removedLineIndexes.map((index) => ({ start: index, end: index }))];
   const rendered = [block.start, ...block.lines, block.end];
   if (removedRanges.length === 0) {
     const prefix = lines.length > 0 && lines.at(-1) !== '' ? [...lines, ''] : lines;
-    return normalizeCrontab([...prefix, ...rendered].join('\n'));
+    return { text: normalizeCrontab([...prefix, ...rendered].join('\n')), warnings };
   }
 
   const firstRemoved = Math.min(...removedRanges.map((range) => range.start));
@@ -112,7 +146,11 @@ function replaceCrontabBlock(currentText, block, replacements = {}) {
     if (index === firstRemoved) output.push(...rendered);
     if (!insideAny(index, removedRanges)) output.push(line);
   });
-  return normalizeCrontab(output.join('\n'));
+  return { text: normalizeCrontab(output.join('\n')), warnings };
+}
+
+function replaceCrontabBlock(currentText, block, replacements = {}) {
+  return planCrontabBlock(currentText, block, replacements).text;
 }
 
 function crontabDiff(before, after, { context = 2 } = {}) {
@@ -155,9 +193,17 @@ function findTimezoneLines(text) {
   return splitLines(text).filter((line) => /^\s*(CRON_TZ|TZ)\s*=/.test(line));
 }
 
+function assertNoEscapedControlCharacters(text) {
+  if (text.split('\n').some((line) => line.endsWith('\\r') || line.includes('\\b'))) {
+    throw new Error('crontab contains escaped control characters; fix by hand');
+  }
+}
+
 function readCrontab(run = execFileSync) {
   try {
-    return String(run('crontab', ['-l'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+    const text = String(run('crontab', ['-l'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+    assertNoEscapedControlCharacters(text);
+    return text;
   } catch (error) {
     const output = `${error.stdout || ''}\n${error.stderr || ''}`;
     if (error.status === 1 && /no crontab/i.test(output)) return '';
@@ -171,6 +217,7 @@ function writeCrontab(content, run = execFileSync) {
 
 module.exports = {
   normalizeCrontab,
+  planCrontabBlock,
   replaceCrontabBlock,
   crontabDiff,
   findTimezoneLines,

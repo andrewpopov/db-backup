@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const {
   normalizeCrontab,
-  replaceCrontabBlock,
+  planCrontabBlock,
   crontabDiff,
   findTimezoneLines,
   readCrontab,
@@ -38,7 +38,7 @@ function rejectUnknownKeys(object, allowed, field) {
 function requireAbsolutePath(value, field) {
   requireString(value, field);
   if (!path.posix.isAbsolute(value)) fail(field, 'must be an absolute path');
-  if (/[\r\n%]/.test(value)) fail(field, 'must not contain a newline or %');
+  if (/[\r\n%\\]/.test(value)) fail(field, 'must not contain a newline, % or backslash');
   return value;
 }
 
@@ -69,12 +69,14 @@ function parseCron(cron, jobField) {
   const [minute, hour, dayOfMonth, month, dayOfWeek] = CRON_FIELDS.map((field, index) =>
     expandCronField(parts[index], field, jobField),
   );
-  return { text: parts.join(' '), minute, hour, dayOfMonth, month, dayOfWeek };
+  return { text: parts.join(' '), raw: parts, minute, hour, dayOfMonth, month, dayOfWeek };
 }
 
-function requireUnescapedPercentFree(command, field) {
+function requireSafeCommand(command, field) {
   if (/\r|\n/.test(command)) fail(field, 'must be a single line');
-  if (/(^|[^\\])%/.test(command)) fail(field, 'has an unescaped % (cron turns it into a newline); write \\%');
+  if (/(^|\s)#/.test(command)) fail(field, 'has a # starting a word (cron would comment out the rest of the line)');
+  const unescaped = [...command.matchAll(/(\\*)%/g)].some((match) => match[1].length % 2 === 0);
+  if (unescaped) fail(field, 'has an unescaped % (cron turns it into a newline); write \\%');
 }
 
 function onlyValue(values, label, field) {
@@ -85,9 +87,9 @@ function onlyValue(values, label, field) {
 function assertRunsStrictlyLater(job, earlier, jobField) {
   const later = parseCron(job.cron, jobField);
   const before = parseCron(earlier.cron, `jobs[${earlier.id}].cron`);
-  const calendarWide = (cron) => cron.dayOfMonth.size === 31 && cron.month.size === 12;
-  if (!calendarWide(later) || !calendarWide(before)) {
-    fail(jobField, `cannot prove the ordering against "${earlier.id}": day-of-month and month must be * on both jobs`);
+  const literalStars = (cron) => cron.raw[2] === '*' && cron.raw[3] === '*';
+  if (!literalStars(later) || !literalStars(before)) {
+    fail(jobField, `cannot prove the ordering against "${earlier.id}": day-of-month and month must be a literal * on both jobs (cron ORs day-of-month with day-of-week otherwise)`);
   }
   const sharedDays = [...later.dayOfWeek].filter((day) => before.dayOfWeek.has(day));
   if (sharedDays.length === 0) return;
@@ -106,7 +108,7 @@ function validateJob(raw, index) {
   if (!IDENTIFIER_PATTERN.test(id)) fail(`${field}.id`, 'must match [a-z0-9-]+');
   const cron = parseCron(raw.cron, `${field}.cron`).text;
   const command = requireString(raw.command, `${field}.command`).trim();
-  requireUnescapedPercentFree(command, `${field}.command`);
+  requireSafeCommand(command, `${field}.command`);
   const log = requireAbsolutePath(raw.log, `${field}.log`);
   if (raw.after !== undefined) requireString(raw.after, `${field}.after`);
   return { id, cron, command, log, ...(raw.after === undefined ? {} : { after: raw.after }) };
@@ -145,7 +147,7 @@ function renderScheduleBlock(schedule) {
   return {
     start: `# db-backup:${name}`,
     end: `# /db-backup:${name}`,
-    lines: jobs.map((job) => `${job.cron} cd ${shellQuote(cwd)} && ${job.command} >> ${shellQuote(job.log)} 2>&1`),
+    lines: jobs.map((job) => `${job.cron} cd ${shellQuote(cwd)} && ( ${job.command} ) >> ${shellQuote(job.log)} 2>&1`),
   };
 }
 
@@ -163,6 +165,14 @@ function loadScheduleFile(filePath, readFile) {
   }
 }
 
+function isExistingDirectory(directory) {
+  try {
+    return fs.statSync(directory).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function installSchedule(options = {}, deps = {}) {
   const {
     configPath = null,
@@ -174,7 +184,7 @@ function installSchedule(options = {}, deps = {}) {
   } = options;
   const {
     readFile = fs.readFileSync,
-    exists = fs.existsSync,
+    isDirectory = isExistingDirectory,
     getUid = () => process.getuid?.(),
     read = readCrontab,
     write = writeCrontab,
@@ -185,11 +195,16 @@ function installSchedule(options = {}, deps = {}) {
   if (getUid() === 0) throw new Error('install-schedule edits the invoking user crontab and must not run as root; run it as the app service user');
 
   const warnings = [];
-  if (!exists(schedule.cwd)) {
-    const message = `cwd ${schedule.cwd} does not exist`;
-    if (!dryRun) throw new Error(`${message}; refusing to install a schedule that cannot run (use --dry-run to preview)`);
-    warnings.push(message);
+  const missingPaths = [
+    ...(isDirectory(schedule.cwd) ? [] : [`cwd ${schedule.cwd} is not an existing directory`]),
+    ...[...new Set(schedule.jobs.map((job) => path.posix.dirname(job.log)))]
+      .filter((directory) => !isDirectory(directory))
+      .map((directory) => `log directory ${directory} is not an existing directory`),
+  ];
+  if (missingPaths.length > 0 && !dryRun) {
+    throw new Error(`${missingPaths.join('; ')}; refusing to install a schedule that cannot run (use --dry-run to preview)`);
   }
+  warnings.push(...missingPaths);
 
   const current = read();
   const timezoneLines = findTimezoneLines(current);
@@ -199,12 +214,17 @@ function installSchedule(options = {}, deps = {}) {
     warnings.push(message);
   }
 
-  const next = replaceCrontabBlock(current, renderScheduleBlock(schedule), { lines: replaceLines, blocks: replaceBlocks });
+  const plan = planCrontabBlock(current, renderScheduleBlock(schedule), { lines: replaceLines, blocks: replaceBlocks });
+  const next = plan.text;
+  warnings.push(...plan.warnings);
   const changed = next !== normalizeCrontab(current);
   const diff = changed ? `--- crontab (current)\n+++ crontab (new)\n${crontabDiff(current, next)}` : '';
   const result = { name: schedule.name, dryRun, changed, written: false, diff, warnings };
   if (!changed || dryRun) return result;
 
+  if (normalizeCrontab(read()) !== normalizeCrontab(current)) {
+    throw new Error('crontab changed while the new schedule was being planned; nothing written, rerun to plan against the current crontab');
+  }
   write(next);
   if (normalizeCrontab(read()) !== next) throw new Error('crontab was written but re-reading it does not match; check `crontab -l`');
   return { ...result, written: true };
