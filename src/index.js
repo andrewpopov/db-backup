@@ -1,4 +1,5 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
@@ -199,6 +200,8 @@ function parseArgs(argv) {
     notifyCommand: null,
     notifyDiscord: null,
     notifyWebhook: null,
+    notifyDiscordEnv: null,
+    notifyWebhookEnv: null,
     drimeEnvFile: null,
     drimeBaseRemote: null,
     drimeCryptRemote: null,
@@ -690,6 +693,19 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--notify-discord-env' || arg === '--notify-webhook-env') {
+      const value = argv[index + 1];
+      if (!value) throw new Error(`Missing value for ${arg}`);
+      // The value is never echoed: a URL pasted here by mistake must not reach logs.
+      if (!NOTIFY_ENV_NAME.test(value)) {
+        throw new Error(`Invalid value for ${arg}: expected an environment variable name such as DISCORD_ALERT_WEBHOOK`);
+      }
+      if (arg === '--notify-discord-env') options.notifyDiscordEnv = value;
+      else options.notifyWebhookEnv = value;
+      index += 1;
+      continue;
+    }
+
     if (arg === '--notify-command') {
       const value = argv[index + 1];
       if (!value) throw new Error('Missing value for --notify-command');
@@ -699,6 +715,13 @@ function parseArgs(argv) {
     }
 
     throw new Error(`Unknown argument: ${arg}`);
+  }
+
+  if (options.notifyDiscord && options.notifyDiscordEnv) {
+    throw new Error('--notify-discord and --notify-discord-env are mutually exclusive; give one');
+  }
+  if (options.notifyWebhook && options.notifyWebhookEnv) {
+    throw new Error('--notify-webhook and --notify-webhook-env are mutually exclusive; give one');
   }
 
   if (options.remoteTarget && options.s3Bucket) {
@@ -3630,7 +3653,9 @@ function writeAlertState(stateFile, state, { warn = console.warn } = {}) {
 // Returns { attempted, delivered } so the caller can tell a real delivery from a
 // silent failure. It still NEVER throws and NEVER sets an exit code — the return
 // value is advisory, and callers that ignore it behave exactly as before.
-function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, runtime = normalizeRuntime() } = {}) {
+const NOTIFY_ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+
+function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyDiscordEnv, notifyWebhookEnv, notifyCommand, runtime = normalizeRuntime() } = {}) {
   let attempted = false;
   let delivered = false;
   const postJson = (url, body) => {
@@ -3638,21 +3663,40 @@ function notifyAlert(message, { notifyDiscord, notifyWebhook, notifyCommand, run
       console.warn('[db-backup] notify skipped: curl is unavailable');
       return;
     }
-    // Body over stdin (`-d @-`) so the message never lands in argv/ps output.
-    runtime.execFileSync('curl', ['-fsS', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', '@-', url], {
-      input: JSON.stringify(body),
-      stdio: ['pipe', 'ignore', 'pipe'],
-    });
+    // Body over stdin and the URL in a 0600 curl config file, so neither lands in argv/ps output.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-notify-'));
+    const configFile = path.join(dir, 'curl.conf');
+    try {
+      fs.writeFileSync(configFile, `url = "${String(url).replace(/[\\"]/g, '\\$&')}"\n`, { mode: 0o600 });
+      runtime.execFileSync('curl', ['-fsS', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', '@-', '-K', configFile], {
+        input: JSON.stringify(body),
+        stdio: ['pipe', 'ignore', 'pipe'],
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   };
-  if (notifyDiscord) {
+  // The env twin is read here, at notify time, so a URL kept in an env file never
+  // sits on argv. An unset variable is a skipped sink, never a changed verdict.
+  const resolveUrl = (url, envName) => {
+    if (url || !envName) return url;
+    const fromEnv = runtime.env[envName];
+    if (!fromEnv) console.warn(`[db-backup] notification skipped: ${envName} is not set`);
+    return fromEnv;
+  };
+  const discordUrl = resolveUrl(notifyDiscord, notifyDiscordEnv);
+  const webhookUrl = resolveUrl(notifyWebhook, notifyWebhookEnv);
+  if (notifyDiscordEnv && !discordUrl) attempted = true;
+  if (notifyWebhookEnv && !webhookUrl) attempted = true;
+  if (discordUrl) {
     attempted = true;
-    try { postJson(notifyDiscord, { content: message }); delivered = true; }
-    catch (err) { console.warn(`[db-backup] Discord notify failed: ${redactWebhookUrl(err && err.message ? err.message : err, notifyDiscord)}`); }
+    try { postJson(discordUrl, { content: message }); delivered = true; }
+    catch (err) { console.warn(`[db-backup] Discord notify failed: ${redactWebhookUrl(err && err.message ? err.message : err, discordUrl)}`); }
   }
-  if (notifyWebhook) {
+  if (webhookUrl) {
     attempted = true;
-    try { postJson(notifyWebhook, { text: message }); delivered = true; }
-    catch (err) { console.warn(`[db-backup] webhook notify failed: ${redactWebhookUrl(err && err.message ? err.message : err, notifyWebhook)}`); }
+    try { postJson(webhookUrl, { text: message }); delivered = true; }
+    catch (err) { console.warn(`[db-backup] webhook notify failed: ${redactWebhookUrl(err && err.message ? err.message : err, webhookUrl)}`); }
   }
   if (notifyCommand) {
     attempted = true;
@@ -4248,6 +4292,11 @@ Options:
                           survivor; delete nothing.
   --notify-discord <url>  freshness/backup: POST an alert to a Discord webhook on failure
   --notify-webhook <url>  freshness/backup: POST {"text":...} to a webhook on failure
+  --notify-discord-env <VAR>
+                          Like --notify-discord, reading the URL from $VAR when an alert
+                          is sent (keeps it out of ps and crontabs)
+  --notify-webhook-env <VAR>
+                          Like --notify-webhook, reading the URL from $VAR
   --notify-command <cmd>  freshness/backup: run cmd on failure ($DB_BACKUP_ALERT = message)
   --state-file <path>     freshness: alert-suppression state (default:
                           <stamp-file>.alerts.json). Required to suppress in --remote
@@ -4325,14 +4374,22 @@ function notifyOptionsOf(options) {
   return {
     notifyDiscord: options.notifyDiscord,
     notifyWebhook: options.notifyWebhook,
+    notifyDiscordEnv: options.notifyDiscordEnv,
+    notifyWebhookEnv: options.notifyWebhookEnv,
     notifyCommand: options.notifyCommand,
     runtime: normalizeRuntime({ commandTimeoutMs: options.resolvedCommandTimeoutMs ?? options.commandTimeoutMs }),
   };
 }
 
 // Never changes a backup's verdict or replaces its error: no sink means no setup at all.
+function hasNotifySink(options) {
+  return Boolean(
+    options.notifyDiscord || options.notifyWebhook || options.notifyDiscordEnv || options.notifyWebhookEnv || options.notifyCommand,
+  );
+}
+
 function notifyBestEffort(message, options) {
-  if (!options.notifyDiscord && !options.notifyWebhook && !options.notifyCommand) return;
+  if (!hasNotifySink(options)) return;
   try {
     notifyAlert(message, notifyOptionsOf(options));
   } catch {
@@ -4371,6 +4428,8 @@ async function runParsedCli(options) {
     const notifyOpts = {
       notifyDiscord: options.notifyDiscord,
       notifyWebhook: options.notifyWebhook,
+      notifyDiscordEnv: options.notifyDiscordEnv,
+      notifyWebhookEnv: options.notifyWebhookEnv,
       notifyCommand: options.notifyCommand,
       runtime: normalizeRuntime({ commandTimeoutMs: options.commandTimeoutMs }),
     };
@@ -4387,7 +4446,7 @@ async function runParsedCli(options) {
       reAlertAfterMinutes: options.reAlertAfterHours * 60,
       nowMs: Date.now(),
     };
-    if (!stateFile && (options.notifyDiscord || options.notifyWebhook || options.notifyCommand)) {
+    if (!stateFile && hasNotifySink(options)) {
       console.warn('[db-backup] alert suppression disabled: no --state-file and no --stamp-file to derive one from; every run will notify');
     }
 

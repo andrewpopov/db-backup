@@ -627,7 +627,17 @@ future timestamp (clock skew), or a check that can't run (rclone missing), it al
 |---|---|
 | `--notify-discord <url>` | POST `{"content": message}` to a Discord webhook |
 | `--notify-webhook <url>` | POST `{"text": message}` to any webhook (Slack-style) |
+| `--notify-discord-env <VAR>` | same as `--notify-discord`, reading the URL from `$VAR` |
+| `--notify-webhook-env <VAR>` | same as `--notify-webhook`, reading the URL from `$VAR` |
 | `--notify-command <cmd>` | run `cmd` with the message in `$DB_BACKUP_ALERT` (generic escape hatch) |
+
+A URL on argv shows in `ps` and in crontabs. Keep it in an env file and pass the
+variable's name instead, for example `--notify-discord-env DISCORD_ALERT_WEBHOOK`. The
+name must match `^[A-Z_][A-Z0-9_]*$`, the variable is read when an alert is sent, and
+giving a URL flag and its `-env` twin together is a usage error. If the variable is
+unset or empty at that moment, db-backup logs
+`[db-backup] notification skipped: <VAR> is not set` and the verdict and exit code do
+not change. The URL never appears in logs, errors or output.
 
 Notifications are **best-effort and synchronous** (POST via `curl`, or run the command) —
 a failing webhook never masks or manufactures a verdict, and `freshness` still exits
@@ -636,8 +646,8 @@ non-zero on staleness. No `fetch`, so `runCli` stays synchronous and consumers'
 
 #### Backup alerts: `backup --notify-*`
 
-`backup` accepts the same `--notify-discord`, `--notify-webhook` and
-`--notify-command` flags (there are no config-file keys for them). Two distinct,
+`backup` accepts the same `--notify-discord`, `--notify-webhook`, their `-env`
+twins and `--notify-command` flags (there are no config-file keys for them). Two distinct,
 secret-free messages, built from fixed strings and destination labels only
 (never error text, which can carry a command line or a provider response):
 

@@ -896,6 +896,9 @@ export function notifyAlert(
   options?: {
     notifyDiscord?: string | null;
     notifyWebhook?: string | null;
+    /** Name of an env var (in `runtime.env`) holding the Discord URL, read when the alert is sent. */
+    notifyDiscordEnv?: string | null;
+    notifyWebhookEnv?: string | null;
     notifyCommand?: string | null;
     runtime?: BackupRuntime;
   },
