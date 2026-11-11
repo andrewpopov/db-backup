@@ -28,6 +28,10 @@ import {
   normalizeRuntime,
   DEFAULT_COMMAND_TIMEOUT_MS,
   buildDailyCronEntry,
+  installSchedule,
+  validateSchedule,
+  renderScheduleBlock,
+  replaceCrontabBlock,
   runCli,
   DEFAULT_RETENTION_POLICY,
   resolveBackupDirectories,
@@ -176,6 +180,14 @@ const pruneResult: PruneJobResult = pruneBackupsJob({ outputDir: '/var/backups/m
 const plan: BackupPlan = planRetention(listResult.backups as BackupEntry[], DEFAULT_RETENTION_POLICY, new Date());
 
 const cronLine: string = buildDailyCronEntry({ hour: 3, minute: 0 });
+
+const schedule = validateSchedule({ name: 'app', cwd: '/srv/app', jobs: [] });
+const scheduleText: string = replaceCrontabBlock('', renderScheduleBlock(schedule), {
+  lines: ['legacy'],
+  blocks: [{ start: '# a', end: '# /a' }],
+});
+const scheduleResult = installSchedule({ dryRun: true, replaceLines: ['legacy'] });
+const scheduleChanged: boolean = scheduleResult.changed;
 
 // Backup-storage helpers.
 const dirs: string[] = resolveBackupDirectories({

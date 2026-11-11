@@ -621,8 +621,8 @@ db-backup backup \
 # Or collapse the above into a config file (see `db-backup.config.json` above)
 db-backup backup --config db-backup.config.json
 
-# Print a copy-pasteable cron entry for daily execution
-db-backup cron --hour 3 --minute 0 --prod --output-dir /var/backups/myapp
+# Install the app's backup schedule into the invoking user's crontab
+db-backup install-schedule --dry-run
 
 # Restore from a specific backup file
 db-backup restore --prod --output-dir /var/backups/myapp --file sqlite-backup-20260219-030000Z.db.gz
@@ -710,24 +710,82 @@ is visible in the result, not only in config. Restores require `pg_restore`
 as well. Same-second PostgreSQL backups use the same numeric suffix pattern,
 such as `postgres-backup-20260705-150000Z-2.dump`.
 
-### Daily cron
+### Scheduling
 
-Generate a copy-pasteable cron entry. `cron` reflects the flags you pass
-(`--prod`, `--output-dir`, `--allow-missing`) into the emitted `backup` command
-and defaults the log path to `<output-dir>/backup.log`:
+See [Scheduling: `install-schedule`](#scheduling-install-schedule).
 
-```bash
-db-backup cron --hour 3 --minute 0 --prod --output-dir /var/backups/myapp --allow-missing
-# 0 3 * * * /usr/bin/env bash -lc 'cd "/srv/myapp" && npx db-backup backup --prod --output-dir "/var/backups/myapp" --allow-missing >> "/var/backups/myapp/backup.log" 2>&1'
+## Scheduling: `install-schedule`
+
+`db-backup install-schedule` writes an app's backup schedule, kept in the app repo, into the
+invoking user's crontab as one marked block. It is idempotent, so a deploy can run it every time.
+
+The schedule lives in `db-backup.schedule.json` in the repo root (`--config <path>` overrides the
+location). It is separate from `db-backup.config.json`, which `backup` auto-loads and some apps do not have.
+
+```json
+{
+  "name": "myapp",
+  "cwd": "/srv/myapp",
+  "jobs": [
+    { "id": "backup", "cron": "58 0 * * 0", "command": "set -a && . /etc/db-backup/s3.env && set +a && npm run backup", "log": "/srv/myapp-backups/backup.log" },
+    { "id": "drill", "cron": "30 4 * * 0", "command": "npm run ops:restore-drill -- --latest", "log": "/srv/myapp-backups/drill.log", "after": "backup" }
+  ]
+}
 ```
 
-The default command uses `npx db-backup` (resolves the locally-installed bin
-under npm and pnpm). Override it entirely with `--command` (e.g. to wrap a
-`pnpm exec` or an app npm script) and set the log file with `--log-path`:
+The block it writes:
+
+```
+# db-backup:myapp
+58 0 * * 0 cd '/srv/myapp' && ( set -a && . /etc/db-backup/s3.env && set +a && npm run backup ) >> '/srv/myapp-backups/backup.log' 2>&1
+30 4 * * 0 cd '/srv/myapp' && ( npm run ops:restore-drill -- --latest ) >> '/srv/myapp-backups/drill.log' 2>&1
+# /db-backup:myapp
+```
+
+`cwd` and `log` are shell-quoted. `command` is free-form shell, run in a subshell so `a || b` and `a; b`
+keep the `cd` guard and the log redirect. Job `id`s are the stable identity; extra jobs (a freshness check, a status line) are just more jobs.
 
 ```bash
-db-backup cron --command 'pnpm exec db-backup backup --allow-missing' --log-path /srv/myapp/logs/backup.log
+db-backup install-schedule [--config <path>] [--dry-run] [--json] [--strict] \
+  [--replace-line <substring>]... [--replace-block <start-marker>=<end-marker>]...
 ```
+
+Validation fails with a message naming the field:
+
+- `name` matches `[a-z0-9-]+`; `cwd` and each `log` are absolute and contain no `%` or backslash.
+- Each job has a unique `id`, a 5-field cron (digits, `*`, `,`, `-`, `/`; no `@` shortcuts or names), a non-empty `command` and an absolute `log`.
+- An unescaped `%` in `command` is refused (cron turns it into a newline); write `\%`. A `%` counts as escaped only after an odd number of backslashes. A `#` that starts a word in `command` is refused (cron would drop the rest of the line).
+- `after: <id>` requires the job to run strictly later than that job on every day both run. This is proven for a fixed minute and hour with day-of-week sets compared; a range or step in the minute or hour is refused rather than guessed. Both jobs must also use a literal `*` for day-of-month and month, because cron ORs day-of-month with day-of-week unless the field is a literal `*`.
+- Unknown keys are refused, so a typo like `afer` cannot silently drop a guard.
+
+Guards:
+
+- Refuses to run as root. Run it as the app's service user: the crontab it edits is the invoking user's.
+- A real install refuses when `cwd` is not a directory or a job's log directory does not exist; `--dry-run` only warns.
+- Refuses to read a crontab where a line ends in a literal `\r` or contains a literal `\b` (Debian `crontab -l` prints control characters that way): `crontab contains escaped control characters; fix by hand`.
+- Refuses to write if the crontab changed between planning and writing.
+- Exactly one `# db-backup:<name>` / `# /db-backup:<name>` pair is replaced in place. A duplicate, unpaired, nested or overlapping marker fails with nothing written.
+- `--replace-line <substring>` removes the old unmarked host line. Comment lines and environment lines (`PATH=...`) never match. A match inside any marked block (`# db-backup:<id>` pairs and any other `# X` ... `# /X` pair) fails, so use a distinctive tag. Two or more matches always fail. Zero matches fails until the schedule's own block is installed, which catches a typo on the first migration; after that it is a no-op recorded in `warnings`, so the flag can stay in the deploy hook.
+- `--replace-block <start>=<end>` removes an old marked block. It must match exactly one well-formed pair; zero matches follows the same rule as `--replace-line`.
+- The new block takes the position of the FIRST removed item (a legacy line or block, or the existing block), so it does not inherit a `SHELL=` or `PATH=` set further down. With nothing removed it is appended.
+- A `TZ=` or `CRON_TZ=` line in the crontab produces a warning, because Debian cron ignores both on this fleet and the schedule runs in host local time. `--strict` makes it a failure.
+- `--dry-run` prints a unified-style diff and writes nothing. A real run writes with `crontab -`, re-reads the crontab and verifies it. A rerun with no change prints `unchanged` and does not write.
+
+`--json` prints `{ command, name, dryRun, changed, written, diff, warnings }`.
+
+To install on every deploy with `@andrewpopov/deploy-kit`, add a post-deploy check (pnpm repos use `pnpm exec`):
+
+```json
+{ "command": "npx db-backup install-schedule", "onFailure": "remain-active" }
+```
+
+A host that already has the old line or blocks passes `--replace-line` or `--replace-block` in that same
+command and keeps it there: once migrated, the flag is a no-op. Pick a distinctive tag from the old line
+(preview with `--dry-run` first), for example
+`npx db-backup install-schedule --replace-line '# db-backup-nightly'`.
+
+The `cron` command and `buildDailyCronEntry` are **deprecated**: they print a daily entry for you to
+paste by hand and nothing keeps it in sync with the repo. They keep working; use `install-schedule`.
 
 ## Environment resolution
 

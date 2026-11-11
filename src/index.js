@@ -38,6 +38,8 @@ const {
   DEFAULT_S3_KEEP,
   DEFAULT_S3_TIMEOUT_MS,
 } = require('./s3-remote');
+const { installSchedule, validateSchedule, renderScheduleBlock } = require('./schedule');
+const { replaceCrontabBlock } = require('./crontab');
 const { planFlatRemoteRetention } = require('./remote-retention');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -179,6 +181,9 @@ function parseArgs(argv) {
     s3TimeoutMs: null,
     skipRemote: false,
     cronCommand: null,
+    replaceLines: [],
+    replaceBlocks: [],
+    strict: false,
     logPath: null,
     notifyCommand: null,
     notifyDiscord: null,
@@ -191,6 +196,7 @@ function parseArgs(argv) {
     commandArg === 'list' ||
     commandArg === 'prune' ||
     commandArg === 'cron' ||
+    commandArg === 'install-schedule' ||
     commandArg === 'restore' ||
     commandArg === 'freshness'
   ) {
@@ -380,6 +386,32 @@ function parseArgs(argv) {
 
     if (arg === '--dry-run') {
       options.dryRun = true;
+      continue;
+    }
+
+    if (arg === '--replace-line') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('Missing value for --replace-line');
+      options.replaceLines.push(value);
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--replace-block') {
+      const value = argv[index + 1];
+      const separator = value ? value.indexOf('=') : -1;
+      const start = separator > 0 ? value.slice(0, separator).trim() : '';
+      const end = separator > 0 ? value.slice(separator + 1).trim() : '';
+      if (!start || !end || start === end) {
+        throw new Error('--replace-block requires <start-marker>=<end-marker> with two different markers');
+      }
+      options.replaceBlocks.push({ start, end });
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--strict') {
+      options.strict = true;
       continue;
     }
 
@@ -3957,13 +3989,15 @@ function formatBytes(sizeBytes) {
 function showHelp() {
   console.log(`
 Usage:
-  db-backup [backup|list|prune|cron|restore] [options]
+  db-backup [backup|list|prune|install-schedule|restore] [options]
 
 Commands:
   backup                  Create a backup and apply retention policy (default)
   list                    List backups with keep/rotate decisions (no DB needed)
   prune                   Apply retention now without taking a backup (no DB needed)
-  cron                    Print a daily cron entry
+  install-schedule        Write the app's db-backup.schedule.json into the invoking user's
+                          crontab (one marked block, idempotent; --dry-run prints the diff)
+  cron                    DEPRECATED: print a daily cron entry (use install-schedule)
   restore                 Restore database from backup file
   freshness               Exit non-zero if the last success is older than the threshold
                           (checks --stamp-file, or --remote for an off-host monitor)
@@ -4041,6 +4075,12 @@ Options:
   --minute <0-59>         Minute for cron output (command: cron)
   --command <str>         Override the command in cron output (command: cron)
   --log-path <path>       Log path for cron output (command: cron)
+  --replace-line <text>   Remove the one crontab entry containing <text> as the block is
+                          installed (repeatable; command: install-schedule)
+  --replace-block <s>=<e> Remove the one marked block <s> ... <e> as the block is installed
+                          (repeatable; command: install-schedule)
+  --strict                Fail instead of warning on a TZ=/CRON_TZ= crontab line
+                          (command: install-schedule)
   --file <name|path>      Backup file to restore (command: restore)
   --latest                Restore latest backup in output-dir (command: restore)
   --no-pre-backup         Skip safety backup before restore (command: restore)
@@ -4176,6 +4216,29 @@ async function runCli(argv = process.argv.slice(2)) {
       // OUTSIDE the suppression gate on purpose: a suppressed reminder must never turn
       // a stale backup into a green run.
       process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (options.command === 'install-schedule') {
+    const result = installSchedule({
+      configPath: options.configPath,
+      dryRun: options.dryRun,
+      replaceLines: options.replaceLines,
+      replaceBlocks: options.replaceBlocks,
+      strict: options.strict,
+    });
+    if (options.json) {
+      console.log(JSON.stringify({ command: 'install-schedule', ...result }, null, 2));
+      return;
+    }
+    result.warnings.forEach((warning) => console.error(`[db-backup] WARNING: ${warning}`));
+    if (!result.changed) {
+      console.log(`[db-backup] install-schedule: ${result.name} unchanged`);
+    } else if (result.dryRun) {
+      console.log(`[db-backup] install-schedule: ${result.name} dry run, crontab not written. Pending changes:\n${result.diff}`);
+    } else {
+      console.log(`[db-backup] install-schedule: ${result.name} installed:\n${result.diff}`);
     }
     return;
   }
@@ -4492,6 +4555,10 @@ module.exports = {
   DEFAULT_RETENTION_POLICY,
   buildGfsAnchors,
   buildDailyCronEntry,
+  installSchedule,
+  validateSchedule,
+  renderScheduleBlock,
+  replaceCrontabBlock,
   listBackupsWithPlan,
   pruneBackupsJob,
   resolveRetentionPolicy,
