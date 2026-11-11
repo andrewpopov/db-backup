@@ -69,22 +69,36 @@ function jobOptions(cwd: string, outputDir: string, extra: Record<string, unknow
   return { allowUnsafeCopy: true, cwd, databaseUrl: 'file:./app.db', compressSqlite: false, now: fixedNow, outputDir, ...extra };
 }
 
-interface Call { args: string[]; env: Record<string, string>; config: { exists: boolean; mode: number; size: number; file: string } }
+interface Call { maxBuffer?: number; args: string[]; env: Record<string, string>; config: { exists: boolean; mode: number; size: number; file: string } }
+
+// Object names as a bag, not a Set: Drime allows duplicate names, and a delete
+// by name removes whichever copy rclone resolves first (the first).
+class NameBag {
+  private readonly names: string[];
+  constructor(initial: string[] = []) { this.names = [...initial]; }
+  add(name: string) { this.names.push(name); }
+  has(name: string) { return this.names.includes(name); }
+  count(name: string) { return this.names.filter((n) => n === name).length; }
+  delete(name: string) { const at = this.names.indexOf(name); if (at >= 0) this.names.splice(at, 1); }
+  get size() { return this.names.length; }
+  [Symbol.iterator]() { return this.names[Symbol.iterator](); }
+}
 
 // Fake rclone for the in-process runtime. Drime children address the private
 // `dbbdrimecrypt:` remote; anything else is the generic `offsite:` target.
-function makeFakeRclone(options: { seeded?: string[]; hideNewFromListing?: boolean; fail?: (args: string[]) => Error | null } = {}) {
-  const drimeObjects = new Set<string>(options.seeded || []);
-  const otherObjects = new Set<string>();
+function makeFakeRclone(options: { seeded?: string[]; seededOther?: string[]; seededDirs?: string[]; hideNewFromListing?: boolean; fail?: (args: string[]) => Error | null } = {}) {
+  const drimeObjects = new NameBag(options.seeded);
+  const otherObjects = new NameBag(options.seededOther);
   const deleted: string[] = [];
   const calls: Call[] = [];
   let lastUploadSize = 0;
-  const execFileSync = (_command: string, args: string[], opts?: { env?: Record<string, string> }) => {
+  const execFileSync = (_command: string, args: string[], opts?: { env?: Record<string, string>; maxBuffer?: number }) => {
     const env = opts?.env || {};
     const configFile = env.RCLONE_CONFIG || '';
     const exists = Boolean(configFile) && fs.existsSync(configFile);
     calls.push({
       args,
+      maxBuffer: opts?.maxBuffer,
       env,
       config: { exists, mode: exists ? fs.statSync(configFile).mode & 0o777 : 0, size: exists ? fs.statSync(configFile).size : -1, file: configFile },
     });
@@ -95,10 +109,15 @@ function makeFakeRclone(options: { seeded?: string[]; hideNewFromListing?: boole
     if (args[0] === 'copyto') {
       objects.add(String(args[2]).split('/').pop()!);
       lastUploadSize = fs.statSync(args[1]).size;
-    } else if (args[0] === 'lsjson') {
+    } else if (args[0] === 'lsjson' && args.includes('--stat')) {
       return Buffer.from(JSON.stringify({ Size: lastUploadSize }));
-    } else if (args[0] === 'lsf') {
-      return Buffer.from([...objects].filter((n) => !(options.hideNewFromListing && n === NEW_NAME)).join('\n'));
+    } else if (args[0] === 'lsjson') {
+      const files = [...objects].filter((n) => !(options.hideNewFromListing && n === NEW_NAME));
+      const dirs = isDrime ? options.seededDirs || [] : [];
+      return Buffer.from(JSON.stringify([
+        ...files.map((n) => ({ Path: n, Name: n, IsDir: false })),
+        ...dirs.map((n) => ({ Path: n, Name: n, IsDir: true })),
+      ]));
     } else if (args[0] === 'deletefile') {
       const name = String(args[1]).split('/').pop()!;
       deleted.push(name);
@@ -363,7 +382,8 @@ describe('drime destination: secrets never surface', () => {
     let error: Error | null = null;
     try { run(); } catch (caught) { error = caught as Error; }
     expect(error?.message).toBe(`rclone ${op} failed (exit 1)`);
-    expect(Object.getOwnPropertyNames(error).filter((n) => n !== 'markerPath').sort()).toEqual(['message', 'stack']);
+    expect(Object.getOwnPropertyNames(error).filter((n) => n !== 'markerPath').sort()).toEqual(['destinationResults', 'message', 'stack']);
+    expectNoSecrets(JSON.stringify((error as { destinationResults?: unknown }).destinationResults));
     expect((error as { cause?: unknown }).cause).toBeUndefined();
     expectNoSecrets(String(error?.stack));
     expectNoSecrets(logs.join('\n'));
@@ -385,14 +405,14 @@ describe('drime destination: secrets never surface', () => {
     }));
     const text = logs.join('\n');
     expectNoSecrets(text);
-    expect(text).toMatch(/ALERT drime prune failed for app: 3 objects over keep 10/);
-    expect(result.destinationResults?.[0]).toMatchObject({ pruneFailed: { overKeep: 3 }, removed: [] });
+    expect(text).toMatch(/ALERT drime prune failed for app: 3 objects over keep 10 \(delete-failed\)/);
+    expect(result.destinationResults?.[0]).toMatchObject({ pruneFailed: { overKeep: 3, reason: 'delete-failed' }, removed: [] });
     expectNoSecrets(JSON.stringify(result));
   });
 
   it('a failed listing during prune raises the distinct alert and still succeeds', () => {
     const { cwd, outputDir, envFile } = setup();
-    const rclone = makeFakeRclone({ fail: (args) => (args[0] === 'lsf' ? leakyError() : null) });
+    const rclone = makeFakeRclone({ fail: (args) => (args[0] === 'lsjson' && !args.includes('--stat') ? leakyError() : null) });
     const errors: string[] = [];
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     vi.spyOn(console, 'error').mockImplementation((...parts: unknown[]) => { errors.push(parts.join(' ')); });
@@ -400,8 +420,8 @@ describe('drime destination: secrets never surface', () => {
       destinations: [{ type: 'drime', path: 'app', envFile }],
       runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync }),
     }));
-    expect(errors.join('\n')).toMatch(/ALERT drime prune failed for app: an unknown number of objects over keep 10/);
-    expect(result.destinationResults?.[0].pruneFailed).toEqual({ overKeep: null });
+    expect(errors.join('\n')).toMatch(/ALERT drime prune failed for app: an unknown number of objects over keep 10 \(list-failed\)/);
+    expect(result.destinationResults?.[0].pruneFailed).toEqual({ overKeep: null, reason: 'list-failed' });
   });
 
   describe('through the CLI with a real rclone-shaped subprocess', () => {
@@ -1082,7 +1102,7 @@ describe('drime destination: writes can only address the crypt remote (PKG-304 r
     expect(rclone.calls.map((c) => c.args)).toEqual([
       ['copyto', local, 'dbbdrimecrypt:app/f'],
       ['lsjson', '--stat', 'dbbdrimecrypt:app/f'],
-      ['lsf', 'dbbdrimecrypt:app', '--files-only'],
+      ['lsjson', 'dbbdrimecrypt:app'],
       ['deletefile', 'dbbdrimecrypt:app/f'],
     ]);
   });
@@ -1174,5 +1194,351 @@ describe('--drime-env-file overrides config-file destinations (PKG-304 review 5)
     const override = path.join(cwd, 'override.env');
     const { thrown } = await cli(installFakeRclone([]), cwd, [...CLI_FLAGS, '--config', cfg, '--drime-env-file', override, '--output-dir', outputDir]);
     expect(thrown?.message).toBe(`Drime env file ${override} is not readable (ENOENT)`);
+  });
+});
+
+function makeS3Fetch(options: { failPut?: boolean } = {}) {
+  const objects = new Map<string, Buffer>();
+  const methods: string[] = [];
+  const fetchImpl = (url: string, opts: { method: string; body?: Buffer }) => {
+    methods.push(opts.method);
+    const key = decodeURIComponent(new URL(url).pathname.replace(/^\/[^/]+\//, ''));
+    if (opts.method === 'PUT') {
+      if (options.failPut) return { status: 500, headers: {}, body: Buffer.from('InternalError') };
+      const body = Buffer.from(opts.body || Buffer.alloc(0));
+      objects.set(key, body);
+      return { status: 200, headers: { etag: `"${crypto.createHash('md5').update(body).digest('hex')}"` }, body: Buffer.alloc(0) };
+    }
+    const obj = objects.get(key);
+    return obj
+      ? { status: 200, headers: { 'content-length': String(obj.length), etag: `"${crypto.createHash('md5').update(obj).digest('hex')}"` }, body: Buffer.alloc(0) }
+      : { status: 404, headers: {}, body: Buffer.alloc(0) };
+  };
+  return { objects, methods, fetchImpl };
+}
+
+const S3_ENV = { AWS_ACCESS_KEY_ID: 'AKIDEXAMPLE', AWS_SECRET_ACCESS_KEY: 'secretsecretsecret' };
+
+describe('prune refuses an ambiguous remote inventory (PKG-307 item 1)', () => {
+  const day = (n: number) => `sqlite-backup-202607${String(n).padStart(2, '0')}-120000Z.db`;
+
+  function runPrune(rcloneOptions: Parameters<typeof makeFakeRclone>[0], destination: Record<string, unknown>) {
+    const { cwd, outputDir, envFile } = setup();
+    const stampFile = path.join(cwd, '.last-success');
+    const rclone = makeFakeRclone(rcloneOptions);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const result = runBackupJob(jobOptions(cwd, outputDir, {
+      stampFile,
+      destinations: [{ ...destination, ...(destination.type === 'drime' ? { envFile } : {}) }],
+      runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync }),
+    }));
+    return { rclone, result, stampFile };
+  }
+
+  it('drime: a duplicated name deletes nothing, keeps both copies, flags ambiguous-inventory, and the job still succeeds', () => {
+    const { rclone, result, stampFile } = runPrune({ seeded: [day(2), day(2), day(1)] }, { type: 'drime', path: 'app', keep: 2 });
+    expect(rclone.calls.some((c) => c.args[0] === 'deletefile')).toBe(false);
+    expect(rclone.drimeObjects.count(day(2))).toBe(2);
+    expect(rclone.drimeObjects.has(day(1))).toBe(true);
+    expect(result.destinationResults?.[0]).toMatchObject({ removed: [], pruneFailed: { overKeep: null, reason: 'ambiguous-inventory' } });
+    expect(fs.existsSync(stampFile)).toBe(true);
+  });
+
+  it('drime: a file and a directory at one path is ambiguous too', () => {
+    const { rclone, result } = runPrune({ seeded: [day(2), day(1)], seededDirs: [day(2)] }, { type: 'drime', path: 'app', keep: 2 });
+    expect(rclone.calls.some((c) => c.args[0] === 'deletefile')).toBe(false);
+    expect(result.destinationResults?.[0].pruneFailed).toMatchObject({ reason: 'ambiguous-inventory' });
+  });
+
+  it('a directory named like a backup, or with a newline in its name, never takes a retention slot', () => {
+    const newlineDir = `${day(7)}\njunk`;
+    const { rclone, result } = runPrune(
+      { seeded: [day(2), day(1)], seededDirs: [day(6), newlineDir] },
+      { type: 'drime', path: 'app', keep: 2 },
+    );
+    expect(rclone.deleted).toEqual([day(1)]);
+    expect(rclone.drimeObjects.has(day(2))).toBe(true);
+    expect(result.destinationResults?.[0].pruneFailed).toBeUndefined();
+  });
+
+  it('the prune listing is read with the large output bound', () => {
+    const { rclone } = runPrune({ seeded: [day(2)] }, { type: 'drime', path: 'app', keep: 2 });
+    const list = rclone.calls.find((c) => c.args[0] === 'lsjson' && !c.args.includes('--stat'));
+    expect(list?.maxBuffer).toBeGreaterThanOrEqual(256 * 1024 * 1024);
+  });
+
+  it('a clean inventory (a directory with a different name) still prunes', () => {
+    const { rclone, result } = runPrune({ seeded: [day(3), day(2), day(1)], seededDirs: ['nested'] }, { type: 'drime', path: 'app', keep: 2 });
+    expect(rclone.deleted).toEqual([day(2), day(1)]);
+    expect(result.destinationResults?.[0].pruneFailed).toBeUndefined();
+  });
+
+  it('generic rclone: a duplicated name is refused the same way', () => {
+    const { rclone, result } = runPrune({ seededOther: [day(2), day(2), day(1)] }, { type: 'rclone', target: 'offsite:x', keep: 2 });
+    expect(rclone.calls.some((c) => c.args[0] === 'deletefile')).toBe(false);
+    expect(rclone.otherObjects.count(day(2))).toBe(2);
+    expect(result.destinationResults?.[0].pruneFailed).toMatchObject({ reason: 'ambiguous-inventory' });
+  });
+});
+
+describe('every destination is attempted before the job fails (PKG-307 item 2)', () => {
+  const OLD = ['sqlite-backup-20260701-120000Z.db', 'sqlite-backup-20260702-120000Z.db'];
+  type Failed = Error & { destinationResults?: { destination: { type: string }; uploaded: unknown; uploadFailed?: boolean }[] };
+
+  function seedLocal(outputDir: string) {
+    fs.mkdirSync(outputDir, { recursive: true });
+    for (const name of OLD) fs.writeFileSync(path.join(outputDir, name), 'old');
+  }
+
+  it('async: S3 fails, yet Drime and the second local copy upload, nothing is pruned, the stamp is untouched', async () => {
+    const { cwd, outputDir, envFile } = setup();
+    seedLocal(outputDir);
+    const second = path.join(cwd, 'second');
+    const stampFile = path.join(cwd, '.last-success');
+    const s3 = makeS3Fetch({ failPut: true });
+    const rclone = makeFakeRclone({ seeded: OLD });
+    let error: Failed | null = null;
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await runBackupJobAsync(jobOptions(cwd, outputDir, {
+        stampFile,
+        policy: { mode: 'keep-last', keepLast: 1 },
+        destinations: [{ type: 'local', path: outputDir }, { type: 's3', bucket: 'b' }, { type: 'drime', path: 'app', envFile }, { type: 'local', path: second }],
+        runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync, fetchImpl: s3.fetchImpl, env: S3_ENV } as never),
+      }));
+    } catch (caught) { error = caught as Failed; }
+    expect(error).toBeTruthy();
+    expect(rclone.drimeObjects.has(NEW_NAME), 'drime uploaded after the S3 failure').toBe(true);
+    expect(fs.existsSync(path.join(second, NEW_NAME)), 'later local copy written').toBe(true);
+    expect(rclone.deleted).toEqual([]);
+    for (const name of OLD) expect(fs.existsSync(path.join(outputDir, name))).toBe(true);
+    expect(fs.existsSync(stampFile)).toBe(false);
+    expect(error?.destinationResults?.map((r) => [r.destination.type, r.uploadFailed ?? false])).toEqual([['s3', true], ['drime', false], ['local', false]]);
+  });
+
+  it('async: Drime fails, yet S3 still uploads, and the job fails without pruning', async () => {
+    const { cwd, outputDir, envFile } = setup();
+    seedLocal(outputDir);
+    const s3 = makeS3Fetch();
+    const rclone = makeFakeRclone({ fail: (args) => (args[0] === 'copyto' ? leakyError() : null) });
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    await expect(
+      runBackupJobAsync(jobOptions(cwd, outputDir, {
+        policy: { mode: 'keep-last', keepLast: 1 },
+        destinations: [{ type: 'local', path: outputDir }, { type: 'drime', path: 'app', envFile }, { type: 's3', bucket: 'b', keep: 1 }],
+        runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync, fetchImpl: s3.fetchImpl, env: S3_ENV } as never),
+      })),
+    ).rejects.toThrow('rclone copyto failed (exit 1)');
+    expect([...s3.objects.keys()].some((k) => k.endsWith(NEW_NAME)), 's3 uploaded after the Drime failure').toBe(true);
+    expect(s3.methods).not.toContain('DELETE');
+    for (const name of OLD) expect(fs.existsSync(path.join(outputDir, name))).toBe(true);
+  });
+
+  it('sync: a failing rclone destination does not stop Drime, and several failures are all named', () => {
+    const { cwd, outputDir, envFile } = setup();
+    const rclone = makeFakeRclone({ fail: (args) => (args[0] === 'copyto' && String(args[2]).startsWith('offsite:') ? new Error('upload exploded') : null) });
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let error: Failed | null = null;
+    try {
+      runBackupJob(jobOptions(cwd, outputDir, {
+        destinations: [{ type: 'local', path: outputDir }, { type: 'rclone', target: 'offsite:x' }, { type: 'drime', path: 'app', envFile }, { type: 'rclone', target: 'offsite:y' }],
+        runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync }),
+      }));
+    } catch (caught) { error = caught as Failed; }
+    expect(rclone.drimeObjects.has(NEW_NAME)).toBe(true);
+    expect(error?.message).toBe('2 destinations failed to upload: rclone:offsite:, rclone:offsite:');
+    expect(error?.destinationResults?.map((r) => r.uploadFailed ?? false)).toEqual([true, false, true]);
+  });
+});
+
+describe('upload failures never print error text (PKG-307 item 2)', () => {
+  it('an S3 failure whose response body holds a sentinel never reaches the logs, but the thrown error is unchanged', async () => {
+    const { cwd, outputDir } = setup();
+    const SENTINEL = 'SENTINEL_S3_BODY_4f1c';
+    const logs: string[] = [];
+    for (const method of ['log', 'warn', 'error'] as const) {
+      vi.spyOn(console, method).mockImplementation((...parts: unknown[]) => { logs.push(parts.join(' ')); });
+    }
+    const fetchImpl = () => ({ status: 500, headers: {}, body: Buffer.from(SENTINEL) });
+    let thrown: Error | null = null;
+    try {
+      await runBackupJobAsync(jobOptions(cwd, outputDir, {
+        destinations: [{ type: 'local', path: outputDir }, { type: 's3', bucket: 'b' }],
+        runtime: makeRuntime({ fetchImpl, env: S3_ENV } as never),
+      }));
+    } catch (caught) { thrown = caught as Error; }
+    expect(thrown?.message, 'the caller still gets the original error').toContain(SENTINEL);
+    expect(logs.join('\n')).toContain('upload to s3:b failed');
+    expect(logs.join('\n')).not.toContain(SENTINEL);
+  });
+});
+
+describe('backup alerts through --notify-command (PKG-307 item 3)', () => {
+  function notifyFixture() {
+    const { cwd, outputDir, envFile } = setup();
+    useRealSqliteIfPresent(cwd);
+    const sink = path.join(cwd, 'alerts.log');
+    const notify = `printf '%s\\n' "$DB_BACKUP_ALERT" >> ${JSON.stringify(sink)}`;
+    const alerts = () => (fs.existsSync(sink) ? fs.readFileSync(sink, 'utf8').trim().split('\n') : []);
+    return { cwd, outputDir, envFile, notify, alerts };
+  }
+  const b64Json = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64');
+
+  itOnPosix('a failing deletefile: the backup succeeds (exit 0) and a distinct retention-failed alert is delivered', async () => {
+    const { cwd, outputDir, envFile, notify, alerts } = notifyFixture();
+    const seeded = Array.from({ length: 12 }, (_v, i) => `sqlite-backup-202606${String(i + 10).padStart(2, '0')}-150000Z.db`);
+    const bin = installFakeRclone([
+      { match: 'lsjson --stat', stdoutBase64: b64Json({ Size: fs.statSync(path.join(cwd, 'app.db')).size }) },
+      { match: 'lsjson dbbdrimecrypt:', stdoutBase64: b64Json(seeded.map((n) => ({ Path: n, Name: n, IsDir: false }))) },
+      { match: 'deletefile', exit: 1, stderr: `${SECRETS.token} ${SECRETS.pass}` },
+    ]);
+    const { out, thrown, exitCode } = await cli(bin, cwd, [...CLI_FLAGS, '--dest', 'drime:app', '--drime-env-file', envFile, '--output-dir', outputDir, '--notify-command', notify]);
+    expect(thrown).toBeNull();
+    expect(exitCode).toBeUndefined();
+    const delivered = alerts();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain('the backup succeeded but retention failed on drime:app (delete-failed)');
+    expect(delivered[0]).not.toContain('FAILED');
+    expectNoSecrets(out + delivered.join('\n'));
+  });
+
+  itOnPosix('a failed upload alerts a job failure with the destination label and no error text', async () => {
+    const { cwd, outputDir, envFile, notify, alerts } = notifyFixture();
+    const bin = installFakeRclone([{ match: 'copyto', exit: 1, stderr: `${SECRETS.token} ${SECRETS.pass}` }]);
+    const { out, thrown } = await cli(bin, cwd, [...CLI_FLAGS, '--dest', 'drime:app', '--drime-env-file', envFile, '--output-dir', outputDir, '--notify-command', notify]);
+    expect(thrown).toBeTruthy();
+    const delivered = alerts();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toBe('🔴 db-backup FAILED: drime:app (upload failed). Nothing was pruned or stamped');
+    expectNoSecrets(out + delivered.join('\n'));
+  });
+
+  itOnPosix('an over-cap backup alerts a job failure', async () => {
+    const { cwd, outputDir, envFile, notify, alerts } = notifyFixture();
+    const cfg = path.join(cwd, 'db-backup.config.json');
+    fs.writeFileSync(cfg, JSON.stringify({ databaseUrl: 'file:./app.db', destinations: [{ type: 'drime', path: 'app', envFile, maxBytes: 3 }] }));
+    const { thrown } = await cli(installFakeRclone([]), cwd, [...CLI_FLAGS, '--config', cfg, '--output-dir', outputDir, '--notify-command', notify]);
+    expect(thrown).toBeTruthy();
+    expect(alerts()).toEqual(['🔴 db-backup FAILED: drime:app (over its size cap). Nothing was pruned or stamped']);
+  });
+
+  itOnPosix('an ambiguous inventory raises the retention-failed alert with its reason', async () => {
+    const { cwd, outputDir, envFile, notify, alerts } = notifyFixture();
+    const dup = 'sqlite-backup-20260602-150000Z.db';
+    const bin = installFakeRclone([
+      { match: 'lsjson --stat', stdoutBase64: b64Json({ Size: fs.statSync(path.join(cwd, 'app.db')).size }) },
+      { match: 'lsjson dbbdrimecrypt:', stdoutBase64: b64Json([dup, dup].map((n) => ({ Path: n, Name: n, IsDir: false }))) },
+    ]);
+    const { exitCode } = await cli(bin, cwd, [...CLI_FLAGS, '--dest', 'drime:app', '--drime-env-file', envFile, '--output-dir', outputDir, '--notify-command', notify]);
+    expect(exitCode).toBeUndefined();
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0]).toContain('retention failed on drime:app (ambiguous-inventory)');
+  });
+
+  itOnPosix('an unreadable --config still delivers the failure alert', async () => {
+    const { cwd, outputDir, notify, alerts } = notifyFixture();
+    const { thrown } = await cli(installFakeRclone([]), cwd, [...CLI_FLAGS, '--config', path.join(cwd, 'absent.json'), '--output-dir', outputDir, '--notify-command', notify]);
+    expect(thrown).toBeTruthy();
+    expect(alerts()).toEqual(['🔴 db-backup FAILED: the backup did not complete; see the job log']);
+  });
+
+  itOnPosix.each([
+    ['inline connection string', ':drime,access_token=SENTINEL_CONN_TOKEN_5e2a:backups'],
+    ['named connection string', 'offsite,access_token=SENTINEL_CONN_TOKEN_5e2a:backups'],
+  ])('a refused %s target never reaches the error, --json output, logs or the alert', async (_name, target) => {
+    const { cwd, outputDir, notify, alerts } = notifyFixture();
+    const bin = installFakeRclone([]);
+    const { out, thrown } = await cli(bin, cwd, [...CLI_FLAGS, '--remote', target, '--json', '--output-dir', outputDir, '--notify-command', notify]);
+    expect(thrown?.message).toMatch(/connection-string/);
+    const results = (thrown as { destinationResults?: { destination: Record<string, unknown> }[] }).destinationResults;
+    expect(results?.[0].destination).toEqual({ type: 'rclone' });
+    const everything = [out, String(thrown?.stack), JSON.stringify(results), ...alerts()].join('\n');
+    expect(everything).not.toContain('SENTINEL_CONN_TOKEN_5e2a');
+    expect(alerts()).toEqual(['🔴 db-backup FAILED: rclone:<rejected target> (upload failed). Nothing was pruned or stamped']);
+  });
+
+  itOnPosix('no sink + an invalid ambient timeout + a valid config timeout: a successful backup still exits 0', async () => {
+    const { cwd, outputDir, envFile } = notifyFixture();
+    const seeded = Array.from({ length: 12 }, (_v, i) => `sqlite-backup-202606${String(i + 10).padStart(2, '0')}-150000Z.db`);
+    const cfg = path.join(cwd, 'db-backup.config.json');
+    fs.writeFileSync(cfg, JSON.stringify({ databaseUrl: 'file:./app.db', commandTimeoutSeconds: 30, destinations: [{ type: 'drime', path: 'app', envFile }] }));
+    const bin = installFakeRclone([
+      { match: 'lsjson --stat', stdoutBase64: b64Json({ Size: fs.statSync(path.join(cwd, 'app.db')).size }) },
+      { match: 'lsjson dbbdrimecrypt:', stdoutBase64: b64Json(seeded.map((n) => ({ Path: n, Name: n, IsDir: false }))) },
+      { match: 'deletefile', exit: 1 },
+    ]);
+    vi.stubEnv('DB_BACKUP_COMMAND_TIMEOUT_MS', 'not-a-number');
+    try {
+      const { thrown, exitCode } = await cli(bin, cwd, [...CLI_FLAGS, '--config', cfg, '--output-dir', outputDir]);
+      expect(thrown).toBeNull();
+      expect(exitCode).toBeUndefined();
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  itOnPosix('with a sink, a notifier setup failure never replaces the original error', async () => {
+    const { cwd, outputDir, notify } = notifyFixture();
+    const missing = path.join(cwd, 'absent.json');
+    vi.stubEnv('DB_BACKUP_COMMAND_TIMEOUT_MS', 'not-a-number');
+    try {
+      const { out, thrown } = await cli(installFakeRclone([]), cwd, [...CLI_FLAGS, '--config', missing, '--output-dir', outputDir, '--notify-command', notify]);
+      expect(thrown?.message).not.toMatch(/DB_BACKUP_COMMAND_TIMEOUT_MS/);
+      expect(thrown?.message).toContain('absent.json');
+      expect(out).toContain('notification skipped: could not set up the notifier');
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  itOnPosix('a clean run sends nothing', async () => {
+    const { cwd, outputDir, envFile, notify, alerts } = notifyFixture();
+    const bin = installFakeRclone([
+      { match: 'lsjson --stat', stdoutBase64: b64Json({ Size: fs.statSync(path.join(cwd, 'app.db')).size }) },
+      { match: 'lsjson dbbdrimecrypt:', stdoutBase64: b64Json([]) },
+    ]);
+    const { thrown } = await cli(bin, cwd, [...CLI_FLAGS, '--dest', 'drime:app', '--drime-env-file', envFile, '--output-dir', outputDir, '--notify-command', notify]);
+    expect(thrown).toBeNull();
+    expect(alerts()).toEqual([]);
+  });
+});
+
+describe('audit listings above the default exec buffer (PKG-307 item 4)', () => {
+  const MIB = 1024 * 1024;
+
+  function bigAuditRuntime(entries: number) {
+    const raw = Array.from({ length: entries }, (_v, i) => ({ Path: `d/${'x'.repeat(200)}${i}`, Size: 100, IsDir: false }));
+    const crypt = [{ Path: 'dec/d', EncryptedPath: 'd', IsDir: true }, ...raw.map((entry) => ({ Path: `dec/${entry.Path}`, EncryptedPath: entry.Path, IsDir: false }))];
+    const execFileSync = (_c: string, args: string[], opts?: { maxBuffer?: number }) => {
+      let out: Buffer;
+      if (args[0] === 'lsjson' && args[1] === 'dbbdrimebase:') out = Buffer.from(JSON.stringify([{ Path: 'backups-encrypted', IsDir: true }]));
+      else if (args[0] === 'lsjson' && args.includes('--encrypted')) out = Buffer.from(JSON.stringify(crypt));
+      else if (args[0] === 'lsjson') out = Buffer.from(JSON.stringify([{ Path: 'd', IsDir: true }, ...raw]));
+      else if (args[0] === 'cat') out = Buffer.from(MAGIC);
+      else out = Buffer.from('{}');
+      if (out.length > (opts?.maxBuffer ?? MIB)) throw Object.assign(new Error('spawnSync rclone ENOBUFS'), { code: 'ENOBUFS', status: null });
+      return out;
+    };
+    return { runtime: { execFileSync, env: {} as Record<string, string | undefined> } };
+  }
+
+  it('audits completely a store whose recursive listing is over 1 MiB', () => {
+    const { runtime } = bigAuditRuntime(6000);
+    const { envFile } = setup();
+    const report = drimeAudit({ envFile, runtime });
+    expect(report.objects).toBe(6000);
+    expect(report.findings).toEqual([]);
+  });
+
+  it('a listing past the bound is "cannot audit" (exit 2), never a truncated parse', async () => {
+    const { cwd, envFile } = setup();
+    const out: string[] = [];
+    vi.spyOn(console, 'error').mockImplementation((...p: unknown[]) => { out.push(p.join(' ')); });
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    vi.spyOn(process, 'cwd').mockReturnValue(cwd);
+    const overflow = (_c: string, args: string[]) => {
+      if (args[0] === 'lsjson' && args[1] === 'dbbdrimebase:') return Buffer.from('[{"Path":"backups-encrypted","IsDir":true}]');
+      if (args[0] === 'backend') return Buffer.from('{}');
+      throw Object.assign(new Error('spawnSync rclone ENOBUFS'), { code: 'ENOBUFS', status: null });
+    };
+    expect(() => drimeAudit({ envFile, runtime: { execFileSync: overflow, env: {} } })).toThrow(/output exceeded the \d+-byte listing limit/);
+    void out;
   });
 });

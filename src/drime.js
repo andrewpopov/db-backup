@@ -216,7 +216,7 @@ function buildRcloneArgs(operation, target) {
     case 'stat':
       return ['lsjson', '--stat', objectTarget()];
     case 'list':
-      return ['lsf', target, '--files-only'];
+      return ['lsjson', target];
     default:
       return ['deletefile', objectTarget()];
   }
@@ -225,7 +225,7 @@ function buildRcloneArgs(operation, target) {
 // The ONLY place an rclone child for Drime is spawned. Returns the raw output,
 // or a failure that keeps the child's stderr internal (for classification by
 // the audit only); it is never put on an error or printed.
-function execContext(ctx, runtime, args) {
+function execContext(ctx, runtime, args, maxBuffer) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-rclone-'));
   try {
     const configPath = path.join(dir, 'rclone.conf');
@@ -234,12 +234,14 @@ function execContext(ctx, runtime, args) {
       const output = runtime.execFileSync('rclone', args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: buildChildEnv(runtime.env, configPath, ctx.remoteVars),
+        ...(maxBuffer ? { maxBuffer } : {}),
       });
       return { ok: true, output: output == null ? Buffer.alloc(0) : output };
     } catch (error) {
       return {
         ok: false,
         status: error && error.status != null ? error.status : null,
+        code: error && error.code ? error.code : null,
         stderr: String(error && error.stderr ? error.stderr : ''),
       };
     }
@@ -250,8 +252,8 @@ function execContext(ctx, runtime, args) {
 
 // A failure is a fixed string: child stderr can echo credentials, and nothing
 // from the child error (stderr, stdout, cause) is carried on the thrown error.
-function runWithContext(ctx, runtime, args) {
-  const result = execContext(ctx, runtime, args);
+function runWithContext(ctx, runtime, args, maxBuffer) {
+  const result = execContext(ctx, runtime, args, maxBuffer);
   if (!result.ok) {
     throw new Error(`rclone ${args[0]} failed (exit ${result.status === null ? 'unknown' : result.status})`);
   }
@@ -264,7 +266,8 @@ function privateCryptTarget(destination) {
 
 function runDrimeOperation(destination, runtime, operation) {
   const ctx = loadDrimeContext(destination);
-  return runWithContext(ctx, runtime, buildRcloneArgs(operation, privateCryptTarget(destination)));
+  const maxBuffer = operation.op === 'list' ? LISTING_MAX_BYTES : undefined;
+  return runWithContext(ctx, runtime, buildRcloneArgs(operation, privateCryptTarget(destination)), maxBuffer);
 }
 
 // Every Drime write target is derived from the validated path, never from a
@@ -423,6 +426,10 @@ const NAME_DECRYPT_FAILURE = new RegExp(
   'i',
 );
 
+// Past this bound a listing is "cannot audit", never a truncated parse.
+const LISTING_MAX_BYTES = 256 * 1024 * 1024;
+const AUDIT_LISTING_OPS = ['listTop', 'listRaw', 'listCrypt'];
+
 // Read-only audit operations. Raw names are always placed after `--`.
 function buildAuditArgs(ctx, operation) {
   const rawBase = `${PRIVATE_BASE}:`;
@@ -456,12 +463,16 @@ function parseJsonList(buffer, what) {
 }
 
 function failureText(args, result) {
+  if (result.code === 'ENOBUFS') {
+    return `rclone ${args[0]} output exceeded the ${LISTING_MAX_BYTES}-byte listing limit`;
+  }
   return `rclone ${args[0]} failed (exit ${result.status === null ? 'unknown' : result.status})`;
 }
 
 function auditExec(ctx, runtime, operation) {
   const args = buildAuditArgs(ctx, operation);
-  return { args, result: execContext(ctx, runtime, args) };
+  const maxBuffer = AUDIT_LISTING_OPS.includes(operation.op) ? LISTING_MAX_BYTES : undefined;
+  return { args, result: execContext(ctx, runtime, args, maxBuffer) };
 }
 
 function auditRun(ctx, runtime, operation, what) {
@@ -594,4 +605,5 @@ module.exports = {
   overCapOutcome,
   assertGenericRcloneTarget,
   drimeAudit,
+  LISTING_MAX_BYTES,
 };

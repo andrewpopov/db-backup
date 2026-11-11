@@ -395,8 +395,23 @@ nothing comes from ambient rclone config:
   names the set and size. The result carries `{ status: 'skipped-over-cap', size, maxBytes }`.
 - **Retention.** `keep` defaults to 10 and wins over a GFS plan, so exactly 10
   objects remain, the new one included. A prune failure logs a distinct
-  `ALERT drime prune failed` line and sets `pruneFailed` on the destination
-  result, but does not fail the run.
+  `ALERT drime prune failed` line and sets `pruneFailed: { overKeep, reason }`
+  on the destination result, but does not fail the run (the backup itself is
+  verified in place). With `--notify-*` it also raises the retention-failed
+  alert (see "Backup alerts").
+- **Duplicate names.** Drime allows two objects with one name, and a delete by
+  name removes whichever copy rclone resolves first, which may be the one meant
+  to survive. Before any delete, the `lsjson` listing (exact paths, files and
+  directories alike; only `IsDir: false` entries count as backups) is checked: the same path twice,
+  or a file and a directory at one path, refuses the whole prune
+  (`reason: 'ambiguous-inventory'`), keeps all history and raises the alert.
+  Generic `rclone` destinations apply the same refusal. Resolve it by hand
+  (`db-backup drime-audit` names the paths), then the next run prunes again.
+- **Every destination is attempted.** An outage at one destination (say S3) no
+  longer blocks the others: each upload is tried, then the job fails if any
+  failed. Retention, finalization and the success stamp are skipped, and the
+  thrown error carries every `destinationResults` entry (a failed upload has
+  `uploaded: null, uploadFailed: true`).
 
 A generic `rclone` destination refuses to write to Drime: its remote type is
 resolved with `rclone listremotes --long --json` using the same config and
@@ -415,7 +430,8 @@ names), and that every raw file starts with the rclone crypt header
 Drime allows duplicate names, so a duplicated path (or crypt root) is a finding:
 an ambiguous inventory is never reported clean. Exit 0 clean, 1 a demonstrated
 violation (each finding names the raw path), 2 the audit could not complete
-(transport, timeout, malformed output). `--json` prints the report.
+(transport, timeout, malformed output, or a listing larger than 256 MiB, which
+is refused rather than parsed truncated). `--json` prints the report.
 
 ### Native S3 remote (no rclone) — AWS S3 or Cloudflare R2
 
@@ -617,6 +633,26 @@ Notifications are **best-effort and synchronous** (POST via `curl`, or run the c
 a failing webhook never masks or manufactures a verdict, and `freshness` still exits
 non-zero on staleness. No `fetch`, so `runCli` stays synchronous and consumers'
 `try/catch` is unaffected.
+
+#### Backup alerts: `backup --notify-*`
+
+`backup` accepts the same `--notify-discord`, `--notify-webhook` and
+`--notify-command` flags (there are no config-file keys for them). Two distinct,
+secret-free messages, built from fixed strings and destination labels only
+(never error text, which can carry a command line or a provider response):
+
+- `🔴 db-backup FAILED: <destination> (upload failed | over its size cap)...`:
+  the job failed (any destination, over-cap included, or an unreadable config
+  or invalid retention policy, which have no destination to name). Exit non-zero as before.
+- `🟠 db-backup: the backup succeeded but retention failed on <destination>
+  (<reason>)`: a remote prune failed (`delete-failed`, `list-failed`,
+  `planning-failed`) or was refused (`ambiguous-inventory`). The job still exits 0
+  and stamps, because the backup itself is verified; the alert is how you learn
+  old backups are piling up. Covers rclone and Drime destinations (native S3
+  prune misses are not reported this way).
+
+A `--allow-missing` skip sends nothing. Unlike `freshness`, there is no
+suppression: each failing run sends one alert.
 
 #### Suppression: one alert per incident, not one per run
 
