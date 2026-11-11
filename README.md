@@ -440,6 +440,10 @@ is refused rather than parsed truncated). `--json` prints the report.
   children at once, all through the same hermetic context. Every listed object is
   checked exactly once or the audit fails closed (exit 2); a read failure names
   the raw path (an encrypted name, safe to print) and nothing else from the child.
+- **Transient read failures are retried.** A header read that fails with any exit
+  other than not-found (3 or 4) is retried up to 3 attempts in total, after 1 s
+  then 3 s; a read that returns bytes is never retried, so a wrong header is a
+  finding at once. Only the last failure exits 2, and it says how many attempts ran.
 - **A store that changes under the audit.** If a header read finds the object
   gone (rclone exit 3 or 4), that path is re-listed. Still gone: it is recorded
   as `changedDuringAudit` (printed as `changed-during-audit: <path>`, counted in
