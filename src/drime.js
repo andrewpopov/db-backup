@@ -222,32 +222,61 @@ function buildRcloneArgs(operation, target) {
   }
 }
 
-// The ONLY place an rclone child for Drime is spawned. Returns the raw output,
-// or a failure that keeps the child's stderr internal (for classification by
-// the audit only); it is never put on an error or printed.
-function execContext(ctx, runtime, args, maxBuffer) {
+function failureOf(error) {
+  return {
+    ok: false,
+    status: error && error.status != null ? error.status : null,
+    code: error && error.code ? error.code : null,
+    stderr: String(error && error.stderr ? error.stderr : ''),
+  };
+}
+
+function withPrivateConfig(ctx, runtime, run) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-rclone-'));
+  const configPath = path.join(dir, 'rclone.conf');
+  fs.writeFileSync(configPath, '', { mode: 0o600 });
+  const env = buildChildEnv(runtime.env, configPath, ctx.remoteVars);
+  const cleanup = () => fs.rmSync(dir, { recursive: true, force: true });
   try {
-    const configPath = path.join(dir, 'rclone.conf');
-    fs.writeFileSync(configPath, '', { mode: 0o600 });
+    const outcome = run(env);
+    if (outcome && typeof outcome.then === 'function') return outcome.finally(cleanup);
+    cleanup();
+    return outcome;
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+}
+
+// The ONLY places an rclone child for Drime is spawned (this and
+// execContextAsync, which differ only in how the child is awaited). Returns the
+// raw output, or a failure that keeps the child's stderr internal (for
+// classification by the audit only); it is never put on an error or printed.
+function execContext(ctx, runtime, args, maxBuffer) {
+  return withPrivateConfig(ctx, runtime, (env) => {
     try {
       const output = runtime.execFileSync('rclone', args, {
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: buildChildEnv(runtime.env, configPath, ctx.remoteVars),
+        env,
         ...(maxBuffer ? { maxBuffer } : {}),
       });
       return { ok: true, output: output == null ? Buffer.alloc(0) : output };
     } catch (error) {
-      return {
-        ok: false,
-        status: error && error.status != null ? error.status : null,
-        code: error && error.code ? error.code : null,
-        stderr: String(error && error.stderr ? error.stderr : ''),
-      };
+      return failureOf(error);
     }
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+  });
+}
+
+// Same contract over `runtime.execFile` (resolves the output, rejects with
+// { status, code, stderr }); a runtime without it runs the synchronous child.
+function execContextAsync(ctx, runtime, args) {
+  if (!runtime.execFile) return Promise.resolve(execContext(ctx, runtime, args));
+  return withPrivateConfig(ctx, runtime, (env) =>
+    runtime.execFile('rclone', args, { env }).then(
+      (output) => ({ ok: true, output: output == null ? Buffer.alloc(0) : output }),
+      failureOf,
+    ),
+  );
 }
 
 // A failure is a fixed string: child stderr can echo credentials, and nothing
@@ -447,6 +476,8 @@ function buildAuditArgs(ctx, operation) {
       return ['backend', 'decode', crypt, '--', operation.rawPath];
     case 'catHead':
       return ['cat', '--count', String(CRYPT_MAGIC.length), `${rawBase}${ctx.root}/${operation.rawPath}`];
+    case 'statRaw':
+      return ['lsjson', '--stat', `${rawBase}${ctx.root}/${operation.rawPath}`];
     default:
       throw new Error(`Unknown audit operation ${operation.op}`);
   }
@@ -473,6 +504,11 @@ function auditExec(ctx, runtime, operation) {
   const args = buildAuditArgs(ctx, operation);
   const maxBuffer = AUDIT_LISTING_OPS.includes(operation.op) ? LISTING_MAX_BYTES : undefined;
   return { args, result: execContext(ctx, runtime, args, maxBuffer) };
+}
+
+async function auditExecAsync(ctx, runtime, operation) {
+  const args = buildAuditArgs(ctx, operation);
+  return { args, result: await execContextAsync(ctx, runtime, args) };
 }
 
 function auditRun(ctx, runtime, operation, what) {
@@ -502,7 +538,128 @@ function findUndecryptable(ctx, runtime, rawPaths) {
 
 function auditReport(objects, findings) {
   const unique = new Map(findings.map((finding) => [`${finding.kind}\0${finding.path}`, finding]));
-  return { objects, findings: [...unique.values()] };
+  return { objects, findings: [...unique.values()], changedDuringAudit: [] };
+}
+
+const DEFAULT_AUDIT_CONCURRENCY = 8;
+const MAX_AUDIT_CONCURRENCY = 64;
+const DEFAULT_AUDIT_MAX_CHANGED = 50;
+// rclone exit codes: 3 directory not found, 4 file not found.
+const NOT_FOUND_EXIT_CODES = [3, 4];
+
+function auditLimits({ concurrency, maxChanged }) {
+  const limits = {
+    concurrency: concurrency ?? DEFAULT_AUDIT_CONCURRENCY,
+    maxChanged: maxChanged ?? DEFAULT_AUDIT_MAX_CHANGED,
+  };
+  if (!Number.isInteger(limits.concurrency) || limits.concurrency < 1 || limits.concurrency > MAX_AUDIT_CONCURRENCY) {
+    throw new Error(`Audit concurrency must be an integer from 1 to ${MAX_AUDIT_CONCURRENCY}`);
+  }
+  if (!Number.isInteger(limits.maxChanged) || limits.maxChanged < 0) {
+    throw new Error('Audit max-changed must be an integer >= 0');
+  }
+  return limits;
+}
+
+// Runs `work` over every item with at most `concurrency` in flight and returns
+// the results in item order. The first failure stops new work, lets in-flight
+// children finish, and is thrown; an item with no result is also a failure, so
+// an unchecked object can never be reported clean.
+async function runPool(items, concurrency, work) {
+  const results = new Array(items.length);
+  let next = 0;
+  let failure = null;
+  const lane = async () => {
+    while (!failure && next < items.length) {
+      const index = next;
+      next += 1;
+      try {
+        results[index] = await work(items[index]);
+      } catch (error) {
+        failure = failure || error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, lane));
+  if (failure) throw failure;
+  for (let index = 0; index < items.length; index += 1) {
+    if (results[index] === undefined) throw new DrimeAuditError('header check incomplete: an object was not checked');
+  }
+  return results;
+}
+
+function isNotFound(result) {
+  return !result.ok && NOT_FOUND_EXIT_CODES.includes(result.status);
+}
+
+// One object's header check. A not-found read means the object changed after
+// the listing: re-list that path, and read a replacement once.
+async function checkObject(ctx, runtime, entry, rawName, onChanged) {
+  const name = rawName(entry.Path);
+  const tooSmall = (size) => typeof size === 'number' && size < CRYPT_MIN_FILE_BYTES;
+  const notCrypt = (detail) => ({ finding: { kind: 'not-crypt-format', path: name, detail } });
+  const changed = { changed: true, path: entry.Path };
+  if (tooSmall(entry.Size)) return notCrypt(`only ${entry.Size} bytes`);
+
+  let read = await auditExecAsync(ctx, runtime, { op: 'catHead', rawPath: entry.Path });
+  if (isNotFound(read.result)) {
+    const listed = await auditExecAsync(ctx, runtime, { op: 'statRaw', rawPath: entry.Path });
+    if (isNotFound(listed.result)) return onChanged(changed);
+    if (!listed.result.ok) throw new DrimeAuditError(`re-listing ${name}: ${failureText(listed.args, listed.result)}`);
+    let current;
+    try {
+      current = JSON.parse(listed.result.output.toString());
+    } catch {
+      throw new DrimeAuditError(`re-listing ${name}: could not parse object listing`);
+    }
+    if (!current || current.IsDir) return onChanged(changed);
+    if (tooSmall(current.Size)) return notCrypt(`only ${current.Size} bytes`);
+    read = await auditExecAsync(ctx, runtime, { op: 'catHead', rawPath: entry.Path });
+    if (isNotFound(read.result)) return onChanged(changed);
+  }
+  if (!read.result.ok) throw new DrimeAuditError(`reading object header of ${name}: ${failureText(read.args, read.result)}`);
+  const head = Buffer.from(read.result.output);
+  if (head.length < CRYPT_MAGIC.length) {
+    throw new DrimeAuditError(`reading object header of ${name}: rclone cat returned fewer bytes than requested`);
+  }
+  return head.subarray(0, CRYPT_MAGIC.length).equals(CRYPT_MAGIC) ? {} : notCrypt('missing rclone crypt header');
+}
+
+function changeBudget(maxChanged) {
+  let spent = 0;
+  return (count) => {
+    spent += count;
+    if (spent > maxChanged) {
+      throw new DrimeAuditError(`store changed too much during audit (more than ${maxChanged} objects changed)`);
+    }
+  };
+}
+
+// Header reads for `entries`; a vanished object counts against the change budget.
+function checkHeaders(ctx, runtime, entries, rawName, limits, spendChange) {
+  const onChanged = (outcome) => {
+    spendChange(1);
+    return outcome;
+  };
+  return runPool(entries, limits.concurrency, (entry) => checkObject(ctx, runtime, entry, rawName, onChanged));
+}
+
+// Closing passes: a listing taken after the checks must equal the one they
+// were based on. The last pass must find nothing new, so only a stable
+// store whose every object was checked can report clean.
+const MAX_CLOSING_PASSES = 3;
+
+function entrySignature(entry) {
+  return entry.IsDir ? 'dir' : [entry.Size, entry.ModTime, entry.ID].join('|');
+}
+
+function signaturesOf(listing) {
+  const byPath = new Map();
+  for (const entry of listing) {
+    const signature = entrySignature(entry);
+    byPath.set(entry.Path, byPath.has(entry.Path) ? `${byPath.get(entry.Path)}\0${signature}` : signature);
+  }
+  return byPath;
 }
 
 // Namespace + format audit. Proves rclone-crypt format, not restorability.
@@ -510,7 +667,8 @@ function auditReport(objects, findings) {
 // from completing throws (exit 2), and an ambiguous inventory is never clean:
 // Drime allows duplicate names, and a path-addressed read cannot tell which
 // object it reached.
-function drimeAudit({ envFile, baseRemote, cryptRemote, runtime }) {
+async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurrency, maxChanged }) {
+  const limits = auditLimits({ concurrency, maxChanged });
   const ctx = loadContext({
     envFile: envFile || DEFAULT_DRIME_ENV_FILE,
     baseRemote: baseRemote || DEFAULT_DRIME_BASE_REMOTE,
@@ -520,16 +678,20 @@ function drimeAudit({ envFile, baseRemote, cryptRemote, runtime }) {
   const rawName = (rawPath) => `${base}:${ctx.root}/${rawPath}`;
   const findings = [];
 
-  const topLevel = parseJsonList(auditRun(ctx, runtime, { op: 'listTop' }, 'listing base remote'), 'base remote listing');
-  for (const entry of topLevel) {
-    if (entry.Path !== ctx.root) {
-      findings.push({ kind: 'unexpected-top-level', path: `${base}:${entry.Path}`, detail: 'not the crypt root' });
+  const listTop = () => parseJsonList(auditRun(ctx, runtime, { op: 'listTop' }, 'listing base remote'), 'base remote listing');
+  const namespaceFindings = (topLevel) => {
+    const found = topLevel
+      .filter((entry) => entry.Path !== ctx.root)
+      .map((entry) => ({ kind: 'unexpected-top-level', path: `${base}:${entry.Path}`, detail: 'not the crypt root' }));
+    const rootEntries = topLevel.filter((entry) => entry.Path === ctx.root);
+    if (rootEntries.length > 1 || rootEntries.some((entry) => !entry.IsDir)) {
+      found.push({ kind: 'ambiguous-path', path: `${base}:${ctx.root}`, detail: 'the crypt root is duplicated or not a directory' });
     }
-  }
+    return found;
+  };
+  const topLevel = listTop();
+  findings.push(...namespaceFindings(topLevel));
   const rootEntries = topLevel.filter((entry) => entry.Path === ctx.root);
-  if (rootEntries.length > 1 || rootEntries.some((entry) => !entry.IsDir)) {
-    findings.push({ kind: 'ambiguous-path', path: `${base}:${ctx.root}`, detail: 'the crypt root is duplicated or not a directory' });
-  }
   if (rootEntries.length !== 1 || !rootEntries[0].IsDir) {
     return auditReport(0, findings);
   }
@@ -572,24 +734,75 @@ function drimeAudit({ envFile, baseRemote, cryptRemote, runtime }) {
     throw new DrimeAuditError(`strict crypt listing: ${failureText(strictArgs, strict)}`);
   }
 
-  for (const entry of raw.filter((candidate) => !candidate.IsDir && !ambiguous.has(candidate.Path))) {
-    if (typeof entry.Size === 'number' && entry.Size < CRYPT_MIN_FILE_BYTES) {
-      findings.push({ kind: 'not-crypt-format', path: rawName(entry.Path), detail: `only ${entry.Size} bytes` });
-      continue;
+  const spendChange = changeBudget(limits.maxChanged);
+  const headerFindings = new Map();
+  const changed = new Set();
+  const checkFiles = async (listing) => {
+    const counts = new Map();
+    for (const entry of listing) counts.set(entry.Path, (counts.get(entry.Path) || 0) + 1);
+    const readable = listing.filter((entry) => !entry.IsDir && counts.get(entry.Path) === 1);
+    for (const entry of readable) {
+      headerFindings.delete(entry.Path);
+      changed.delete(entry.Path);
     }
-    const head = auditRun(ctx, runtime, { op: 'catHead', rawPath: entry.Path }, 'reading object header');
-    if (Buffer.from(head).length < CRYPT_MAGIC.length) {
-      throw new DrimeAuditError('reading object header: rclone cat returned fewer bytes than requested');
-    }
-    if (!Buffer.from(head).subarray(0, CRYPT_MAGIC.length).equals(CRYPT_MAGIC)) {
-      findings.push({ kind: 'not-crypt-format', path: rawName(entry.Path), detail: 'missing rclone crypt header' });
+    const outcomes = await checkHeaders(ctx, runtime, readable, rawName, limits, spendChange);
+    outcomes.forEach((outcome, index) => {
+      if (outcome.finding) headerFindings.set(readable[index].Path, outcome.finding);
+      if (outcome.changed) changed.add(readable[index].Path);
+    });
+  };
+
+  await checkFiles(raw);
+  let current = raw;
+  let known = signaturesOf(raw);
+  let knownTop = signaturesOf(topLevel);
+  let stable = false;
+  for (let pass = 0; pass < MAX_CLOSING_PASSES && !stable; pass += 1) {
+    const relisted = parseJsonList(auditRun(ctx, runtime, { op: 'listRaw' }, 're-listing raw objects'), 'raw re-listing');
+    const relistedTop = listTop();
+    const nowTop = signaturesOf(relistedTop);
+    const topChanged = [...new Set([...knownTop.keys(), ...nowTop.keys()])].filter((entryPath) => knownTop.get(entryPath) !== nowTop.get(entryPath));
+    const now = signaturesOf(relisted);
+    const removed = [...known.keys()].filter((rawPath) => !now.has(rawPath) && !changed.has(rawPath));
+    const touched = [...now.keys()].filter((rawPath) => known.get(rawPath) !== now.get(rawPath));
+    stable = removed.length === 0 && touched.length === 0 && topChanged.length === 0;
+    if (!stable) {
+      spendChange(removed.length + touched.length + topChanged.length);
+      findings.push(...namespaceFindings(relistedTop));
+      knownTop = nowTop;
+      for (const rawPath of removed) {
+        changed.add(rawPath);
+        headerFindings.delete(rawPath);
+      }
+      const touchedSet = new Set(touched);
+      for (const rawPath of findUndecryptable(ctx, runtime, touched)) {
+        findings.push({ kind: 'undecryptable', path: rawName(rawPath), detail: 'name does not decrypt through the crypt remote' });
+      }
+      const counts = new Map(relisted.map((entry) => [entry.Path, 0]));
+      for (const entry of relisted) counts.set(entry.Path, counts.get(entry.Path) + 1);
+      for (const rawPath of touchedSet) {
+        if (counts.get(rawPath) > 1) {
+          findings.push({ kind: 'ambiguous-path', path: rawName(rawPath), detail: 'more than one raw entry has this path' });
+        }
+      }
+      await checkFiles(relisted.filter((entry) => touchedSet.has(entry.Path)));
+      known = now;
+      current = relisted;
     }
   }
+  if (!stable) {
+    throw new DrimeAuditError(`store changed too much during audit (still changing after ${MAX_CLOSING_PASSES} re-listings)`);
+  }
 
-  return auditReport(raw.filter((entry) => !entry.IsDir).length, findings);
+  findings.push(...headerFindings.values());
+  const files = current.filter((candidate) => !candidate.IsDir);
+  const checked = files.filter((entry) => !changed.has(entry.Path)).length;
+  return { ...auditReport(checked, findings), changedDuringAudit: [...changed].map(rawName) };
 }
 
 module.exports = {
+  DEFAULT_AUDIT_CONCURRENCY,
+  DEFAULT_AUDIT_MAX_CHANGED,
   DEFAULT_DRIME_ENV_FILE,
   DEFAULT_DRIME_BASE_REMOTE,
   DEFAULT_DRIME_CRYPT_REMOTE,
