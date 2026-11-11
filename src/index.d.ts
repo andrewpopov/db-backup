@@ -483,12 +483,86 @@ export function resolveDestinations(options: {
  * against `cwd`). Throws on an invalid shape. */
 export function normalizeDestination(destination: unknown, cwd: string): BackupDestination;
 
+/** @deprecated Use `db-backup install-schedule` with a `db-backup.schedule.json`. */
 export function buildDailyCronEntry(options?: {
   hour?: number;
   minute?: number;
   command?: string;
   logPath?: string;
 }): string;
+
+export interface ScheduleJob {
+  id: string;
+  /** 5-field cron expression (digits, `*`, `,`, `-`, `/`). */
+  cron: string;
+  /** Free-form shell; an unescaped `%` is refused. Runs after `cd <cwd> &&`. */
+  command: string;
+  /** Absolute log path, appended to. */
+  log: string;
+  /** Id of a job this one must run strictly later than on every day both run. */
+  after?: string;
+}
+
+export interface BackupSchedule {
+  /** Block id: `[a-z0-9-]+`, rendered as `# db-backup:<name>`. */
+  name: string;
+  cwd: string;
+  jobs: ScheduleJob[];
+}
+
+export interface CrontabBlock {
+  start: string;
+  end: string;
+  lines: string[];
+}
+
+export interface CrontabReplacements {
+  /** Substrings, each matching exactly one entry line to remove. */
+  lines?: string[];
+  /** Marker pairs, each matching exactly one well-formed block to remove. */
+  blocks?: Array<{ start: string; end: string }>;
+}
+
+/** Throws an Error naming the offending field. Returns the normalized schedule. */
+export function validateSchedule(raw: unknown): BackupSchedule;
+export function renderScheduleBlock(schedule: BackupSchedule): CrontabBlock;
+
+/** Pure crontab transform: `block` replaces its own marked pair, the replacement
+ * blocks and lines, at the first removed item's position (appended if none).
+ * Duplicate, unpaired, nested or overlapping markers throw. */
+export function replaceCrontabBlock(
+  currentText: string,
+  block: CrontabBlock,
+  replacements?: CrontabReplacements,
+): string;
+
+export interface InstallScheduleOptions {
+  configPath?: string | null;
+  dryRun?: boolean;
+  replaceLines?: string[];
+  replaceBlocks?: Array<{ start: string; end: string }>;
+  strict?: boolean;
+  cwd?: string;
+}
+
+export interface InstallScheduleDeps {
+  readFile?: (path: string, encoding: 'utf8') => string;
+  exists?: (path: string) => boolean;
+  getUid?: () => number | undefined;
+  read?: () => string;
+  write?: (content: string) => void;
+}
+
+export interface InstallScheduleResult {
+  name: string;
+  dryRun: boolean;
+  changed: boolean;
+  written: boolean;
+  diff: string;
+  warnings: string[];
+}
+
+export function installSchedule(options?: InstallScheduleOptions, deps?: InstallScheduleDeps): InstallScheduleResult;
 
 export function listBackupsWithPlan(options?: BackupOptions): BackupListResult;
 export function pruneBackupsJob(options?: BackupOptions): PruneJobResult;

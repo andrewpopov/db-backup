@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.23.0
+
+- New `db-backup install-schedule` writes an app's backup schedule from its repo into the invoking user's crontab
+  The schedule lives in `db-backup.schedule.json` (`--config <path>` overrides): a `name`, an absolute `cwd`, and `jobs` with an `id`, a 5-field `cron`, a `command`, an absolute `log` and an optional `after` that must run strictly later than the job it names. It writes one `# db-backup:<name>` block, replaces an existing block in place, and a rerun with no change writes nothing. `--replace-line <substring>` and `--replace-block <start>=<end>` migrate an old unmarked line or marked block, each requiring exactly one match, and the new block takes the first removed item's position so it does not inherit a mid-file `PATH=`. It refuses root, a missing `cwd` on a real install, duplicate, unpaired or nested markers and an unescaped `%` in a command; `TZ=`/`CRON_TZ=` lines warn, or fail with `--strict`. `--dry-run` prints a diff and writes nothing; `--json` prints the result. `installSchedule`, `validateSchedule`, `renderScheduleBlock` and the pure `replaceCrontabBlock` are exported.
+- The `cron` command and `buildDailyCronEntry` are deprecated in favour of `install-schedule`
+  Both keep working unchanged.
+
 ## 0.22.2
 
 - Depends on alert-kit v0.7.1, so installing db-backup no longer starts a nested npm install
