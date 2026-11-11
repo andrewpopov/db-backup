@@ -80,7 +80,10 @@ export interface LocalDestination {
 
 export interface RcloneDestination {
   type: 'rclone';
-  /** rclone destination directory, e.g. `offsite:backups/app`. */
+  /** rclone destination directory, e.g. `offsite:backups/app`. Refused at upload
+   * when the remote (resolved from the same config the upload uses) is Drime or a
+   * wrapper type (alias, union, combine, chunker, hasher, compress, crypt, cache),
+   * or when the target is an inline connection string. Use a `drime` destination. */
   target: string;
   /** Re-read the uploaded object and compare sizes. Default true. */
   verify?: boolean;
@@ -108,7 +111,33 @@ export interface S3Destination {
   prune?: boolean;
 }
 
-export type BackupDestination = LocalDestination | RcloneDestination | S3Destination;
+/** Encrypted Drime store. db-backup owns the rclone context: credentials come
+ * from `envFile` only, encryption (rclone crypt, standard names, encrypted
+ * directories, encrypted data) is fixed, and no ambient rclone config applies.
+ * Over `maxBytes` the upload is skipped and the whole run fails. */
+export interface DrimeDestination {
+  type: 'drime';
+  /** Relative set path under the crypt root, e.g. `app-name`. */
+  path: string;
+  /** Default `/etc/db-backup/drime.env`. */
+  envFile?: string;
+  /** Base remote name in the env file. Default `drime`. */
+  baseRemote?: string;
+  /** Crypt remote name in the env file. Default `drimecrypt`. */
+  cryptRemote?: string;
+  /** Objects retained, including the new one. Default 10 (wins over a GFS plan). */
+  keep?: number;
+  /** Largest artifact (decimal bytes, after optional gpg) that is uploaded.
+   * Positive safe integer. Default 5_000_000_000. */
+  maxBytes?: number;
+}
+
+export type BackupDestination = LocalDestination | RcloneDestination | S3Destination | DrimeDestination;
+
+/** Typed per-destination outcome, set on `drime` destinations. */
+export type DrimeOutcome =
+  | { status: 'uploaded'; size: number }
+  | { status: 'skipped-over-cap'; size: number; maxBytes: number };
 
 export interface BackupEncryption {
   /** Path to a file containing the symmetric passphrase. A file, never an
@@ -119,7 +148,10 @@ export interface BackupEncryption {
 }
 
 export interface BackupRemote {
-  /** rclone destination directory, e.g. `offsite:backups/app`. */
+  /** rclone destination directory, e.g. `offsite:backups/app`. Refused at upload
+   * when the remote (resolved from the same config the upload uses) is Drime or a
+   * wrapper type (alias, union, combine, chunker, hasher, compress, crypt, cache),
+   * or when the target is an inline connection string. Use a `drime` destination. */
   target: string;
   /** Re-read the uploaded object and compare sizes. Default true. Turning this
    * off means the "backup" is unverified — prefer not to. */
@@ -358,9 +390,14 @@ export interface BackupPlan {
  * with the single-remote era. */
 export interface BackupDestinationResult {
   destination: BackupDestination;
-  uploaded: BackupUploadResult;
+  /** Null only for a `drime` destination skipped as over-cap (the run then fails). */
+  uploaded: BackupUploadResult | null;
   /** Filenames pruned at this destination after its verified upload. */
   removed: string[];
+  /** `drime` destinations only. */
+  outcome?: DrimeOutcome;
+  /** `drime` destinations only: set when pruning missed objects (the run still succeeds). */
+  pruneFailed?: { overKeep: number | null };
 }
 
 export interface BackupJobResult {

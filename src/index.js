@@ -41,6 +41,16 @@ const {
 const { installSchedule, validateSchedule, renderScheduleBlock } = require('./schedule');
 const { replaceCrontabBlock } = require('./crontab');
 const { planFlatRemoteRetention } = require('./remote-retention');
+const {
+  normalizeDrimeDestination,
+  loadDrimeContext,
+  runDrimeOperation,
+  buildRcloneArgs,
+  drimeTargetOf,
+  overCapOutcome,
+  assertGenericRcloneTarget,
+  drimeAudit,
+} = require('./drime');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -188,6 +198,9 @@ function parseArgs(argv) {
     notifyCommand: null,
     notifyDiscord: null,
     notifyWebhook: null,
+    drimeEnvFile: null,
+    drimeBaseRemote: null,
+    drimeCryptRemote: null,
   };
 
   const commandArg = argv[0];
@@ -198,7 +211,8 @@ function parseArgs(argv) {
     commandArg === 'cron' ||
     commandArg === 'install-schedule' ||
     commandArg === 'restore' ||
-    commandArg === 'freshness'
+    commandArg === 'freshness' ||
+    commandArg === 'drime-audit'
   ) {
     options.command = commandArg;
     argv = argv.slice(1);
@@ -393,6 +407,20 @@ function parseArgs(argv) {
       const value = argv[index + 1];
       if (!value) throw new Error('Missing value for --replace-line');
       options.replaceLines.push(value);
+      index += 1;
+      continue;
+    }
+
+    const drimeFlags = {
+      '--drime-env-file': 'drimeEnvFile',
+      '--env-file': 'drimeEnvFile',
+      '--base-remote': 'drimeBaseRemote',
+      '--crypt-remote': 'drimeCryptRemote',
+    };
+    if (drimeFlags[arg]) {
+      const value = argv[index + 1];
+      if (!value) throw new Error(`Missing value for ${arg}`);
+      options[drimeFlags[arg]] = value;
       index += 1;
       continue;
     }
@@ -1056,7 +1084,7 @@ function resolveRetentionPolicy({
 // before: they map onto a `destinations` list under the hood (see
 // resolveDestinations) so there is one engine, not two.
 // ---------------------------------------------------------------------------
-const DESTINATION_TYPES = ['local', 'rclone', 's3'];
+const DESTINATION_TYPES = ['local', 'rclone', 's3', 'drime'];
 
 function assertValidRemoteKeep(dest, label) {
   if (dest.keep === undefined || dest.keep === null) return;
@@ -1076,6 +1104,9 @@ function normalizeDestination(dest, cwd) {
       throw new Error('A "local" destination requires "path"');
     }
     return { type: 'local', path: path.resolve(cwd, dest.path) };
+  }
+  if (dest.type === 'drime') {
+    return normalizeDrimeDestination(dest, cwd);
   }
   if (dest.type === 'rclone') {
     const target = dest.target || dest.remote;
@@ -1140,7 +1171,10 @@ function parseDestSpec(value) {
   if (type === 'rclone') {
     return { type: 'rclone', target: spec };
   }
-  throw new Error(`Invalid --dest type "${type}": expected local, s3, or rclone`);
+  if (type === 'drime') {
+    return { type: 'drime', path: spec };
+  }
+  throw new Error(`Invalid --dest type "${type}": expected local, s3, rclone, or drime`);
 }
 
 function loadJsonFile(filePath, label, cwd = process.cwd()) {
@@ -1249,7 +1283,7 @@ function resolveDestinations({ cwd, outputDir, destinations, remote, s3, skipRem
     if (!Array.isArray(destinations) || destinations.length === 0) {
       throw new Error(
         'Refusing to run with zero destinations: configure at least one place backups should go ' +
-          '(local, s3, or rclone) via destinations / --dest.',
+          '(local, s3, rclone, or drime) via destinations / --dest.',
       );
     }
     const resolved = destinations.map((dest) => normalizeDestination(dest, cwd));
@@ -3077,8 +3111,24 @@ function rcloneEnv(remote) {
   return remote.configFile ? { ...process.env, RCLONE_CONFIG: remote.configFile } : undefined;
 }
 
+// Every rclone child for a remote goes through here, so a drime destination
+// can never be spawned with the caller's ambient rclone environment.
+function runRclone(remote, runtime, operation) {
+  if (remote.type === 'drime') {
+    return runDrimeOperation(remote, runtime, operation);
+  }
+  return runtime.execFileSync('rclone', buildRcloneArgs(operation, remote.target), {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: rcloneEnv(remote),
+  });
+}
+
+function remoteTarget(remote) {
+  return remote.type === 'drime' ? drimeTargetOf(remote) : remote.target;
+}
+
 function remoteObjectPath(remote, fileName) {
-  return `${remote.target.replace(/\/+$/, '')}/${fileName}`;
+  return `${remoteTarget(remote).replace(/\/+$/, '')}/${fileName}`;
 }
 
 // Re-read the uploaded object and compare its size to the local artifact. rclone
@@ -3086,10 +3136,7 @@ function remoteObjectPath(remote, fileName) {
 // accept both. An unparseable response is a verification FAILURE, not a pass.
 function verifyRemoteObject(entry, remote, runtime) {
   const target = remoteObjectPath(remote, entry.fileName);
-  const output = runtime.execFileSync('rclone', ['lsjson', '--stat', target], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: rcloneEnv(remote),
-  });
+  const output = runRclone(remote, runtime, { op: 'stat', remoteRel: entry.fileName });
 
   let remoteSize = null;
   try {
@@ -3117,18 +3164,19 @@ function verifyRemoteObject(entry, remote, runtime) {
 }
 
 function uploadBackupToRemote(entry, remote, runtime) {
-  if (!remote.target) {
+  if (!remoteTarget(remote)) {
     throw new Error('remote.target is required to upload a backup');
   }
   if (!runtime.commandExists('rclone')) {
     throw new Error("Refusing to report success: remote upload was requested but the 'rclone' binary is unavailable");
   }
 
+  if (remote.type !== 'drime') {
+    assertGenericRcloneTarget(remote.target, runtime, rcloneEnv(remote));
+  }
+
   const target = remoteObjectPath(remote, entry.fileName);
-  runtime.execFileSync('rclone', ['copyto', entry.fullPath, target], {
-    stdio: 'pipe',
-    env: rcloneEnv(remote),
-  });
+  runRclone(remote, runtime, { op: 'copyto', localPath: path.resolve(entry.fullPath), remoteRel: entry.fileName });
 
   return remote.verify === false ? { target, sizeBytes: null } : verifyRemoteObject(entry, remote, runtime);
 }
@@ -3233,18 +3281,14 @@ function remoteBackupEntries(names, namePrefix) {
 // Prune remote objects per `policy`, never the one just uploaded and verified.
 // A flat keep-last count keeps `keepLast` objects in total, that one included.
 // A prune failure is a cleanup miss, not a data-safety issue: warn and carry on.
-function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null, policy = null, now = new Date()) {
+// `overKeep` is how many objects were meant to go but stayed (null: unknown).
+function pruneRemoteBackupsDetailed(remote, protectFileName, runtime, namePrefix = null, policy = null, now = new Date()) {
   let listing = '';
   try {
-    listing = runtime
-      .execFileSync('rclone', ['lsf', remote.target, '--files-only'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: rcloneEnv(remote),
-      })
-      .toString();
+    listing = runRclone(remote, runtime, { op: 'list' }).toString();
   } catch (error) {
     console.warn(`[db-backup] Could not list remote backups for pruning: ${error.message}`);
-    return [];
+    return { deleted: [], failed: true, overKeep: null };
   }
 
   const rawEntries = remoteBackupEntries(listing.split(/\r?\n/), namePrefix);
@@ -3257,7 +3301,7 @@ function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null,
       doomedNames = planFlatRemoteRetention(rawEntries, protectFileName, effectivePolicy.keepLast);
     } catch (error) {
       console.warn(`[db-backup] Retention planning failed for remote backups (leaving them in place): ${error.message}`);
-      return [];
+      return { deleted: [], failed: true, overKeep: null };
     }
   } else {
     const entries = rawEntries.some((entry) => entry.fileName === protectFileName)
@@ -3269,21 +3313,44 @@ function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null,
         .filter((name) => name !== protectFileName);
     } catch (error) {
       console.warn(`[db-backup] Retention planning failed for remote backups (leaving them in place): ${error.message}`);
-      return [];
+      return { deleted: [], failed: true, overKeep: null };
     }
   }
 
   const deleted = [];
   for (const fileName of doomedNames) {
     try {
-      runtime.execFileSync('rclone', ['deletefile', remoteObjectPath(remote, fileName)], {
-        stdio: 'pipe',
-        env: rcloneEnv(remote),
-      });
+      runRclone(remote, runtime, { op: 'deletefile', remoteRel: fileName });
       deleted.push(fileName);
     } catch (error) {
       console.warn(`[db-backup] Failed to prune remote backup ${fileName} (leaving it in place): ${error.message}`);
     }
+  }
+  const overKeep = doomedNames.length - deleted.length;
+  return { deleted, failed: overKeep > 0, overKeep };
+}
+
+function pruneRemoteBackups(remote, protectFileName, runtime, namePrefix = null, policy = null, now = new Date()) {
+  return pruneRemoteBackupsDetailed(remote, protectFileName, runtime, namePrefix, policy, now).deleted;
+}
+
+// A Drime prune miss is surfaced distinctly and never fails the run: the new
+// backup is already verified in place.
+function pruneDrimeBackups(distribution, protectFileName, runtime, namePrefix, policy, now) {
+  const { deleted, failed, overKeep } = pruneRemoteBackupsDetailed(
+    distribution.destination,
+    protectFileName,
+    runtime,
+    namePrefix,
+    policy,
+    now,
+  );
+  if (failed) {
+    const over = overKeep === null ? 'an unknown number of objects' : `${overKeep} objects`;
+    console.error(
+      `[db-backup] ALERT drime prune failed for ${distribution.destination.path}: ${over} over keep ${distribution.destination.keep}`,
+    );
+    distribution.pruneFailed = { overKeep };
   }
   return deleted;
 }
@@ -3721,6 +3788,49 @@ function finalizeBackupResult(resolved, created, now, distributions) {
   };
 }
 
+function preflightDrimeDestinations(resolved) {
+  for (const destination of resolved.destinations) {
+    if (destination.type === 'drime') loadDrimeContext(destination);
+  }
+}
+
+function uploadDrimeBackup(created, destination, runtime) {
+  const size = fs.statSync(created.fullPath).size;
+  const skipped = overCapOutcome(destination, size);
+  if (skipped) return { uploaded: null, outcome: skipped };
+  return { uploaded: uploadBackupToRemote(created, destination, runtime), outcome: { status: 'uploaded', size } };
+}
+
+// An over-cap Drime set is a failed run, but only after every other
+// destination had its upload: retention, finalization and the success stamp
+// are all skipped by the throw, and the staged artifact stays.
+function overCapMessage(distributions, created) {
+  const skipped = distributions.filter((d) => d.outcome && d.outcome.status === 'skipped-over-cap');
+  if (skipped.length === 0) return null;
+  const detail = skipped
+    .map((d) => `${d.destination.path}: ${created.fileName} is ${d.outcome.size} bytes, over maxBytes ${d.outcome.maxBytes}`)
+    .join('; ');
+  return `Drime upload skipped because the backup is over its size cap (${detail})`;
+}
+
+function failOnOverCapDrime(distributions, created) {
+  const message = overCapMessage(distributions, created);
+  if (!message) return;
+  const error = new Error(`${message}. Other destinations were uploaded; nothing was pruned or stamped.`);
+  error.destinationResults = distributions;
+  throw error;
+}
+
+// A later destination failing must not lose what already happened: the
+// accumulated outcomes ride on the error, and an earlier over-cap skip is
+// named in it.
+function keepResultsOnFailure(error, distributions, created) {
+  if (distributions.length > 0) error.destinationResults = distributions;
+  const capMessage = overCapMessage(distributions, created);
+  if (capMessage) error.message = `${error.message}; also: ${capMessage}`;
+  return error;
+}
+
 const S3_SYNC_REFUSAL_MESSAGE =
   'runBackupJob (the synchronous API) cannot use an S3 destination: uploading it would block the ' +
   'Node event loop for the entire upload, which is fine for a one-shot CLI process but freezes ' +
@@ -3756,6 +3866,7 @@ function runBackupJob(options = {}) {
   if (remoteDestinations.some((dest) => dest.type === 's3')) {
     throw new Error(S3_SYNC_REFUSAL_MESSAGE);
   }
+  preflightDrimeDestinations(resolved);
 
   ensureBackupDir(resolved.outputDir);
 
@@ -3800,16 +3911,27 @@ function runBackupJob(options = {}) {
       // primary re-listed, or a duplicate secondary — is refused rather than
       // silently self-copied. See replicateBackupToLocal.
       const seenLocalPaths = new Set(primaryLocal ? [path.resolve(primaryLocal.path)] : []);
-      const distributions = resolved.destinations
-        .filter((destination) => destination !== primaryLocal)
-        .map((destination) => ({
-          destination,
-          uploaded:
-            destination.type === 'local'
-              ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
-              : uploadBackupToRemote(created, destination, resolved.runtime),
-          removed: [],
-        }));
+      const distributions = [];
+      try {
+        for (const destination of resolved.destinations) {
+          if (destination === primaryLocal) continue;
+          distributions.push(
+            destination.type === 'drime'
+              ? { destination, ...uploadDrimeBackup(created, destination, resolved.runtime), removed: [] }
+              : {
+                  destination,
+                  uploaded:
+                    destination.type === 'local'
+                      ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
+                      : uploadBackupToRemote(created, destination, resolved.runtime),
+                  removed: [],
+                },
+          );
+        }
+      } catch (error) {
+        throw keepResultsOnFailure(error, distributions, created);
+      }
+      failOnOverCapDrime(distributions, created);
 
       // Retention is applied per destination only after EVERY destination has
       // a verified copy — a prune must never run ahead of replication. The
@@ -3826,14 +3948,17 @@ function runBackupJob(options = {}) {
           continue;
         }
         const policy = resolveDestinationPolicy(distribution.destination, resolved);
-        distribution.removed = pruneRemoteBackups(
-          distribution.destination,
-          created.fileName,
-          resolved.runtime,
-          resolved.namePrefix,
-          policy,
-          now,
-        );
+        distribution.removed =
+          distribution.destination.type === 'drime'
+            ? pruneDrimeBackups(distribution, created.fileName, resolved.runtime, resolved.namePrefix, policy, now)
+            : pruneRemoteBackups(
+                distribution.destination,
+                created.fileName,
+                resolved.runtime,
+                resolved.namePrefix,
+                policy,
+                now,
+              );
       }
 
       return finalizeBackupResult(resolved, created, now, distributions);
@@ -3858,6 +3983,7 @@ function runBackupJob(options = {}) {
 // call chain. The CLI awaits this for every `backup` invocation.
 async function runBackupJobAsync(options = {}) {
   const resolved = resolveBackupOptions({ ...options, requireOffsite: true });
+  preflightDrimeDestinations(resolved);
 
   ensureBackupDir(resolved.outputDir);
 
@@ -3895,16 +4021,25 @@ async function runBackupJobAsync(options = {}) {
       // runBackupJob for the full rationale.
       const seenLocalPaths = new Set(primaryLocal ? [path.resolve(primaryLocal.path)] : []);
       const distributions = [];
-      for (const destination of resolved.destinations) {
-        if (destination === primaryLocal) continue;
-        const uploaded =
-          destination.type === 'local'
-            ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
-            : destination.type === 's3'
-              ? await uploadBackupToS3(created, destination, resolved.runtime)
-              : uploadBackupToRemote(created, destination, resolved.runtime);
-        distributions.push({ destination, uploaded, removed: [] });
+      try {
+        for (const destination of resolved.destinations) {
+          if (destination === primaryLocal) continue;
+          if (destination.type === 'drime') {
+            distributions.push({ destination, ...uploadDrimeBackup(created, destination, resolved.runtime), removed: [] });
+            continue;
+          }
+          const uploaded =
+            destination.type === 'local'
+              ? replicateBackupToLocal(created, destination, resolved.runtime, seenLocalPaths)
+              : destination.type === 's3'
+                ? await uploadBackupToS3(created, destination, resolved.runtime)
+                : uploadBackupToRemote(created, destination, resolved.runtime);
+          distributions.push({ destination, uploaded, removed: [] });
+        }
+      } catch (error) {
+        throw keepResultsOnFailure(error, distributions, created);
       }
+      failOnOverCapDrime(distributions, created);
 
       // Retention is applied per destination only after EVERY destination has
       // a verified copy — a prune must never run ahead of replication. Local
@@ -3931,14 +4066,16 @@ async function runBackupJobAsync(options = {}) {
                 policy,
                 now,
               )
-            : pruneRemoteBackups(
-                distribution.destination,
-                created.fileName,
-                resolved.runtime,
-                resolved.namePrefix,
-                policy,
-                now,
-              );
+            : distribution.destination.type === 'drime'
+              ? pruneDrimeBackups(distribution, created.fileName, resolved.runtime, resolved.namePrefix, policy, now)
+              : pruneRemoteBackups(
+                  distribution.destination,
+                  created.fileName,
+                  resolved.runtime,
+                  resolved.namePrefix,
+                  policy,
+                  now,
+                );
       }
 
       return finalizeBackupResult(resolved, created, now, distributions);
@@ -4001,6 +4138,10 @@ Commands:
   restore                 Restore database from backup file
   freshness               Exit non-zero if the last success is older than the threshold
                           (checks --stamp-file, or --remote for an off-host monitor)
+  drime-audit             Audit the Drime store: only the crypt root at the top level,
+                          every object name decrypts, every object starts with the
+                          rclone crypt header. Proves rclone-crypt format, NOT that a
+                          backup restores. Exit 0 clean, 1 findings, 2 cannot audit.
 
 Options:
   --prod                  Use production env files (.env + .env.production)
@@ -4013,6 +4154,13 @@ Options:
                           rclone:<remote:path>. The NEW location model — an explicit,
                           non-empty list of where backups go. Cannot be combined with the
                           legacy --remote/--s3-bucket/--skip-remote/--output-dir flags.
+                          drime:<path> is the encrypted Drime store (capped at
+                          maxBytes, default 5000000000; keeps 10; credentials from the
+                          env file). Use --drime-env-file <path> to override
+                          /etc/db-backup/drime.env.
+  --env-file <path>       (command: drime-audit) Drime env file; also --base-remote
+                          <name> (default drime) and --crypt-remote <name> (default
+                          drimecrypt)
   --output-dir <path>     [legacy] Backup directory (default: backups/database)
   --retain-daily <n>      GFS: keep the N most-recent backups
   --retain-weekly <n>     GFS: keep one backup per week, for N weeks
@@ -4094,6 +4242,34 @@ Options:
                           'sqlite3' is unavailable (command: restore)
   --help                  Show help
 `);
+}
+
+// Exit 0 clean, 1 findings, 2 cannot audit.
+function runDrimeAuditCommand(options) {
+  let report;
+  try {
+    report = drimeAudit({
+      envFile: options.drimeEnvFile,
+      baseRemote: options.drimeBaseRemote,
+      cryptRemote: options.drimeCryptRemote,
+      runtime: normalizeRuntime({ commandTimeoutMs: options.commandTimeoutMs }),
+    });
+  } catch (error) {
+    if (options.json) console.log(JSON.stringify({ status: 'error', error: error.message }, null, 2));
+    console.error(`[db-backup] drime-audit cannot audit: ${error.message}`);
+    process.exitCode = 2;
+    return;
+  }
+  const status = report.findings.length === 0 ? 'clean' : 'findings';
+  if (options.json) {
+    console.log(JSON.stringify({ status, ...report }, null, 2));
+  } else {
+    console.log(`[db-backup] drime-audit: ${status}, ${report.objects} object(s) checked`);
+    for (const finding of report.findings) {
+      console.error(`[db-backup] FINDING ${finding.kind}: ${finding.path} (${finding.detail})`);
+    }
+  }
+  process.exitCode = status === 'clean' ? 0 : 1;
 }
 
 // Async: a CLI is a batch process, so it can freely await the S3-capable
@@ -4243,6 +4419,11 @@ async function runCli(argv = process.argv.slice(2)) {
     return;
   }
 
+  if (options.command === 'drime-audit') {
+    runDrimeAuditCommand(options);
+    return;
+  }
+
   if (options.command === 'cron') {
     const outputDir = options.outputDirProvided ? options.outputDir : null;
     let command = options.cronCommand;
@@ -4289,7 +4470,11 @@ async function runCli(argv = process.argv.slice(2)) {
   // inside resolveBackupOptions where the message would lack CLI context.
   const cliDestinations = options.destinations.length > 0 ? options.destinations : null;
   const configDestinations = !cliDestinations && config && config.destinations ? config.destinations : null;
-  const newModelDestinations = cliDestinations || configDestinations;
+  const chosenDestinations = cliDestinations || configDestinations;
+  const newModelDestinations =
+    chosenDestinations && options.drimeEnvFile
+      ? chosenDestinations.map((dest) => (dest.type === 'drime' ? { ...dest, envFile: options.drimeEnvFile } : dest))
+      : chosenDestinations;
   const legacyLocationFlagsUsed =
     Boolean(options.remoteTarget) || Boolean(options.s3Bucket) || options.skipRemote === true;
   if (newModelDestinations && legacyLocationFlagsUsed) {
@@ -4527,6 +4712,9 @@ async function runCli(argv = process.argv.slice(2)) {
         console.log(`[db-backup] ${error.message}; skipping backup.`);
       }
       return;
+    }
+    if (options.json && error && error.destinationResults) {
+      console.log(JSON.stringify({ ok: false, error: error.message, destinationResults: error.destinationResults }, null, 2));
     }
     throw error;
   }
