@@ -51,6 +51,7 @@ const {
   overCapOutcome,
   assertGenericRcloneTarget,
   drimeAudit,
+  drimeFetch,
   LISTING_MAX_BYTES,
 } = require('./drime');
 
@@ -208,6 +209,8 @@ function parseArgs(argv) {
     drimeConcurrency: null,
     drimeMaxChanged: null,
     drimePaths: [],
+    fetchFrom: null,
+    fetchOutput: null,
   };
 
   const commandArg = argv[0];
@@ -219,7 +222,8 @@ function parseArgs(argv) {
     commandArg === 'install-schedule' ||
     commandArg === 'restore' ||
     commandArg === 'freshness' ||
-    commandArg === 'drime-audit'
+    commandArg === 'drime-audit' ||
+    commandArg === 'fetch'
   ) {
     options.command = commandArg;
     argv = argv.slice(1);
@@ -428,6 +432,14 @@ function parseArgs(argv) {
       const value = argv[index + 1];
       if (!value) throw new Error(`Missing value for ${arg}`);
       options[drimeFlags[arg]] = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--from' || arg === '--output') {
+      const value = argv[index + 1];
+      if (!value) throw new Error(`Missing value for ${arg}`);
+      options[arg === '--from' ? 'fetchFrom' : 'fetchOutput'] = value;
       index += 1;
       continue;
     }
@@ -3348,6 +3360,35 @@ function remoteBackupEntries(names, namePrefix) {
     .filter(Boolean);
 }
 
+// Newest backup name by the filename's own timestamp (then sequence), the same
+// identity retention uses; never the listing order. Two names that tie are
+// ambiguous, so no pick.
+function newestBackupName(names, namePrefix = null) {
+  const ranked = remoteBackupEntries(names, namePrefix)
+    .map((entry) => ({ ...entry, sequence: parseBackupFileName(entry.fileName, namePrefix).sequence }))
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.sequence - a.sequence);
+  if (ranked.length > 1 && ranked[0].createdAt === ranked[1].createdAt && ranked[0].sequence === ranked[1].sequence) {
+    throw new Error('The newest Drime backup is ambiguous (two files share its timestamp); use --file');
+  }
+  return ranked.length > 0 ? ranked[0].fileName : null;
+}
+
+// Download one backup of a Drime set (read-only) into outputDir; the restore
+// source for a drill, since only db-backup holds the crypt context.
+function fetchFromDrime({ set, latest, file, outputDir, envFile, baseRemote, cryptRemote, namePrefix = null, runtime }) {
+  return drimeFetch({
+    set,
+    latest,
+    file,
+    outputDir,
+    envFile,
+    baseRemote,
+    cryptRemote,
+    runtime: runtime || normalizeRuntime(),
+    pickLatest: (names) => newestBackupName(names, namePrefix),
+  });
+}
+
 // Prune remote objects per `policy`, never the one just uploaded and verified.
 // A flat keep-last count keeps `keepLast` objects in total, that one included.
 // A prune failure is a cleanup miss, not a data-safety issue: warn and carry on.
@@ -4262,7 +4303,7 @@ function formatBytes(sizeBytes) {
 function showHelp() {
   console.log(`
 Usage:
-  db-backup [backup|list|prune|install-schedule|restore] [options]
+  db-backup [backup|list|prune|install-schedule|restore|fetch] [options]
 
 Commands:
   backup                  Create a backup and apply retention policy (default)
@@ -4274,6 +4315,14 @@ Commands:
   restore                 Restore database from backup file
   freshness               Exit non-zero if the last success is older than the threshold
                           (checks --stamp-file, or --remote for an off-host monitor)
+  fetch                   Download one backup from the Drime store (read-only):
+                          fetch --from drime:<set> (--latest | --file <name>)
+                          --output <dir>. Prints the fetched file's absolute path
+                          alone on stdout (--json: {file, size, set}); the size is
+                          checked against the listing, a partial file is deleted.
+                          --latest picks the newest by the filename timestamp
+                          (--name-prefix for a custom prefix). Refuses an ambiguous
+                          listing; never writes outside --output.
   drime-audit             Audit the Drime store: only the crypt root at the top level,
                           every object name decrypts, every object starts with the
                           rclone crypt header. Proves rclone-crypt format, NOT that a
@@ -4377,8 +4426,11 @@ Options:
                           (repeatable; command: install-schedule)
   --strict                Fail instead of warning on a TZ=/CRON_TZ= crontab line
                           (command: install-schedule)
-  --file <name|path>      Backup file to restore (command: restore)
-  --latest                Restore latest backup in output-dir (command: restore)
+  --file <name|path>      Backup file to restore (command: restore) or fetch (a plain name)
+  --latest                Restore latest backup in output-dir (command: restore) or
+                          fetch the newest from the Drime set (command: fetch)
+  --from drime:<set>      (command: fetch) The Drime set to download from
+  --output <dir>          (command: fetch) Directory to download into (created 0700)
   --no-pre-backup         Skip safety backup before restore (command: restore)
   --stop-writers-cmd <c>  Shell command run to quiesce writers before restore
                           replaces a live SQLite DB (command: restore)
@@ -4390,6 +4442,24 @@ Options:
                           'sqlite3' is unavailable (command: restore)
   --help                  Show help
 `);
+}
+
+// stdout carries exactly the fetched path (or the --json object) so a drill can capture it.
+async function runFetchCommand(options) {
+  const from = options.fetchFrom || '';
+  if (!from.startsWith('drime:')) throw new Error('fetch needs --from drime:<set>');
+  const fetched = await fetchFromDrime({
+    set: from.slice('drime:'.length),
+    latest: options.useLatest,
+    file: options.backupFile,
+    outputDir: options.fetchOutput,
+    envFile: options.drimeEnvFile,
+    baseRemote: options.drimeBaseRemote,
+    cryptRemote: options.drimeCryptRemote,
+    namePrefix: options.namePrefix,
+    runtime: normalizeRuntime({ commandTimeoutMs: options.commandTimeoutMs }),
+  });
+  console.log(options.json ? JSON.stringify({ file: fetched.file, size: fetched.size, set: fetched.set }) : fetched.path);
 }
 
 // Exit 0 clean, 1 findings, 2 cannot audit.
@@ -4618,6 +4688,11 @@ async function runParsedCli(options) {
 
   if (options.command === 'drime-audit') {
     await runDrimeAuditCommand(options);
+    return;
+  }
+
+  if (options.command === 'fetch') {
+    await runFetchCommand(options);
     return;
   }
 
@@ -4955,6 +5030,7 @@ module.exports = {
   normalizeDestination,
   planRetention,
   restoreBackup,
+  fetchFromDrime,
   runBackupJob,
   runBackupJobAsync,
   runCli,

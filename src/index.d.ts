@@ -692,6 +692,37 @@ export function runBackupJob(options?: BackupOptions): BackupJobResult;
 export function runBackupJobAsync(options?: BackupOptions): Promise<BackupJobResult>;
 export function runCli(argv?: string[]): Promise<void>;
 
+export interface FetchFromDrimeOptions {
+  /** The Drime set (a relative path inside the crypt root, e.g. `cairn`). */
+  set: string;
+  /** Fetch the newest backup by its filename timestamp. Exactly one of `latest` or `file`. */
+  latest?: boolean;
+  /** A plain file name in the set (no `/`, `:` or `..`). */
+  file?: string;
+  /** Created 0700; the file is written directly inside it, never elsewhere. */
+  outputDir: string;
+  /** Default `/etc/db-backup/drime.env`. */
+  envFile?: string;
+  baseRemote?: string;
+  cryptRemote?: string;
+  /** Custom backup filename prefix, for `latest`. */
+  namePrefix?: string | null;
+  runtime?: ResolvedBackupRuntime;
+}
+
+export interface FetchFromDrimeResult {
+  file: string;
+  size: number;
+  set: string;
+  /** Absolute path of the downloaded file. */
+  path: string;
+}
+
+/** Read-only download of one backup from the encrypted Drime store. Refuses an
+ * ambiguous listing, verifies the size against the listing (deleting the partial
+ * file on a mismatch) and retries transient rclone failures. */
+export function fetchFromDrime(options: FetchFromDrimeOptions): Promise<FetchFromDrimeResult>;
+
 /** Default process timeout applied to every external command (10 minutes). */
 export const DEFAULT_COMMAND_TIMEOUT_MS: number;
 
