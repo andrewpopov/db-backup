@@ -4,6 +4,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+const { isContainedWithin } = require('./storage');
+const { ambiguousRemoteNames } = require('./remote-retention');
+
 const DEFAULT_DRIME_ENV_FILE = '/etc/db-backup/drime.env';
 const DEFAULT_DRIME_BASE_REMOTE = 'drime';
 const DEFAULT_DRIME_CRYPT_REMOTE = 'drimecrypt';
@@ -183,6 +186,7 @@ const DESTINATION_OPERATION_KEYS = {
   copyto: ['op', 'localPath', 'remoteRel'],
   stat: ['op', 'remoteRel'],
   list: ['op'],
+  download: ['op', 'localPath', 'remoteRel'],
   deletefile: ['op', 'remoteRel'],
 };
 
@@ -198,13 +202,27 @@ function assertSafeRemoteRel(value) {
   return value;
 }
 
+// A downloaded object is addressed by one plain file name, never a path.
+function assertPlainFileName(value) {
+  const bad =
+    typeof value !== 'string' ||
+    !value ||
+    value === '.' ||
+    value.includes('..') ||
+    /[/\\:]/.test(value) ||
+    // eslint-disable-next-line no-control-regex
+    /[\u0000-\u001f]/.test(value);
+  if (bad) throw new Error('A drime download needs a plain file name (no "/", "\\", ":" or "..")');
+  return value;
+}
+
 // The one place rclone arguments for a destination are built: callers pass a
 // structured operation, never argv, so no flag (an rclone flag beats the
 // remote's encryption settings) can be added. `target` is `<remote>:<path>`.
 function buildRcloneArgs(operation, target) {
   const allowedKeys = operation && DESTINATION_OPERATION_KEYS[operation.op];
   if (!allowedKeys || Object.keys(operation).some((key) => !allowedKeys.includes(key))) {
-    throw new Error('A drime destination operation must be one of copyto, stat, list, deletefile, with no extra fields');
+    throw new Error('A drime destination operation must be one of copyto, stat, list, download, deletefile, with no extra fields');
   }
   const objectTarget = () => `${target.replace(/\/+$/, '')}/${assertSafeRemoteRel(operation.remoteRel)}`;
   switch (operation.op) {
@@ -217,6 +235,12 @@ function buildRcloneArgs(operation, target) {
       return ['lsjson', '--stat', objectTarget()];
     case 'list':
       return ['lsjson', target];
+    case 'download':
+      if (typeof operation.localPath !== 'string' || !path.isAbsolute(operation.localPath)) {
+        throw new Error('A drime download needs an absolute localPath');
+      }
+      assertPlainFileName(operation.remoteRel);
+      return ['copyto', objectTarget(), operation.localPath];
     default:
       return ['deletefile', objectTarget()];
   }
@@ -482,6 +506,8 @@ function buildAuditArgs(ctx, operation) {
       return ['cat', '--count', String(CRYPT_MAGIC.length), `${rawBase}${ctx.root}/${operation.rawPath}`];
     case 'statRaw':
       return ['lsjson', '--stat', `${rawBase}${ctx.root}/${operation.rawPath}`];
+    case 'destination':
+      return buildRcloneArgs(operation.operation, operation.target);
     default:
       throw new Error(`Unknown audit operation ${operation.op}`);
   }
@@ -508,7 +534,8 @@ function failureText(args, result) {
 // operation awaits its child.
 async function auditExecOnce(ctx, runtime, operation) {
   const args = buildAuditArgs(ctx, operation);
-  const result = AUDIT_LISTING_OPS.includes(operation.op)
+  const isListing = AUDIT_LISTING_OPS.includes(operation.op) || (operation.op === 'destination' && operation.operation.op === 'list');
+  const result = isListing
     ? execContext(ctx, runtime, args, LISTING_MAX_BYTES)
     : await execContextAsync(ctx, runtime, args);
   return { args, result };
@@ -893,6 +920,64 @@ async function drimeAudit({ envFile, baseRemote, cryptRemote, runtime, concurren
   return { ...auditReport(checked, findings, sets), changedDuringAudit: [...changed].map(rawName) };
 }
 
+function isSymlink(target) {
+  try {
+    return fs.lstatSync(target).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+// Read-only restore source: downloads one object of a set through the same
+// crypt context, never anywhere but `outputDir`. `pickLatest(names)` chooses
+// the newest backup name (injected: the filename parser lives in index.js).
+async function drimeFetch({ set, file, latest, outputDir, envFile, baseRemote, cryptRemote, runtime, pickLatest }) {
+  const safeSet = assertSafeDrimePath(set);
+  if (Boolean(file) === Boolean(latest)) throw new Error('fetch needs exactly one of --latest or --file');
+  if (file) assertPlainFileName(file);
+  if (typeof outputDir !== 'string' || !outputDir) throw new Error('fetch needs --output <dir>');
+  const ctx = loadContext({
+    envFile: envFile || DEFAULT_DRIME_ENV_FILE,
+    baseRemote: baseRemote || DEFAULT_DRIME_BASE_REMOTE,
+    cryptRemote: cryptRemote || DEFAULT_DRIME_CRYPT_REMOTE,
+  });
+  const target = `${PRIVATE_CRYPT}:${safeSet}`;
+
+  const listing = parseJsonList(
+    await auditRun(ctx, runtime, { op: 'destination', operation: { op: 'list' }, target }, 'listing set'),
+    'set listing',
+  );
+  if (listing.some((entry) => !entry || typeof entry.Path !== 'string' || typeof entry.IsDir !== 'boolean')) {
+    throw new DrimeAuditError('could not parse set listing');
+  }
+  if (ambiguousRemoteNames(listing.map((entry) => entry.Path)).length > 0) {
+    throw new Error('Drime set listing is ambiguous (a name appears twice, or as a file and a directory); refusing to fetch');
+  }
+  const files = listing.filter((entry) => !entry.IsDir);
+  const name = file || pickLatest(files.map((entry) => entry.Path));
+  const entry = name && files.find((candidate) => candidate.Path === name);
+  if (!entry) throw new Error(file ? 'The requested file is not in the Drime set' : 'The Drime set has no backup to fetch');
+  assertPlainFileName(name);
+  if (!Number.isInteger(entry.Size) || entry.Size < 0) throw new Error('Drime listing has no usable size for the file; refusing to fetch');
+
+  fs.mkdirSync(outputDir, { recursive: true, mode: 0o700 });
+  const realOutput = fs.realpathSync(outputDir);
+  const localPath = path.join(realOutput, name);
+  if (!isContainedWithin(realOutput, localPath) || path.dirname(localPath) !== realOutput) {
+    throw new Error('Refusing to write outside --output');
+  }
+  if (fs.existsSync(localPath) || isSymlink(localPath)) throw new Error('Refusing to overwrite an existing file in --output');
+
+  try {
+    await auditRun(ctx, runtime, { op: 'destination', operation: { op: 'download', localPath, remoteRel: name }, target }, 'downloading file');
+    if (fs.statSync(localPath).size !== entry.Size) throw new Error('Downloaded size does not match the Drime listing');
+  } catch (error) {
+    fs.rmSync(localPath, { force: true });
+    throw error;
+  }
+  return { file: name, size: entry.Size, set: safeSet, path: localPath };
+}
+
 module.exports = {
   DEFAULT_AUDIT_CONCURRENCY,
   DEFAULT_AUDIT_MAX_CHANGED,
@@ -911,5 +996,6 @@ module.exports = {
   overCapOutcome,
   assertGenericRcloneTarget,
   drimeAudit,
+  drimeFetch,
   LISTING_MAX_BYTES,
 };

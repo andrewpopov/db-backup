@@ -1462,7 +1462,7 @@ describe('drime destination: writes can only address the crypt remote (PKG-304 r
   ])('refuses %s before spawning rclone', (_name, operation) => {
     const { dest } = drimeDestination();
     const rclone = makeFakeRclone();
-    expect(() => runDrimeOperation(dest, rt(rclone), operation)).toThrow(/must be one of copyto, stat, list, deletefile, with no extra fields/);
+    expect(() => runDrimeOperation(dest, rt(rclone), operation)).toThrow(/must be one of copyto, stat, list, download, deletefile, with no extra fields/);
     expect(rclone.calls).toEqual([]);
   });
 
@@ -1930,5 +1930,235 @@ describe('audit listings above the default exec buffer (PKG-307 item 4)', () => 
     };
     await expect(drimeAudit({ envFile, runtime: { execFileSync: overflow, env: {} } })).rejects.toThrow(/output exceeded the \d+-byte listing limit/);
     void out;
+  });
+});
+
+describe('fetch from Drime (PKG-319)', () => {
+  const { fetchFromDrime } = dbBackup;
+  const OLD = 'sqlite-backup-20260701-030000Z.db.gz';
+  const MID = 'sqlite-backup-20260705-030000Z.db.gz';
+  const NEWEST = 'sqlite-backup-20260709-030000Z.db.gz';
+  const BYTES = Buffer.from('decrypted backup bytes');
+
+  interface Listed { Path: string; IsDir?: boolean; Size?: number }
+  const listed = (name: string, size = BYTES.length): Listed => ({ Path: name, IsDir: false, Size: size });
+
+  // In-process fake: listings answer execFileSync, downloads answer execFile
+  // (the async path) and write `written` bytes to the local destination.
+  function makeFetchRclone(options: { listing: Listed[]; written?: Buffer; failListing?: number; failDownload?: number; leak?: boolean }) {
+    const calls: string[][] = [];
+    let listingFailures = options.failListing ?? 0;
+    let downloadFailures = options.failDownload ?? 0;
+    const failure = () => (options.leak ? leakyError(5) : Object.assign(new Error('boom'), { status: 5, stderr: '' }));
+    const execFileSync = (_c: string, args: string[]) => {
+      calls.push(args);
+      if (args[0] === 'lsjson') {
+        if (listingFailures > 0) { listingFailures -= 1; throw failure(); }
+        return Buffer.from(JSON.stringify(options.listing.map((entry) => ({ IsDir: false, ...entry }))));
+      }
+      throw new Error('unexpected sync rclone call');
+    };
+    const execFile = async (_c: string, args: string[]) => {
+      calls.push(args);
+      if (args[0] !== 'copyto') throw new Error('unexpected async rclone call');
+      if (downloadFailures > 0) { downloadFailures -= 1; throw failure(); }
+      fs.writeFileSync(args[2], options.written ?? BYTES);
+      return Buffer.from('');
+    };
+    const sleeps: number[] = [];
+    const runtime = { execFileSync, execFile, env: {}, sleepAsync: async (ms: number) => { sleeps.push(ms); } } as unknown as Parameters<typeof fetchFromDrime>[0]['runtime'];
+    return { calls, runtime, sleeps, downloads: () => calls.filter((a) => a[0] === 'copyto') };
+  }
+
+  function fetchSetup() {
+    const { cwd, envFile } = setup();
+    return { envFile, outputDir: path.join(cwd, 'out', 'drill') };
+  }
+
+  it('--latest canary: picks the newest by filename timestamp, not listing order', async () => {
+    const { envFile, outputDir } = fetchSetup();
+    const fake = makeFetchRclone({ listing: [listed(MID), listed(NEWEST), listed(OLD), listed('notes.txt'), listed('sqlite-backup-20260801-030000Z.sql')] });
+    const result = await fetchFromDrime({ set: 'app', latest: true, outputDir, envFile, runtime: fake.runtime });
+    expect(result).toMatchObject({ file: NEWEST, size: BYTES.length, set: 'app' });
+    expect(fake.downloads()[0].slice(1)).toEqual([`dbbdrimecrypt:app/${NEWEST}`, path.join(fs.realpathSync(outputDir), NEWEST)]);
+    expect(fs.readFileSync(result.path)).toEqual(BYTES);
+    expect(fs.statSync(outputDir).mode & 0o777).toBe(0o700);
+  });
+
+  it('--latest canary: the -N sequence breaks a timestamp tie, and two files sharing both refuse', async () => {
+    const { envFile, outputDir } = fetchSetup();
+    const seq = makeFetchRclone({ listing: [listed('sqlite-backup-20260709-030000Z-2.db.gz'), listed(NEWEST)] });
+    expect((await fetchFromDrime({ set: 'app', latest: true, outputDir, envFile, runtime: seq.runtime })).file).toBe('sqlite-backup-20260709-030000Z-2.db.gz');
+    const tie = makeFetchRclone({ listing: [listed(NEWEST), listed('sqlite-backup-20260709-030000Z.db')] });
+    await expect(fetchFromDrime({ set: 'app', latest: true, outputDir: `${outputDir}-tie`, envFile, runtime: tie.runtime })).rejects.toThrow(/ambiguous/);
+    expect(tie.downloads()).toHaveLength(0);
+  });
+
+  it('--latest honours --name-prefix and fails when nothing parses', async () => {
+    const { envFile, outputDir } = fetchSetup();
+    const fake = makeFetchRclone({ listing: [listed('myapp-20260709-030000Z.db.gz'), listed(NEWEST)] });
+    expect((await fetchFromDrime({ set: 'app', latest: true, namePrefix: 'myapp', outputDir, envFile, runtime: fake.runtime })).file).toBe('myapp-20260709-030000Z.db.gz');
+    const none = makeFetchRclone({ listing: [listed('notes.txt')] });
+    await expect(fetchFromDrime({ set: 'app', latest: true, outputDir: `${outputDir}-b`, envFile, runtime: none.runtime })).rejects.toThrow('The Drime set has no backup to fetch');
+  });
+
+  describe('names are validated before any rclone call', () => {
+    it.each([
+      ['file with ..', { file: '..' }],
+      ['file with ../x', { file: '../x.db' }],
+      ['file with /', { file: 'a/b.db' }],
+      ['file with :', { file: 'drime:x.db' }],
+      ['file with a backslash', { file: 'a\\b.db' }],
+      ['set with ..', { set: 'a/../b' }],
+      ['set with a leading /', { set: '/etc' }],
+      ['set with :', { set: 'drime:x' }],
+    ])('canary: %s is refused', async (_label, override) => {
+      const { envFile, outputDir } = fetchSetup();
+      const fake = makeFetchRclone({ listing: [listed(MID)] });
+      await expect(fetchFromDrime({ set: 'app', file: MID, outputDir, envFile, runtime: fake.runtime, ...override })).rejects.toThrow();
+      expect(fake.calls).toHaveLength(0);
+      expect(fs.existsSync(outputDir)).toBe(false);
+    });
+
+    it('canary: the download op itself refuses a traversing remoteRel and a relative localPath', () => {
+      const { buildRcloneArgs } = require('../drime.js') as { buildRcloneArgs: (op: unknown, target: string) => string[] };
+      for (const remoteRel of ['..', '../x', 'a/b', 'a:b']) {
+        expect(() => buildRcloneArgs({ op: 'download', localPath: '/tmp/out/x', remoteRel }, 'dbbdrimecrypt:app')).toThrow();
+      }
+      expect(() => buildRcloneArgs({ op: 'download', localPath: 'out/x', remoteRel: 'x.db' }, 'dbbdrimecrypt:app')).toThrow('absolute localPath');
+      expect(() => buildRcloneArgs({ op: 'download', localPath: '/tmp/out/x', remoteRel: 'x.db', flags: ['--x'] }, 'dbbdrimecrypt:app')).toThrow(/no extra fields/);
+      expect(buildRcloneArgs({ op: 'download', localPath: '/tmp/out/x.db', remoteRel: 'x.db' }, 'dbbdrimecrypt:app')).toEqual(['copyto', 'dbbdrimecrypt:app/x.db', '/tmp/out/x.db']);
+    });
+  });
+
+  it('size-mismatch canary: a short download is deleted and the fetch fails', async () => {
+    const { envFile, outputDir } = fetchSetup();
+    const fake = makeFetchRclone({ listing: [listed(MID)], written: BYTES.subarray(0, 5) });
+    await expect(fetchFromDrime({ set: 'app', file: MID, outputDir, envFile, runtime: fake.runtime })).rejects.toThrow('Downloaded size does not match the Drime listing');
+    expect(fs.existsSync(path.join(outputDir, MID))).toBe(false);
+  });
+
+  describe('an ambiguous listing refuses', () => {
+    it.each([
+      ['a duplicated name', [listed(NEWEST), listed(NEWEST), listed(MID)]],
+      ['a file and a directory with one name', [listed(NEWEST), { Path: NEWEST, IsDir: true }]],
+    ])('canary: %s means no fetch', async (_label, listing) => {
+      const { envFile, outputDir } = fetchSetup();
+      for (const pick of [{ latest: true }, { file: MID }]) {
+        const fake = makeFetchRclone({ listing });
+        await expect(fetchFromDrime({ set: 'app', outputDir, envFile, runtime: fake.runtime, ...pick })).rejects.toThrow(/ambiguous/);
+        expect(fake.downloads()).toHaveLength(0);
+      }
+    });
+  });
+
+  describe('the download cannot target outside --output', () => {
+    itOnPosix('canary: a symlink planted at the destination is not written through', async () => {
+      const { envFile, outputDir } = fetchSetup();
+      const victim = path.join(makeTempDir(), 'victim');
+      fs.writeFileSync(victim, 'keep');
+      fs.mkdirSync(outputDir, { recursive: true });
+      fs.symlinkSync(victim, path.join(outputDir, MID));
+      const fake = makeFetchRclone({ listing: [listed(MID)] });
+      await expect(fetchFromDrime({ set: 'app', file: MID, outputDir, envFile, runtime: fake.runtime })).rejects.toThrow('Refusing to overwrite');
+      expect(fake.downloads()).toHaveLength(0);
+      expect(fs.readFileSync(victim, 'utf8')).toBe('keep');
+    });
+
+    it('canary: a listed name that would escape --output is refused before the download', async () => {
+      const { envFile, outputDir } = fetchSetup();
+      const fake = makeFetchRclone({ listing: [listed('../escape.db')] });
+      const drime = require('../drime.js') as { drimeFetch: (o: Record<string, unknown>) => Promise<unknown> };
+      await expect(
+        drime.drimeFetch({ set: 'app', latest: true, outputDir, envFile, runtime: fake.runtime, pickLatest: (names: string[]) => names[0] }),
+      ).rejects.toThrow('A drime download needs a plain file name');
+      expect(fake.downloads()).toHaveLength(0);
+      expect(fs.existsSync(path.join(path.dirname(outputDir), 'escape.db'))).toBe(false);
+    });
+
+    it('canary: an existing file is never overwritten', async () => {
+      const { envFile, outputDir } = fetchSetup();
+      fs.mkdirSync(outputDir, { recursive: true });
+      fs.writeFileSync(path.join(outputDir, MID), 'old');
+      const fake = makeFetchRclone({ listing: [listed(MID)] });
+      await expect(fetchFromDrime({ set: 'app', file: MID, outputDir, envFile, runtime: fake.runtime })).rejects.toThrow('Refusing to overwrite');
+      expect(fs.readFileSync(path.join(outputDir, MID), 'utf8')).toBe('old');
+    });
+  });
+
+  describe('retry', () => {
+    it('canary: a listing and a download that fail once each still succeed, with the audit backoff', async () => {
+      const { envFile, outputDir } = fetchSetup();
+      const fake = makeFetchRclone({ listing: [listed(MID)], failListing: 1, failDownload: 1 });
+      await fetchFromDrime({ set: 'app', file: MID, outputDir, envFile, runtime: fake.runtime });
+      expect(fake.sleeps).toEqual([1000, 1000]);
+      expect(fake.downloads()).toHaveLength(2);
+    });
+
+    it('canary: a download that always fails is a fixed-string error after 3 attempts and leaves no file', async () => {
+      const { envFile, outputDir } = fetchSetup();
+      const fake = makeFetchRclone({ listing: [listed(MID)], failDownload: 99, leak: true });
+      await expect(fetchFromDrime({ set: 'app', file: MID, outputDir, envFile, runtime: fake.runtime })).rejects.toThrow(
+        'downloading file: rclone copyto failed (exit 5) after 3 attempt(s)',
+      );
+      expect(fake.sleeps).toEqual([1000, 3000]);
+      expect(fs.existsSync(path.join(outputDir, MID))).toBe(false);
+    });
+  });
+
+  it('canary: no secret appears in an error from a failing rclone', async () => {
+    const { envFile, outputDir } = fetchSetup();
+    const fake = makeFetchRclone({ listing: [listed(MID)], failListing: 99, leak: true });
+    const error = await fetchFromDrime({ set: 'app', latest: true, outputDir, envFile, runtime: fake.runtime }).catch((e: Error) => e);
+    expect(error).toBeInstanceOf(Error);
+    expectNoSecrets(`${(error as Error).message}\n${(error as Error).stack}\n${JSON.stringify(error)}`);
+  });
+
+  describe('through the CLI with a real rclone-shaped subprocess', () => {
+    function installFetchRclone(listing: unknown[], mode: 'ok' | 'fail' = 'ok') {
+      const dir = makeTempDir();
+      fs.writeFileSync(path.join(dir, 'rclone'), [
+        `#!${process.execPath}`,
+        "const fs = require('fs');",
+        'const args = process.argv.slice(2);',
+        `if (${JSON.stringify(mode)} === 'fail') { process.stderr.write(${JSON.stringify(`token=${SECRETS.token} pass=${SECRETS.pass}`)}); process.exit(5); }`,
+        `if (args[0] === 'lsjson') { process.stdout.write(${JSON.stringify(JSON.stringify(listing))}); process.exit(0); }`,
+        `if (args[0] === 'copyto') { fs.writeFileSync(args[2], ${JSON.stringify(BYTES.toString())}); process.stderr.write('progress token=${SECRETS.token}'); process.exit(0); }`,
+        'process.exit(9);',
+      ].join('\n'), { mode: 0o755 });
+      return dir;
+    }
+    const entries = [{ Path: OLD, Size: BYTES.length, IsDir: false }, { Path: NEWEST, Size: BYTES.length, IsDir: false }];
+
+    itOnPosix('canary: stdout carries exactly the fetched path, alone on its line', async () => {
+      const { cwd, envFile } = setup();
+      const outputDir = path.join(cwd, 'drill');
+      const result = await cli(installFetchRclone(entries), cwd, ['fetch', '--from', 'drime:app', '--latest', '--output', outputDir, '--drime-env-file', envFile]);
+      expect(result.thrown).toBeNull();
+      expect(result.out).toBe(path.join(fs.realpathSync(outputDir), NEWEST));
+      expect(fs.readFileSync(result.out, 'utf8')).toBe(BYTES.toString());
+      expectNoSecrets(result.out);
+    });
+
+    itOnPosix('--json prints {file, size, set} and --file fetches that object', async () => {
+      const { cwd, envFile } = setup();
+      const result = await cli(installFetchRclone(entries), cwd, ['fetch', '--from', 'drime:app', '--file', OLD, '--output', path.join(cwd, 'd'), '--drime-env-file', envFile, '--json']);
+      expect(JSON.parse(result.out)).toEqual({ file: OLD, size: BYTES.length, set: 'app' });
+    });
+
+    itOnPosix('canary: a failing rclone exits non-zero through the CLI path and prints no secret', async () => {
+      const { cwd, envFile } = setup();
+      const result = await cli(installFetchRclone([], 'fail'), cwd, ['fetch', '--from', 'drime:app', '--latest', '--output', path.join(cwd, 'd'), '--drime-env-file', envFile]);
+      expect(result.thrown).toBeInstanceOf(Error);
+      expectNoSecrets(`${result.out}\n${result.thrown?.message}\n${String(result.thrown?.stderr ?? '')}`);
+    }, 20000);
+
+    itOnPosix('needs --from drime:<set> and exactly one of --latest or --file', async () => {
+      const { cwd, envFile } = setup();
+      const bin = installFetchRclone(entries);
+      const base = ['fetch', '--output', path.join(cwd, 'd'), '--drime-env-file', envFile];
+      expect((await cli(bin, cwd, [...base, '--latest'])).thrown?.message).toBe('fetch needs --from drime:<set>');
+      expect((await cli(bin, cwd, [...base, '--from', 'drime:app'])).thrown?.message).toBe('fetch needs exactly one of --latest or --file');
+    });
   });
 });

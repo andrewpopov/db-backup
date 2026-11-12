@@ -478,6 +478,41 @@ is refused rather than parsed truncated). `--json` prints the report.
   run takes exactly one extra raw and one extra top-level listing. The summary line reads
   `drime-audit: clean, N object(s) checked, M changed during audit`.
 
+#### Restore drills
+
+Drime is the primary store, so a restore drill restores the Drime copy. Only
+db-backup holds the crypt context, so it provides the download:
+
+```bash
+FILE=$(db-backup fetch --from drime:app-name --latest --output "$(mktemp -d)")
+db-backup restore --file "$FILE" ...   # or open it with sqlite3 / pg_restore
+```
+
+- `fetch --from drime:<set> (--latest | --file <name>) --output <dir>` is
+  read-only against Drime (`--drime-env-file`, `--base-remote`,
+  `--crypt-remote` as for `drime-audit`). It prints the absolute path of the
+  downloaded file alone on stdout, so a script can capture it; `--json` prints
+  `{"file", "size", "set"}` instead. Errors go to stderr and the exit code is
+  non-zero.
+- `--latest` picks the newest object by the timestamp in its file name (the
+  parser retention uses, then the `-N` sequence), never the listing order;
+  `--name-prefix <name>` selects a custom prefix. Two files sharing the newest
+  timestamp refuse the pick.
+- The set listing must be unambiguous: a name listed twice, or as both a file and
+  a directory, refuses the fetch (Drime allows duplicate names, so a download by
+  name could return the wrong copy).
+- The downloaded size must equal the size in the listing; otherwise the partial
+  file is deleted and the fetch fails.
+- It never writes outside `--output` (created `0700`, the file lands directly in
+  it) and refuses to overwrite an existing file or symlink there, so use a fresh
+  directory per drill. `set` is validated like a destination path and the file
+  name must be plain (no `/`, `:` or `..`), both before any rclone call.
+- Listing and download retry transient failures like the audit reads (3
+  attempts, 1 s then 3 s; not-found is not retried). Errors are fixed strings and
+  never carry rclone's output.
+- In code: `fetchFromDrime({ set, latest | file, outputDir, envFile })` resolves
+  `{ file, size, set, path }`.
+
 ### Native S3 remote (no rclone) — AWS S3 or Cloudflare R2
 
 If you'd rather not install and configure `rclone` at all, `--s3-bucket`
