@@ -13,7 +13,7 @@
  * repo. Run locally with `npm run verify:pack`; CI runs the same command.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -39,6 +39,7 @@ try {
     join(scratch, 'package.json'),
     JSON.stringify({ name: 'verify-pack-consumer', version: '0.0.0', private: true }, null, 2),
   );
+  copyFileSync(join(repoRoot, '.npmrc'), join(scratch, '.npmrc')); // a consumer resolves @andrewpopov dependencies from the fleet registry
   console.log(`[verify-pack] installing tarball into ${scratch}`);
   run('npm', ['install', '--no-audit', '--no-fund', tarballPath], { cwd: scratch });
 

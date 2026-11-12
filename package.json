@@ -55,12 +55,12 @@
     "hooks": "git config core.hooksPath .githooks"
   },
   "dependencies": {
-    "@andrewpopov/alert-kit": "github:andrewpopov/alert-kit#v0.7.1",
+    "@andrewpopov/alert-kit": "0.7.1",
     "dotenv": "^16.5.0"
   },
   "devDependencies": {
-    "@andrewpopov/deploy-kit": "github:andrewpopov/deploy-kit#v0.37.1",
-    "@andrewpopov/release-kit": "github:andrewpopov/release-kit#v0.7.1",
+    "@andrewpopov/deploy-kit": "0.37.1",
+    "@andrewpopov/release-kit": "0.7.1",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
