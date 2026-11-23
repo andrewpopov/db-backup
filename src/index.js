@@ -46,6 +46,7 @@ const {
   normalizeDrimeDestination,
   loadDrimeContext,
   runDrimeOperation,
+  runDrimeUpload,
   buildRcloneArgs,
   drimeTargetOf,
   overCapOutcome,
@@ -3260,7 +3261,9 @@ function uploadBackupToRemote(entry, remote, runtime) {
   }
 
   const target = remoteObjectPath(remote, entry.fileName);
-  runRclone(remote, runtime, { op: 'copyto', localPath: path.resolve(entry.fullPath), remoteRel: entry.fileName });
+  const copyOperation = { op: 'copyto', localPath: path.resolve(entry.fullPath), remoteRel: entry.fileName };
+  if (remote.type === 'drime') runDrimeUpload(remote, runtime, copyOperation);
+  else runRclone(remote, runtime, copyOperation);
 
   return remote.verify === false ? { target, sizeBytes: null } : verifyRemoteObject(entry, remote, runtime);
 }
@@ -4017,7 +4020,9 @@ function uploadSyncDestination(created, destination, resolved, seenLocalPaths) {
 
 // A failed upload is recorded and the loop carries on; the job fails after.
 function recordUploadFailure(uploads, destination, error) {
-  console.error(`[db-backup] upload to ${destinationLabel(destination)} failed`);
+  const { attempts, failureClass } = error.uploadFailure || {};
+  const reason = failureClass ? ` after ${attempts} attempt${attempts === 1 ? '' : 's'} (${failureClass})` : '';
+  console.error(`[db-backup] upload to ${destinationLabel(destination)} failed${reason}`);
   uploads.failures.push(error);
   uploads.distributions.push({ destination: failedDestinationOf(destination), uploaded: null, uploadFailed: true, removed: [] });
 }

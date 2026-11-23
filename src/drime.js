@@ -313,6 +313,57 @@ function runWithContext(ctx, runtime, args, maxBuffer) {
   return result.output;
 }
 
+// Why an upload failed, as a fixed class: the only thing about a failed child
+// that is ever reported. Decided from the exit status, spawn code and stderr
+// here, so the stderr itself never leaves this module.
+const UPLOAD_AUTH_FAILURE = /didn't find section|\b40[13]\b|unauthori[sz]ed|forbidden|invalid[ _-]?(access[ _-]?)?token|access[ _-]?token/i;
+const UPLOAD_QUOTA_FAILURE = /quota|storage limit|insufficient storage|\b507\b|\b413\b|payload too large|no space left/i;
+const UPLOAD_NETWORK_FAILURE = /connection (reset|refused|closed)|no such host|dial tcp|i\/o timeout|tls handshake|unexpected eof|network is unreachable|temporary failure|bad gateway|service unavailable|gateway time-?out|too many requests|\b(429|50[0-4])\b/i;
+const UPLOAD_FATAL_EXIT_CODES = [2, 7, 8];
+const RCLONE_TEMPORARY_ERROR_EXIT = 5;
+
+function classifyUploadFailure(result) {
+  const stderr = result.stderr;
+  if (CRYPT_INIT_FAILURE.test(stderr) || NAME_DECRYPT_FAILURE.test(stderr)) return { failureClass: 'crypt', retryable: false };
+  if (UPLOAD_AUTH_FAILURE.test(stderr)) return { failureClass: 'auth', retryable: false };
+  if (UPLOAD_QUOTA_FAILURE.test(stderr)) return { failureClass: 'quota', retryable: false };
+  if (result.code === 'ETIMEDOUT') return { failureClass: 'timeout', retryable: true };
+  const failureClass = result.status === RCLONE_TEMPORARY_ERROR_EXIT || UPLOAD_NETWORK_FAILURE.test(stderr) ? 'network' : 'unknown';
+  const deterministic = isNotFound(result) || result.code === 'ENOBUFS' || result.code === 'ENOENT' || UPLOAD_FATAL_EXIT_CODES.includes(result.status);
+  return { failureClass, retryable: !deterministic };
+}
+
+const UPLOAD_ATTEMPTS = 3;
+const UPLOAD_BACKOFF_MS = [30 * 1000, 2 * 60 * 1000];
+const UPLOAD_DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+const UPLOAD_RETRY_BUDGET_SHARE = 0.5;
+
+// A transient upload failure is retried with backoff, but only while the time
+// already spent plus the next wait stays within half the command timeout, so
+// retrying can never run a job past its own limit. An upload that only succeeds
+// on a retry returns exactly what a first-try success does.
+function runDrimeUpload(destination, runtime, operation) {
+  const ctx = loadDrimeContext(destination);
+  const args = buildRcloneArgs(operation, privateCryptTarget(destination));
+  const budgetMs = (runtime.commandTimeoutMs || UPLOAD_DEFAULT_COMMAND_TIMEOUT_MS) * UPLOAD_RETRY_BUDGET_SHARE;
+  const clock = () => (runtime.now ? runtime.now().getTime() : Date.now());
+  const startedAt = clock();
+  for (let attempt = 1; ; attempt += 1) {
+    const result = execContext(ctx, runtime, args);
+    if (result.ok) return result.output;
+    const { failureClass, retryable } = classifyUploadFailure(result);
+    const waitMs = UPLOAD_BACKOFF_MS[attempt - 1];
+    if (retryable && attempt < UPLOAD_ATTEMPTS && clock() - startedAt + waitMs <= budgetMs) {
+      runtime.sleep(waitMs);
+      continue;
+    }
+    const exit = result.status === null ? 'unknown' : result.status;
+    const error = new Error(`rclone ${args[0]} failed (exit ${exit}) after ${attempt} attempt(s) (${failureClass})`);
+    error.uploadFailure = { attempts: attempt, failureClass };
+    throw error;
+  }
+}
+
 function privateCryptTarget(destination) {
   return `${PRIVATE_CRYPT}:${assertSafeDrimePath(destination.path)}`;
 }
@@ -991,6 +1042,7 @@ module.exports = {
   normalizeDrimeDestination,
   loadDrimeContext,
   runDrimeOperation,
+  runDrimeUpload,
   buildRcloneArgs,
   drimeTargetOf,
   overCapOutcome,
