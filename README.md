@@ -386,6 +386,27 @@ nothing comes from ambient rclone config:
   and writes the identical layout.
 - A failed rclone call surfaces as `rclone <op> failed (exit N)` only. Child
   output is never attached to an error, because it can echo credentials.
+- **Upload retry.** A failed `copyto` is retried up to 3 attempts, waiting 30 s
+  then 2 min, and only while the time already spent plus the next wait stays
+  within half of `commandTimeoutSeconds`. An upload that succeeds on a retry is
+  verified, pruned and stamped exactly like a first-try success. After the last
+  attempt the log says `upload to drime:<set> failed after 3 attempts (<class>)`
+  and the error reads `rclone copyto failed (exit N) after 3 attempt(s) (<class>)`.
+  The class is chosen inside db-backup from the exit status and stderr, which
+  are never printed:
+
+  | Class | Matched | Retried |
+  |---|---|---|
+  | `crypt` | crypt init or name decryption error | no |
+  | `auth` | `didn't find section`, 401, 403, unauthorized, forbidden, access token | no |
+  | `quota` | quota, storage limit, 507, 413, no space | no |
+  | `timeout` | the child hit `commandTimeoutSeconds` | yes, if budget remains |
+  | `network` | rclone exit 5, connection reset or refused, DNS, TLS, EOF, 429, 500 to 504 | yes |
+  | `unknown` | anything else | yes |
+
+  A missing path (exit 3 or 4), an over-limit buffer and rclone exits 2, 7 and 8
+  are never retried, whatever their class. A backup over `maxBytes` is refused
+  before any upload.
 - **Size cap.** `maxBytes` (default 5000000000, decimal bytes, positive safe
   integer) applies to the final local artifact, after optional gpg. Crypt adds
   `32 + 16 * ceil(bytes / 65536)` bytes, about 0.0244%, so a 5,000,000,000 byte

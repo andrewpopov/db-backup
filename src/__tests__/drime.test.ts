@@ -381,8 +381,8 @@ describe('drime destination: secrets never surface', () => {
     const { run, logs, outputDir } = runFailing(op);
     let error: Error | null = null;
     try { run(); } catch (caught) { error = caught as Error; }
-    expect(error?.message).toBe(`rclone ${op} failed (exit 1)`);
-    expect(Object.getOwnPropertyNames(error).filter((n) => n !== 'markerPath').sort()).toEqual(['destinationResults', 'message', 'stack']);
+    expect(error?.message).toBe(op === 'copyto' ? 'rclone copyto failed (exit 1) after 3 attempt(s) (unknown)' : 'rclone lsjson failed (exit 1)');
+    expect(Object.getOwnPropertyNames(error).filter((n) => n !== 'markerPath' && n !== 'uploadFailure').sort()).toEqual(['destinationResults', 'message', 'stack']);
     expectNoSecrets(JSON.stringify((error as { destinationResults?: unknown }).destinationResults));
     expect((error as { cause?: unknown }).cause).toBeUndefined();
     expectNoSecrets(String(error?.stack));
@@ -428,10 +428,10 @@ describe('drime destination: secrets never surface', () => {
     itOnPosix('a failing rclone that echoes both password forms on stderr leaks nothing through runCli --json or the thrown error', async () => {
       const { cwd, outputDir, envFile } = setup();
       useRealSqliteIfPresent(cwd);
-      const stderr = `${SECRETS.pass} ${SECRETS.plainPass} ${SECRETS.pass2} ${SECRETS.token}`;
+      const stderr = `401 Unauthorized ${SECRETS.pass} ${SECRETS.plainPass} ${SECRETS.pass2} ${SECRETS.token}`;
       const bin = installFakeRclone([{ match: 'copyto', exit: 1, stderr }]);
       const { out, thrown } = await cli(bin, cwd, [...CLI_FLAGS, '--dest', 'drime:app', '--drime-env-file', envFile, '--output-dir', outputDir]);
-      expect(thrown?.message).toBe('rclone copyto failed (exit 1)');
+      expect(thrown?.message).toBe('rclone copyto failed (exit 1) after 1 attempt(s) (auth)');
       expect(thrown?.stderr).toBeUndefined();
       expect(thrown?.stdout).toBeUndefined();
       expectNoSecrets(out + String(thrown?.stack));
@@ -1719,7 +1719,7 @@ describe('every destination is attempted before the job fails (PKG-307 item 2)',
         destinations: [{ type: 'local', path: outputDir }, { type: 'drime', path: 'app', envFile }, { type: 's3', bucket: 'b', keep: 1 }],
         runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync, fetchImpl: s3.fetchImpl, env: S3_ENV } as never),
       })),
-    ).rejects.toThrow('rclone copyto failed (exit 1)');
+    ).rejects.toThrow('rclone copyto failed (exit 1) after 3 attempt(s) (unknown)');
     expect([...s3.objects.keys()].some((k) => k.endsWith(NEW_NAME)), 's3 uploaded after the Drime failure').toBe(true);
     expect(s3.methods).not.toContain('DELETE');
     for (const name of OLD) expect(fs.existsSync(path.join(outputDir, name))).toBe(true);
@@ -1795,7 +1795,7 @@ describe('backup alerts through --notify-command (PKG-307 item 3)', () => {
 
   itOnPosix('a failed upload alerts a job failure with the destination label and no error text', async () => {
     const { cwd, outputDir, envFile, notify, alerts } = notifyFixture();
-    const bin = installFakeRclone([{ match: 'copyto', exit: 1, stderr: `${SECRETS.token} ${SECRETS.pass}` }]);
+    const bin = installFakeRclone([{ match: 'copyto', exit: 1, stderr: `401 ${SECRETS.token} ${SECRETS.pass}` }]);
     const { out, thrown } = await cli(bin, cwd, [...CLI_FLAGS, '--dest', 'drime:app', '--drime-env-file', envFile, '--output-dir', outputDir, '--notify-command', notify]);
     expect(thrown).toBeTruthy();
     const delivered = alerts();
@@ -2160,5 +2160,98 @@ describe('fetch from Drime (PKG-319)', () => {
       expect((await cli(bin, cwd, [...base, '--latest'])).thrown?.message).toBe('fetch needs --from drime:<set>');
       expect((await cli(bin, cwd, [...base, '--from', 'drime:app'])).thrown?.message).toBe('fetch needs exactly one of --latest or --file');
     });
+  });
+});
+
+describe('drime upload retry (PKG-400)', () => {
+  const stderrOf = (text: string) => Object.assign(new Error(`Command failed: ${text}`), { status: 1, stderr: Buffer.from(text), stdout: Buffer.from(text) });
+
+  function run(failures: Error[], extra: { commandTimeoutMs?: number; seeded?: string[] } = {}) {
+    const { cwd, outputDir, envFile } = setup();
+    const stampFile = path.join(cwd, '.last-success');
+    const pending = [...failures];
+    const rclone = makeFakeRclone({ seeded: extra.seeded, fail: (args) => (args[0] === 'copyto' ? pending.shift() || null : null) });
+    const sleeps: number[] = [];
+    const logs: string[] = [];
+    for (const method of ['log', 'warn', 'error'] as const) {
+      vi.spyOn(console, method).mockImplementation((...parts: unknown[]) => { logs.push(parts.join(' ')); });
+    }
+    const options = jobOptions(cwd, outputDir, {
+      stampFile,
+      destinations: [{ type: 'drime', path: 'app', envFile }],
+      runtime: makeRuntime({ commandExists: (c: string) => c === 'rclone', execFileSync: rclone.execFileSync, sleep: (ms: number) => { sleeps.push(ms); }, ...(extra.commandTimeoutMs ? { commandTimeoutMs: extra.commandTimeoutMs } : {}) } as never),
+    });
+    const copies = () => rclone.calls.filter((c) => c.args[0] === 'copyto').length;
+    const outcome = () => { try { return { result: runBackupJob(options), error: null as Error | null }; } catch (caught) { return { result: null, error: caught as Error }; } };
+    return { rclone, sleeps, logs, stampFile, copies, outcome };
+  }
+
+  it('a transient failure then success counts as a first-try success: stamped, pruned, one backoff', () => {
+    const seeded = Array.from({ length: 12 }, (_v, i) => `sqlite-backup-202606${String(i + 10).padStart(2, '0')}-150000Z.db`);
+    const t = run([stderrOf(`dial tcp: lookup api.example.test: no such host ${SECRETS.token}`)], { seeded });
+    const { result, error } = t.outcome();
+    expect(error).toBeNull();
+    expect(t.copies()).toBe(2);
+    expect(t.sleeps).toEqual([30000]);
+    expect(t.rclone.drimeObjects.has(NEW_NAME)).toBe(true);
+    expect(fs.existsSync(t.stampFile)).toBe(true);
+    expect(t.rclone.deleted.length).toBe(3);
+    expect(result?.destinationResults?.[0].uploadFailed).toBeUndefined();
+    expectNoSecrets(t.logs.join('\n'));
+  });
+
+  it.each([
+    ['auth: no section', "Failed to create file system: didn't find section in config file"],
+    ['auth: 401', 'HTTP error 401 (401 Unauthorized)'],
+    ['auth: 403', 'error 403 Forbidden'],
+    ['crypt init', 'failed to decrypt password: illegal base64 data'],
+    ['crypt decrypt', 'undecryptable file name'],
+    ['quota', 'Error 507: quota exceeded'],
+  ])('a deterministic failure (%s) is never retried', (_name, text) => {
+    const t = run([stderrOf(`${text} ${SECRETS.pass}`)]);
+    const { error } = t.outcome();
+    expect(error).toBeTruthy();
+    expect(t.copies()).toBe(1);
+    expect(t.sleeps).toEqual([]);
+    expect(fs.existsSync(t.stampFile)).toBe(false);
+    expect(error?.message).toMatch(/after 1 attempt\(s\) \((auth|crypt|quota)\)/);
+  });
+
+  it.each([
+    ['not found', Object.assign(new Error('x'), { status: 3, stderr: Buffer.from('directory not found') })],
+    ['ENOBUFS', Object.assign(new Error('x'), { status: null, code: 'ENOBUFS', stderr: Buffer.from('') })],
+    ['fatal exit 7', Object.assign(new Error('x'), { status: 7, stderr: Buffer.from('fatal') })],
+  ])('exit-code determinism (%s) is not retried', (_name, failure) => {
+    const t = run([failure]);
+    expect(t.outcome().error).toBeTruthy();
+    expect(t.copies()).toBe(1);
+  });
+
+  it('three transient failures fail with the class and attempt count, leave history and stamp alone, and leak nothing', () => {
+    const t = run([1, 2, 3].map(() => stderrOf(`read tcp: connection reset by peer https://u:${SECRETS.pass}@host/${SECRETS.token}`)));
+    const { error } = t.outcome();
+    expect(t.copies()).toBe(3);
+    expect(t.sleeps).toEqual([30000, 120000]);
+    expect(error?.message).toBe('rclone copyto failed (exit 1) after 3 attempt(s) (network)');
+    expect(t.logs).toContain('[db-backup] upload to drime:app failed after 3 attempts (network)');
+    expect(fs.existsSync(t.stampFile)).toBe(false);
+    expect(t.rclone.deleted).toEqual([]);
+    expectNoSecrets(`${t.logs.join('\n')}\n${error?.message}\n${error?.stack}\n${JSON.stringify(error)}`);
+    expect(t.logs.join('\n')).not.toMatch(/connection reset|https:/);
+  });
+
+  it('classifies a spawn timeout as timeout and an unrecognised exit 1 as unknown', () => {
+    const timedOut = run([1, 2, 3].map(() => Object.assign(new Error('x'), { status: null, code: 'ETIMEDOUT', stderr: Buffer.from('') })));
+    expect(timedOut.outcome().error?.message).toMatch(/\(timeout\)$/);
+    const unknown = run([1, 2, 3].map(() => stderrOf('something odd')));
+    expect(unknown.outcome().error?.message).toMatch(/\(unknown\)$/);
+  });
+
+  it('stops retrying once the next backoff would exceed half the command timeout', () => {
+    const t = run([1, 2, 3].map(() => stderrOf('i/o timeout')), { commandTimeoutMs: 100 * 1000 });
+    const { error } = t.outcome();
+    expect(t.copies()).toBe(2);
+    expect(t.sleeps).toEqual([30 * 1000]);
+    expect(error?.message).toMatch(/after 2 attempt\(s\) \(network\)/);
   });
 });
